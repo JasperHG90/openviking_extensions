@@ -5,31 +5,58 @@
 #
 # Options (after the pipe, pass with `bash -s -- ...`):
 #   --to <dir>      Install directory (default: $HOME/.local/bin, or $OVX_BIN)
-#   --version <v>   Install a released version, e.g. 0.1.0 (default: main)
+#   --version <v>   Install this released version, e.g. 0.1.0
+#   --main          Install the tip of main; it reports its version as "dev"
 #   --local <path>  Install from a local ovx.sh instead of downloading
-#   --url <url>     Download from this URL (default: $OVX_SCRIPT_URL or the
-#                   main-branch raw URL on GitHub)
+#   --url <url>     Download from this URL
 #
-# --version, --url and --local all choose the payload; the last one given wins.
+# With none of those, the newest published ovx release is installed. Only a
+# release carries a real version: the script in the repository says "dev",
+# because the version is stamped in at release time and lives in the git tag.
+#
+# --version, --main, --url and --local all choose the payload; the last one
+# given wins.
 #
 # ovx needs python3 (3.11+) to read its TOML config and the `ov` CLI to run.
 
 set -euo pipefail
 
 REPO="JasperHG90/openviking_extensions"
-DEFAULT_URL="https://raw.githubusercontent.com/$REPO/main/packages/ovx/ovx.sh"
+TAG_PREFIX="ovx-v"
+MAIN_URL="https://raw.githubusercontent.com/$REPO/main/packages/ovx/ovx.sh"
+# A release stamps its own version here, so the installer attached to a release
+# installs that release without reaching for the API. Empty in the repository.
+PINNED_VERSION=""
 INSTALL_DIR="${OVX_BIN:-$HOME/.local/bin}"
-SOURCE_URL="${OVX_SCRIPT_URL:-$DEFAULT_URL}"
+SOURCE_URL="${OVX_SCRIPT_URL:-}"
 LOCAL_PATH=""
 
 usage() {
   cat <<EOF
-Usage: install.sh [--to <dir>] [--version <v>] [--local <path>] [--url <url>]
+Usage: install.sh [--to <dir>] [--version <v>] [--main] [--local <path>] [--url <url>]
   --to <dir>      Install directory (default: \$HOME/.local/bin)
-  --version <v>   Install a released version, e.g. 0.1.0 (default: main)
+  --version <v>   Install this released version, e.g. 0.1.0
+  --main          Install the tip of main; it reports its version as "dev"
   --local <path>  Install from a local ovx.sh instead of downloading
-  --url <url>     Download URL (default: the main-branch raw URL)
+  --url <url>     Download URL
+
+With none of these, the newest published release is installed.
 EOF
+}
+
+asset_url() {
+  printf 'https://github.com/%s/releases/download/%s%s/ovx.sh' "$REPO" "$TAG_PREFIX" "$1"
+}
+
+# Newest published ovx version, or empty. The repository holds several
+# packages, so /releases/latest is no use here -- it could name an
+# ov-postgres release. Filter the list by tag prefix instead; the API returns
+# it newest first. No jq: this runs on whatever machine curls it.
+latest_version() {
+  curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=100" 2>/dev/null \
+    | grep -o "\"tag_name\"[[:space:]]*:[[:space:]]*\"${TAG_PREFIX}[^\"]*\"" \
+    | head -n 1 \
+    | sed "s/.*\"$TAG_PREFIX\\([^\"]*\\)\"/\\1/"
 }
 
 # Every option here takes a value. Without this check a trailing `--version`
@@ -47,14 +74,32 @@ while [[ $# -gt 0 ]]; do
     --to) need_arg "$1" "$#"; INSTALL_DIR="$2"; shift 2 ;;
     # Tolerate both "0.1.0" and "v0.1.0"; the tag carries the package name.
     --version) need_arg "$1" "$#"
-               SOURCE_URL="https://github.com/$REPO/releases/download/ovx-v${2#v}/ovx.sh"
-               LOCAL_PATH=""; shift 2 ;;
+               SOURCE_URL="$(asset_url "${2#v}")"; LOCAL_PATH=""; shift 2 ;;
+    --main) SOURCE_URL="$MAIN_URL"; LOCAL_PATH=""; shift ;;
     --local) need_arg "$1" "$#"; LOCAL_PATH="$2"; shift 2 ;;
     --url) need_arg "$1" "$#"; SOURCE_URL="$2"; LOCAL_PATH=""; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "ovx install: unknown option: $1" >&2; usage >&2; exit 1 ;;
   esac
 done
+
+# Nothing chose a payload, so install the newest release. Installing main by
+# default would hand out a script reporting "dev", which is what a version
+# flag exists to avoid.
+if [[ -z "$SOURCE_URL" ]] && [[ -z "$LOCAL_PATH" ]]; then
+  command -v curl >/dev/null 2>&1 || { echo "ovx install: needs 'curl' on PATH" >&2; exit 1; }
+  version="$PINNED_VERSION"
+  if [[ -z "$version" ]]; then
+    echo "ovx install: looking up the newest release" >&2
+    version="$(latest_version || true)"
+  fi
+  if [[ -z "$version" ]]; then
+    echo "ovx install: found no published $TAG_PREFIX* release." >&2
+    echo "             Pass --version <v>, or --main for the unreleased tip." >&2
+    exit 1
+  fi
+  SOURCE_URL="$(asset_url "$version")"
+fi
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT

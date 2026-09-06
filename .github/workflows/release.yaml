@@ -253,12 +253,11 @@ jobs:
           sed "s/^${var}=\"dev\"\$/${var}=\"${VERSION}\"/" "$src" > "dist/$PACKAGE.sh"
           chmod 755 "dist/$PACKAGE.sh"
 
-          # Point the shipped installer at this release's asset. Copied
-          # unchanged it would default to main, so someone downloading
-          # install.sh from the release page would get main's script sitting
-          # next to the pinned one -- the opposite of what a release is for.
-          asset="https://github.com/$GITHUB_REPOSITORY/releases/download"
-          sed "s|^DEFAULT_URL=.*|DEFAULT_URL=\"$asset/$PACKAGE-v$VERSION/$PACKAGE.sh\"|" \
+          # Pin the shipped installer to this release. Unstamped it would look
+          # the newest release up over the API; someone who downloaded the pair
+          # from a release page expects to get that pair, not whatever is
+          # newest by the time they run it.
+          sed "s|^PINNED_VERSION=.*|PINNED_VERSION=\"$VERSION\"|" \
             "packages/$PACKAGE/install.sh" > dist/install.sh
           chmod 755 dist/install.sh
 
@@ -269,7 +268,7 @@ jobs:
           got="$(bash "dist/$PACKAGE.sh" -V)"
           echo "planned=$PACKAGE $VERSION got=$got"
           test "$got" = "$PACKAGE $VERSION"
-          grep -q "releases/download/$PACKAGE-v$VERSION/$PACKAGE.sh" dist/install.sh
+          grep -q "^PINNED_VERSION=\"$VERSION\"\$" dist/install.sh
 
       - name: Create GitHub Release
         env:
