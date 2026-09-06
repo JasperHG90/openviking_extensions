@@ -29,11 +29,11 @@ and deletes the file when `ov` exits. Nothing is written to `~/.openviking`.
 and the `ov` CLI.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/JasperHG90/openviking_postgres/main/packages/ovx/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/JasperHG90/openviking_extensions/main/packages/ovx/install.sh | bash
 ```
 
 It installs the tip of `main` to `~/.local/bin`. Pin a
-[release](https://github.com/JasperHG90/openviking_postgres/releases), or pick
+[release](https://github.com/JasperHG90/openviking_extensions/releases), or pick
 another directory, with `--version` and `--to`:
 
 ```bash
@@ -152,12 +152,14 @@ removed when `ov` exits — including when `ov` fails, and when you interrupt it
 with Ctrl-C. `ov` runs as a child process rather than through `exec`, precisely
 so `ovx` survives to clean up.
 
-`ovx` does not trap `SIGINT` by name; bash runs the exit trap on its way out
-anyway, so naming the signal would clean up no more than that does and would
-flatten every interrupt into a plain exit code. Left alone, `ovx` either dies
-from the signal or reports `ov`'s `128+n` — which of the two depends on
-scheduling, and both tell a calling script the command was interrupted rather
-than that it failed. A `SIGKILL` leaves the file behind, as it must.
+`SIGINT`, `SIGTERM` and `SIGHUP` each get their own trap, not just `EXIT`. That
+is not belt-and-braces: on bash 3.2, which macOS ships, a Ctrl-C arriving while
+`ov` holds the foreground sometimes kills the shell *without* running the exit
+trap, leaving the key on disk. It is a few percent of interrupts under load —
+rare enough to miss on an idle machine, common enough to matter. Each handler
+re-raises its signal after cleaning up, so `ovx` still dies from it and a
+calling script can tell an interrupt from a failure. A `SIGKILL` cannot be
+trapped and does leave the file behind, as it must.
 
 What that buys you is a key on disk for the seconds a command runs instead of
 indefinitely. It is not erasure: `rm` unlinks the file, and on an SSD the blocks

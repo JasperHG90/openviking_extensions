@@ -30,8 +30,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/JasperHG90/openviking_postgres"
-Issues = "https://github.com/JasperHG90/openviking_postgres/issues"
+Homepage = "https://github.com/JasperHG90/openviking_extensions"
+Issues = "https://github.com/JasperHG90/openviking_extensions/issues"
 
 # Version comes from git tags, so a build always matches a commit and there is
 # no number to forget to bump. Tags carry the package name -- this repo holds

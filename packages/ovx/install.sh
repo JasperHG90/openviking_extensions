@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install.sh — install ovx, a profile launcher for the ov CLI.
 #
-#   curl -fsSL https://raw.githubusercontent.com/JasperHG90/openviking_postgres/main/packages/ovx/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/JasperHG90/openviking_extensions/main/packages/ovx/install.sh | bash
 #
 # Options (after the pipe, pass with `bash -s -- ...`):
 #   --to <dir>      Install directory (default: $HOME/.local/bin, or $OVX_BIN)
@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-REPO="JasperHG90/openviking_postgres"
+REPO="JasperHG90/openviking_extensions"
 DEFAULT_URL="https://raw.githubusercontent.com/$REPO/main/packages/ovx/ovx.sh"
 INSTALL_DIR="${OVX_BIN:-$HOME/.local/bin}"
 SOURCE_URL="${OVX_SCRIPT_URL:-$DEFAULT_URL}"
