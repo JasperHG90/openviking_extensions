@@ -24,7 +24,7 @@ You need a PostgreSQL 13+ database with [pgvector](https://github.com/pgvector/p
 Install into the environment that runs OpenViking:
 
 ```bash
-uv add "ov-postgres @ git+https://github.com/JasperHG90/openviking_postgres@v0.2.0"
+uv add "ov-postgres @ git+https://github.com/JasperHG90/openviking_extensions@v0.2.0"
 ```
 
 Here is a complete `~/.openviking/ov.conf` that runs on Postgres. Copy it whole, change the DSN, and you are done:
@@ -98,20 +98,20 @@ From the main branch (the package lives at `packages/ov-postgres` in the repo,
 so the URL needs the subdirectory):
 
 ```bash
-uv add "ov-postgres @ git+https://github.com/JasperHG90/openviking_postgres@main#subdirectory=packages/ov-postgres"
+uv add "ov-postgres @ git+https://github.com/JasperHG90/openviking_extensions@main#subdirectory=packages/ov-postgres"
 ```
 
 Pin to a release for a reproducible install:
 
 ```bash
-uv add "ov-postgres @ git+https://github.com/JasperHG90/openviking_postgres@v0.2.0"
+uv add "ov-postgres @ git+https://github.com/JasperHG90/openviking_extensions@v0.2.0"
 ```
 
 If OpenViking runs from a virtualenv you manage by hand rather than a `uv` project:
 
 ```bash
 uv pip install --python /path/to/openviking/.venv/bin/python \
-  "ov-postgres @ git+https://github.com/JasperHG90/openviking_postgres@main#subdirectory=packages/ov-postgres"
+  "ov-postgres @ git+https://github.com/JasperHG90/openviking_extensions@main#subdirectory=packages/ov-postgres"
 ```
 
 `v0.2.0` is the current release, and pinning it is preferable to pinning a
@@ -121,7 +121,7 @@ committed, so older SHAs no longer resolve. `v0.2.0` predates the move to
 are tagged `ov-postgres-v<version>` and need one:
 
 ```bash
-uv add "ov-postgres @ git+https://github.com/JasperHG90/openviking_postgres@ov-postgres-v0.3.0#subdirectory=packages/ov-postgres"
+uv add "ov-postgres @ git+https://github.com/JasperHG90/openviking_extensions@ov-postgres-v0.3.0#subdirectory=packages/ov-postgres"
 ```
 
 Confirm it landed where OpenViking will find it:
@@ -135,8 +135,8 @@ Confirm it landed where OpenViking will find it:
 The package lives at `packages/ov-postgres` inside the repo's uv workspace, so one sync at the root installs it editable together with its dev tools:
 
 ```bash
-git clone https://github.com/JasperHG90/openviking_postgres
-cd openviking_postgres
+git clone https://github.com/JasperHG90/openviking_extensions
+cd openviking_extensions
 uv sync --all-packages
 ```
 

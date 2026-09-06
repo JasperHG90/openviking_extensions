@@ -54,7 +54,7 @@ set -euo pipefail
 # which is the honest answer: the version lives in the git tag, and an
 # unreleased working copy has no tag to claim.
 OVX_VERSION="dev"
-OVX_HOMEPAGE="https://github.com/JasperHG90/openviking_postgres/tree/main/packages/ovx"
+OVX_HOMEPAGE="https://github.com/JasperHG90/openviking_extensions/tree/main/packages/ovx"
 
 OVX_DIR="${OVX_DIR:-$HOME/.ovx}"
 CONFIG_FILE="${OVX_CONFIG_FILE:-$OVX_DIR/config.toml}"
