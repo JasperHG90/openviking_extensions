@@ -1,3 +1,6 @@
+# macOS writes one of these into every directory it browses.
+.DS_Store
+
 # Python
 __pycache__/
 *.py[cod]
