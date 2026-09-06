@@ -36,10 +36,14 @@ OVX = Path(__file__).resolve().parent.parent / "ovx.sh"
 REAL_OV = shutil.which("ov")
 
 # The shim records what ovx handed it, then exits with $OVX_TEST_EXIT so a
-# test can check that ov's exit code is propagated. `stat` takes different
-# flags on macOS and GNU, hence the fallback.
+# test can check that ov's exit code is propagated.
+#
+# `stat` spells "permission bits" differently on GNU and BSD, and the GNU
+# probe has to come first: BSD stat has no -c and fails, so the fallback
+# fires, but GNU's -f means "filesystem status" and SUCCEEDS with unrelated
+# output, so trying BSD first never falls back and yields ' File: "..."'.
 SHIM = """#!/usr/bin/env bash
-mode() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1"; }
+mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
 {
   echo "ARGS: $*"
   echo "CONF: ${OPENVIKING_CLI_CONFIG_FILE:-<unset>}"
