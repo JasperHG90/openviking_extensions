@@ -1,0 +1,66 @@
+# ovx ships as a bash script, not a Python package. This file exists so its
+# test suite has an environment and a lint/type config; nothing is built or
+# installed.
+#
+# ovx is deliberately NOT a member of the root uv workspace (the root
+# pyproject excludes it). A workspace resolves to one Python floor across all
+# members: ov-postgres supports 3.10, ovx's tests drive a script that needs
+# 3.11+ for tomllib, and a shared floor cannot satisfy both. Standing alone,
+# ovx keeps its own lock and its own floor, and ov-postgres keeps its 3.10 CI
+# matrix.
+[project]
+name = "ovx"
+version = "0.1.0"
+description = "Run ov against a profile, without leaving an API key on disk."
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "mypy>=1.11",
+    "pytest>=8",
+    "ruff>=0.6",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# One test drives the real ov binary against a local server. It needs ov
+# installed, so it stays out of the default run; ask for it with
+# `uv run pytest -m integration`.
+addopts = "-m 'not integration'"
+markers = [
+    "integration: needs the ov CLI on PATH",
+]
+
+[tool.ruff]
+line-length = 90
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade -- enforces modern union/generic syntax
+    "B",    # bugbear
+    "D",    # pydocstyle -- enforces the docstring rule
+    "ANN",  # flake8-annotations -- enforces the type-hint rule
+    "RUF",
+]
+ignore = [
+    "D107",    # __init__ docstring; numpy documents params on the class
+    "D203",    # incompatible with D211
+    "D213",    # incompatible with D212
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+files = ["tests"]

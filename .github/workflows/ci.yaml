@@ -41,9 +41,10 @@ jobs:
       - name: Run prek hooks
         run: uvx prek@0.2.25 run --all-files --show-diff-on-failure
 
-  # The package list lives in the filters below and in the fallback list; a new
-  # package adds one filter block and one name. Every filter also names the
-  # shared files a package depends on: the workspace files and the workflows.
+  # The package list lives in the filters below and in the two fallback lists;
+  # a new package adds one filter block and one name, in the list matching the
+  # template that builds it. Every filter also names the shared files a package
+  # depends on: the workspace files and the workflows.
   detect:
     name: detect changed packages
     runs-on: ubuntu-latest
@@ -52,7 +53,8 @@ jobs:
       contents: read
       pull-requests: read # paths-filter reads the PR file list from the API
     outputs:
-      packages: ${{ steps.select.outputs.packages }}
+      python_packages: ${{ steps.select.outputs.python_packages }}
+      shell_packages: ${{ steps.select.outputs.shell_packages }}
     steps:
       - uses: actions/checkout@v4
 
@@ -66,8 +68,18 @@ jobs:
               - uv.lock
               - .pre-commit-config.yaml
               - .github/**
+            ovx:
+              - packages/ovx/**
+              - .pre-commit-config.yaml
+              - .github/**
 
-      # workflow_dispatch has no base to diff against, so fall back to every package.
+      # Split the changed set by which template can build each package: a
+      # Python package gets a wheel built and imported, a shell package gets
+      # its suite run against several bashes. Neither template can stand in
+      # for the other, so they are separate jobs over separate lists.
+      #
+      # workflow_dispatch has no base to diff against, so fall back to every
+      # package.
       - id: select
         shell: bash
         env:
@@ -75,21 +87,49 @@ jobs:
           CHANGED: ${{ steps.filter.outputs.changes }}
         run: |
           set -euo pipefail
+          ALL_PYTHON='["ov-postgres"]'
+          ALL_SHELL='["ovx"]'
+
           if [ "$EVENT" = "workflow_dispatch" ]; then
-            packages='["ov-postgres"]'
+            changed=$(jq -c -n --argjson p "$ALL_PYTHON" --argjson s "$ALL_SHELL" '$p + $s')
           else
-            packages="$CHANGED"
+            changed="$CHANGED"
           fi
-          echo "packages=$packages" >> "$GITHUB_OUTPUT"
-          echo "Selected: $packages"
+
+          # jq treats only false and null as falsy, so index() returning 0 for
+          # a first-position match still selects.
+          pick() {
+            jq -c --argjson known "$1" '[.[] | select(. as $x | $known | index($x))]' \
+              <<<"$changed"
+          }
+          python_packages=$(pick "$ALL_PYTHON")
+          shell_packages=$(pick "$ALL_SHELL")
+
+          {
+            echo "python_packages=$python_packages"
+            echo "shell_packages=$shell_packages"
+          } >> "$GITHUB_OUTPUT"
+          echo "Python: $python_packages"
+          echo "Shell:  $shell_packages"
 
   test:
     needs: detect
-    if: ${{ needs.detect.outputs.packages != '[]' && needs.detect.outputs.packages != '' }}
+    if: ${{ needs.detect.outputs.python_packages != '[]' && needs.detect.outputs.python_packages != '' }}
     strategy:
       fail-fast: false
       matrix:
-        package: ${{ fromJSON(needs.detect.outputs.packages) }}
+        package: ${{ fromJSON(needs.detect.outputs.python_packages) }}
     uses: ./.github/workflows/template-check.yaml
+    with:
+      package: ${{ matrix.package }}
+
+  test-shell:
+    needs: detect
+    if: ${{ needs.detect.outputs.shell_packages != '[]' && needs.detect.outputs.shell_packages != '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJSON(needs.detect.outputs.shell_packages) }}
+    uses: ./.github/workflows/template-check-shell.yaml
     with:
       package: ${{ matrix.package }}
