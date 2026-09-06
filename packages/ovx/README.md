@@ -32,27 +32,28 @@ and the `ov` CLI.
 curl -fsSL https://raw.githubusercontent.com/JasperHG90/openviking_extensions/main/packages/ovx/install.sh | bash
 ```
 
-It installs the tip of `main` to `~/.local/bin`. Pin a
-[release](https://github.com/JasperHG90/openviking_extensions/releases), or pick
-another directory, with `--version` and `--to`:
+That installs the newest [release](https://github.com/JasperHG90/openviking_extensions/releases)
+to `~/.local/bin`. Pin a version, or pick another directory:
 
 ```bash
-curl -fsSL .../install.sh | bash -s -- --version X.Y.Z
+curl -fsSL .../install.sh | bash -s -- --version 0.1.0
 curl -fsSL .../install.sh | bash -s -- --to /usr/local/bin
 ```
 
-The `install.sh` attached to a release defaults to that release, so downloading
-the pair from a release page needs no `--version`.
+The `install.sh` attached to a release is pinned to that release, so taking the
+pair from a release page gives you that pair.
 
-Or from a clone:
+To install the unreleased tip of `main`, or work from a clone:
 
 ```bash
+curl -fsSL .../install.sh | bash -s -- --main
 ./packages/ovx/install.sh --local packages/ovx/ovx.sh
 ```
 
-`ovx -V` reports the installed version. A copy taken from `main` or from a
-clone says `dev`: the version lives in the git tag, and only the release
-stamps it into the script.
+`ovx -V` reports the installed version, and the installer prints it too. Those
+last two both report **`dev`**, and that is not a bug: the version is stamped
+in at release time and lives in the git tag, so a copy taken from the
+repository has no version to claim. Install a release if you want a real one.
 
 > On a stock macOS, `python3` is 3.9 and has no `tomllib`. Install a newer one
 > (`brew install python@3.12`, or `uv python install`) and put it ahead on

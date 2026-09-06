@@ -47,7 +47,7 @@ Adding a package means adding one filter block to `ci.yaml` and its name to whic
 
 Each package releases on its own, from the manual [`release.yaml`](.github/workflows/release.yaml) workflow (Actions → release). Pick the package and an increment — a plain PATCH/MINOR/MAJOR bump of the package's newest tag — or type an explicit version, and run with `dry_run` first to see the plan. A real run re-tests the package, pushes an annotated `<package>-v<version>` tag, and publishes a GitHub release carrying the built artifacts. Nothing releases on push.
 
-The tag is the only place a version exists. A Python package gets there through hatch-vcs, which reads the tag at build time. A shell package has no wheel and no hatch-vcs, so the release stamps the version into a copy of the script and attaches that with its install script — a checkout reports `dev`, because an untagged working copy has no version to claim.
+The tag is the only place a version exists. A Python package gets there through hatch-vcs, which reads the tag at build time. A shell package has no wheel and no hatch-vcs, so the release stamps the version into a copy of the script and attaches that alongside an installer pinned to the same release — a checkout reports `dev`, because an untagged working copy has no version to claim. `ovx`'s installer therefore defaults to the newest release rather than to `main`; installing the branch tip is opt-in via `--main`.
 
 ## License
 
