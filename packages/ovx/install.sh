@@ -48,15 +48,32 @@ asset_url() {
   printf 'https://github.com/%s/releases/download/%s%s/ovx.sh' "$REPO" "$TAG_PREFIX" "$1"
 }
 
-# Newest published ovx version, or empty. The repository holds several
+# Newest published stable ovx version, or empty. The repository holds several
 # packages, so /releases/latest is no use here -- it could name an
 # ov-postgres release. Filter the list by tag prefix instead; the API returns
 # it newest first. No jq: this runs on whatever machine curls it.
+#
+# Prereleases are skipped. The list endpoint returns them alongside stable
+# releases, so marking a release "pre-release" on GitHub does nothing here on
+# its own -- the flag has to be read. A beta is opt-in through --version, not
+# something a bare install hands someone who asked for no version at all.
+#
+# awk rather than grep, because the decision needs two fields from the same
+# release: `tag_name` and `prerelease`. Splitting on commas puts each field on
+# its own line, and `tag_name` always precedes `prerelease` within a release
+# object, so one pass can hold the tag until the flag arrives.
 latest_version() {
   curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=100" 2>/dev/null \
-    | grep -o "\"tag_name\"[[:space:]]*:[[:space:]]*\"${TAG_PREFIX}[^\"]*\"" \
-    | head -n 1 \
-    | sed "s/.*\"$TAG_PREFIX\\([^\"]*\\)\"/\\1/"
+    | tr ',' '\n' \
+    | awk -F'"' -v prefix="$TAG_PREFIX" '
+        $2 == "tag_name"   { tag = $4; next }
+        $2 == "prerelease" {
+          if ($0 !~ /true/ && index(tag, prefix) == 1) {
+            print substr(tag, length(prefix) + 1)
+            exit
+          }
+        }
+      '
 }
 
 # Every option here takes a value. Without this check a trailing `--version`

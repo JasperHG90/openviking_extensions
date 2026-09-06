@@ -14,6 +14,8 @@
 #   -n, --new        Run the create-profile wizard, then run ov with it
 #   -e, --edit [P]   Edit profile P (or pick one) in the wizard, then run ov
 #   -d, --delete [P] Delete profile P (or pick one), after confirmation
+#   -L, --login [P]  Log in to profile P through Studio, store the token, exit
+#       --logout [P] Revoke and remove profile P's stored login, then exit
 #   -V, --version    Show the ovx version and exit
 #   -h, --help       Show this help
 #
@@ -24,7 +26,20 @@
 #   ovx -e lab             Edit profile 'lab' (pre-filled), then run ov
 #   ovx -e                 Pick a profile to edit
 #   ovx -d lab             Delete profile 'lab', after confirmation
+#   ovx -L lab             Log in to 'lab'; approve in Studio, token is stored
+#   ovx --logout lab       Revoke and forget 'lab's stored login
 #   ovx -- -o json status  Pick a profile, forward '-o json status' to ov
+#
+# Logging in:
+#   'ovx -L lab' runs OpenViking's OAuth flow. It prints a six-character code
+#   and a Studio URL; open that URL where you are already signed in, enter the
+#   code, and ovx stores the resulting token under ~/.ovx/tokens/lab.json at
+#   mode 600. Later runs use it and refresh it automatically, so a profile that
+#   has logged in needs no api_key at all.
+#
+#   The stored token outranks the profile's api_key. It is short-lived,
+#   refreshable, and revocable on the server, which a static key is not —
+#   but it is still a credential on disk, unlike a $VAR reference.
 #
 # Everything after the profile name goes to ov untouched, so ov's own
 # subcommands and flags need no escaping: 'ovx lab -o json status' works as
@@ -58,6 +73,9 @@ OVX_HOMEPAGE="https://github.com/JasperHG90/openviking_extensions/tree/main/pack
 
 OVX_DIR="${OVX_DIR:-$HOME/.ovx}"
 CONFIG_FILE="${OVX_CONFIG_FILE:-$OVX_DIR/config.toml}"
+# OAuth tokens live beside the config, one file per profile. A profile that
+# has logged in needs no api_key at all: the stored token replaces it.
+TOKEN_DIR="$OVX_DIR/tokens"
 
 # Every field ovcli.conf accepts, with the JSON type ovx writes for it:
 # str = string, num = number, bool = true/false, map = table.
@@ -99,6 +117,8 @@ NEW=0
 EDIT=0
 DELETE=0
 LIST=0
+LOGIN=0
+LOGOUT=0
 OV_ARGS=()
 
 # Set once a temporary config exists, so the exit trap knows what to remove.
@@ -352,6 +372,13 @@ def expand(value, key):
     return value
 
 out = {k: expand(v, k) for k, v in sec.items()}
+
+# A stored OAuth token outranks whatever the profile says. ov has no separate
+# field for one: ApiKeyAuthPlugin dispatches on the ovat_ prefix, so the token
+# travels in api_key and the server resolves it as the person who approved it.
+oauth_token = os.environ.get("OVX_OAUTH_TOKEN")
+if oauth_token:
+    out["api_key"] = oauth_token
 
 # O_EXCL so a pre-existing path is never followed or overwritten, and 0600
 # from the start rather than a chmod after the secret has already landed.
@@ -818,6 +845,393 @@ choose_profile() {
 # ov runs as a child rather than via exec so this script survives to clean up.
 # Errexit does not apply inside a function called in a `||` context, so every
 # step that can fail is checked by hand.
+# Print a profile's `url`, with $VAR references expanded. Login needs the base
+# URL before any config is materialized, and reading just this one field keeps
+# a missing api_key from failing a login whose whole point is not needing one.
+profile_url() {
+  CONFIG_FILE="$CONFIG_FILE" PROFILE_NAME="$1" python3 <<'PY'
+import os, re, sys, tomllib
+
+path, name = os.environ["CONFIG_FILE"], os.environ["PROFILE_NAME"]
+try:
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+except (OSError, tomllib.TOMLDecodeError) as e:
+    sys.stderr.write(f"ovx: cannot read {path}: {e}\n")
+    sys.exit(2)
+
+sec = data.get(name)
+if not isinstance(sec, dict):
+    sys.stderr.write(f"ovx: profile '{name}' not found\n")
+    sys.exit(3)
+
+url = str(sec.get("url", "")).strip()
+if not url:
+    sys.stderr.write(f"ovx: profile '{name}' is missing required field 'url'\n")
+    sys.exit(2)
+
+VAR = re.compile(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)')
+
+def repl(m):
+    var = m.group(1) or m.group(2)
+    if not os.environ.get(var):
+        sys.stderr.write(f"ovx: profile '{name}' url references ${var} which is not set\n")
+        sys.exit(4)
+    return os.environ[var]
+
+sys.stdout.write(VAR.sub(repl, url))
+PY
+}
+
+# Path of the token file for a profile. Kept in one place so login, logout and
+# materialize cannot disagree about where a token lives.
+token_file() {
+  printf '%s/%s.json' "$TOKEN_DIR" "$1"
+}
+
+# Run the OAuth 2.1 authorization-code flow and store the resulting tokens.
+#
+# The poll shape, and why: OpenViking mints the authorization code inside
+# GET /oauth/authorize/page/status, which deletes the pending row on the first
+# read that finds it verified. That makes the code single-use across readers,
+# so whoever polls first consumes it. Studio's consent page polls in a loop, so
+# sending the operator there would race us and win. Studio's *verify* page has
+# no pending id and cannot poll, so directing the operator to type the
+# 6-character code there leaves ovx the only reader and no listener is needed.
+#
+# The display code is only rendered into the authorize page's HTML — the JSON
+# endpoint withholds it on purpose — so ovx reads it from that page. The page
+# needs no credential and already shows the code to anyone holding the pending
+# id, so reading it here grants ovx nothing it did not already have.
+#
+# urllib rather than httpx: this script runs under whatever python3 the
+# operator has, with no virtualenv and nothing installed, so the standard
+# library is the only thing it can rely on.
+oauth_login() {
+  local name="$1" base
+  base="$(profile_url "$name")" || return $?
+  ensure_config_dir
+  mkdir -p "$TOKEN_DIR"
+  chmod 700 "$TOKEN_DIR" 2>/dev/null || true
+
+  OVX_BASE_URL="$base" OVX_TOKEN_FILE="$(token_file "$name")" \
+  OVX_PROFILE="$name" OVX_VERSION="$OVX_VERSION" python3 <<'PY'
+import base64, hashlib, json, os, re, secrets, sys, time
+import urllib.error, urllib.parse, urllib.request
+
+BASE = os.environ["OVX_BASE_URL"].rstrip("/")
+DEST = os.environ["OVX_TOKEN_FILE"]
+PROFILE = os.environ["OVX_PROFILE"]
+UA = "ovx/" + os.environ.get("OVX_VERSION", "dev")
+
+# A redirect_uri is required by the protocol and validated by exact match
+# against what we register, but nothing ever dials it: the authorization code
+# comes back to us in the status response, not over a loopback socket.
+REDIRECT_URI = "http://127.0.0.1:1/ovx-callback"
+POLL_SECONDS = 2
+POLL_TIMEOUT = 600
+DISPLAY_CODE = re.compile(r'id="displayCode"[^>]*>\s*([A-Z2-9]{6})\s*<')
+
+
+def die(message):
+    sys.stderr.write(f"ovx: {message}\n")
+    sys.exit(1)
+
+
+class Redirected(Exception):
+    """Carries the Location of a redirect we want to read, not follow."""
+
+    def __init__(self, location):
+        self.location = location
+
+
+class CatchRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise Redirected(newurl)
+
+
+NO_REDIRECT = urllib.request.build_opener(CatchRedirect)
+
+
+def request(url, *, data=None, form=None, opener=None, want_json=True):
+    """One HTTP call. Returns parsed JSON, or the raw body when want_json is off."""
+    body, headers = None, {"User-Agent": UA, "Accept": "application/json"}
+    if form is not None:
+        body = urllib.parse.urlencode(form).encode()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    elif data is not None:
+        body = json.dumps(data).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=body, headers=headers)
+    # An opener exposes .open(); the module-level shortcut is .urlopen().
+    open_it = opener.open if opener is not None else urllib.request.urlopen
+    try:
+        with open_it(req, timeout=30) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace").strip()[:300]
+        raise SystemExit(f"ovx: {url} returned HTTP {e.code}: {detail or e.reason}")
+    except OSError as e:
+        raise SystemExit(f"ovx: cannot reach {url}: {e}")
+    if not want_json:
+        return raw.decode("utf-8", "replace")
+    try:
+        return json.loads(raw)
+    except ValueError:
+        raise SystemExit(f"ovx: {url} returned a non-JSON body")
+
+
+# 1. Discover the endpoints rather than hard-coding them, so a server that
+#    moves them stays reachable.
+meta = request(f"{BASE}/.well-known/oauth-authorization-server")
+for key in ("authorization_endpoint", "token_endpoint", "registration_endpoint"):
+    if not meta.get(key):
+        die(f"server metadata is missing {key}; is OAuth enabled on {BASE}?")
+
+# 2. Register. Every OpenViking client is public + PKCE, so there is no secret
+#    to hold and a fresh registration per login costs nothing.
+client = request(
+    meta["registration_endpoint"],
+    data={
+        "client_name": f"ovx ({PROFILE})",
+        "redirect_uris": [REDIRECT_URI],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "scope": "mcp",
+    },
+)
+client_id = client.get("client_id") or die("registration returned no client_id")
+
+# 3. PKCE. S256 only — the server is OAuth 2.1, which forbids `plain`.
+verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
+challenge = (
+    base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+    .rstrip(b"=")
+    .decode()
+)
+state = secrets.token_urlsafe(16)
+
+# 4. Authorize. The response is a redirect to the authorize page, and the
+#    pending id we need is in its query string.
+authorize_url = meta["authorization_endpoint"] + "?" + urllib.parse.urlencode(
+    {
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": REDIRECT_URI,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+        "scope": "mcp",
+    }
+)
+try:
+    request(authorize_url, opener=NO_REDIRECT, want_json=False)
+except Redirected as r:
+    location = r.location
+else:
+    die("the authorize endpoint did not redirect; cannot find the pending id")
+
+pending = urllib.parse.parse_qs(urllib.parse.urlparse(location).query).get("pending", [""])[0]
+if not pending:
+    die(f"no pending id in the authorize redirect: {location}")
+
+# 5. Read the display code off the server-rendered page.
+page = request(f"{BASE}/oauth/authorize/page?pending={urllib.parse.quote(pending)}",
+               want_json=False)
+found = DISPLAY_CODE.search(page)
+if not found:
+    die("could not read the verification code from the authorize page")
+
+sys.stderr.write(
+    f"\novx: approve this login in OpenViking Studio.\n\n"
+    f"  1. Open  {BASE}/studio/oauth/verify\n"
+    f"  2. Enter  {found.group(1)}\n\n"
+    f"Waiting for approval (Ctrl-C to abort)…\n"
+)
+
+# 6. Poll. We are the only reader, so the code is ours when it is minted.
+deadline = time.monotonic() + POLL_TIMEOUT
+status_url = f"{BASE}/oauth/authorize/page/status?pending={urllib.parse.quote(pending)}"
+code = None
+while time.monotonic() < deadline:
+    try:
+        status = request(status_url)
+    except SystemExit as e:
+        if "HTTP 410" in str(e):
+            die("this login expired or was denied. Run ovx --login again.")
+        raise
+    if status.get("status") == "approved" and status.get("redirect_url"):
+        query = urllib.parse.parse_qs(
+            urllib.parse.urlparse(status["redirect_url"]).query
+        )
+        if query.get("state", [""])[0] != state:
+            die("state mismatch on the authorization response; aborting")
+        code = query.get("code", [""])[0]
+        break
+    time.sleep(POLL_SECONDS)
+
+if not code:
+    die("timed out waiting for approval")
+
+# 7. Exchange the code for tokens.
+token = request(
+    meta["token_endpoint"],
+    form={
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": REDIRECT_URI,
+        "client_id": client_id,
+        "code_verifier": verifier,
+    },
+)
+access = token.get("access_token") or die("token response carried no access_token")
+
+record = {
+    "version": 1,
+    "profile": PROFILE,
+    "base_url": BASE,
+    "client_id": client_id,
+    "access_token": access,
+    "refresh_token": token.get("refresh_token"),
+    # Absolute, computed at receipt: a clock read decides freshness rather
+    # than a countdown nobody is running.
+    "expires_at": int(time.time()) + int(token.get("expires_in") or 0),
+    "token_endpoint": meta["token_endpoint"],
+    "revocation_endpoint": meta.get("revocation_endpoint"),
+}
+
+# 0600 from creation, not a chmod afterwards, so the token is never briefly
+# world-readable. Replacing an existing login is normal, so O_EXCL on a temp
+# name plus a rename rather than O_EXCL on the destination.
+tmp = DEST + ".new"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(record, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, DEST)
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+
+sys.stderr.write(f"ovx: logged in. Token stored for profile '{PROFILE}'.\n")
+PY
+}
+
+# Best-effort revoke, then delete the token file.
+oauth_logout() {
+  local name="$1" file
+  file="$(token_file "$name")"
+  if [[ ! -f "$file" ]]; then
+    echo "ovx: no stored login for profile '$name'." >&2
+    return 0
+  fi
+  OVX_TOKEN_FILE="$file" OVX_VERSION="$OVX_VERSION" python3 <<'PY'
+import json, os, sys, urllib.error, urllib.parse, urllib.request
+
+path = os.environ["OVX_TOKEN_FILE"]
+with open(path) as f:
+    record = json.load(f)
+
+# Revocation is courtesy: the file is going either way, and a server that is
+# down must not leave a token undeletable on disk.
+endpoint = record.get("revocation_endpoint")
+if endpoint and record.get("refresh_token"):
+    body = urllib.parse.urlencode(
+        {
+            "token": record["refresh_token"],
+            "token_type_hint": "refresh_token",
+            "client_id": record.get("client_id", ""),
+        }
+    ).encode()
+    request = urllib.request.Request(
+        endpoint,
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "ovx/" + os.environ.get("OVX_VERSION", "dev"),
+        },
+    )
+    try:
+        urllib.request.urlopen(request, timeout=15).close()
+    except (urllib.error.HTTPError, OSError) as e:
+        sys.stderr.write(f"ovx: could not revoke the token ({e}); removing it locally.\n")
+
+os.unlink(path)
+sys.stderr.write(f"ovx: logged out of profile '{record.get('profile', '?')}'.\n")
+PY
+}
+
+# Print a usable access token for a profile, refreshing it first when it has
+# expired. Silent and exit 1 when there is no stored login, so callers can
+# treat "not logged in" as an ordinary state rather than an error.
+token_current() {
+  local name="$1" file
+  file="$(token_file "$name")"
+  [[ -f "$file" ]] || return 1
+  OVX_TOKEN_FILE="$file" OVX_VERSION="$OVX_VERSION" python3 <<'PY'
+import json, os, sys, time, urllib.error, urllib.parse, urllib.request
+
+# A token inside this window is treated as already gone. Refreshing costs one
+# request; handing ov a token that dies mid-command costs a confusing 401.
+SKEW = 60
+
+path = os.environ["OVX_TOKEN_FILE"]
+try:
+    with open(path) as f:
+        record = json.load(f)
+except (OSError, ValueError) as e:
+    sys.stderr.write(f"ovx: unreadable token file {path}: {e}\n")
+    sys.exit(1)
+
+expires_at = record.get("expires_at") or 0
+if expires_at and time.time() + SKEW >= expires_at:
+    refresh = record.get("refresh_token")
+    endpoint = record.get("token_endpoint")
+    if not refresh or not endpoint:
+        sys.stderr.write("ovx: stored login expired and cannot be refreshed. Run ovx --login.\n")
+        sys.exit(1)
+    body = urllib.parse.urlencode(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh,
+            "client_id": record.get("client_id", ""),
+        }
+    ).encode()
+    request = urllib.request.Request(
+        endpoint,
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "ovx/" + os.environ.get("OVX_VERSION", "dev"),
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            fresh = json.loads(response.read())
+    except (urllib.error.HTTPError, OSError, ValueError) as e:
+        sys.stderr.write(f"ovx: could not refresh the stored login ({e}). Run ovx --login.\n")
+        sys.exit(1)
+    record["access_token"] = fresh.get("access_token") or record["access_token"]
+    # A refresh may rotate the refresh token; keeping the old one would break
+    # the next refresh.
+    record["refresh_token"] = fresh.get("refresh_token") or record["refresh_token"]
+    record["expires_at"] = int(time.time()) + int(fresh.get("expires_in") or 0)
+    tmp = path + ".new"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(record, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+sys.stdout.write(record["access_token"])
+PY
+}
+
 run_ov() {
   local name="$1" conf rc
   TMPROOT="$(mktemp -d "${TMPDIR:-/tmp}/ovx.XXXXXXXX")" || {
@@ -828,6 +1242,12 @@ run_ov() {
   # Named ovcli.conf, not a random name: ov derives sibling paths such as
   # ovcli.conf.<name> from it.
   conf="$TMPROOT/ovcli.conf"
+  # A stored login, refreshed if stale. Absent one, token_current fails and the
+  # profile's own api_key stands — logging in is optional, not a precondition.
+  local token
+  if token="$(token_current "$name")"; then
+    export OVX_OAUTH_TOKEN="$token"
+  fi
   materialize "$name" "$conf" || return $?
   export OPENVIKING_CLI_CONFIG_FILE="$conf"
   rc=0
@@ -849,6 +1269,8 @@ while [[ $# -gt 0 ]]; do
     -n|--new)     NEW=1; shift ;;
     -e|--edit)    EDIT=1; shift ;;
     -d|--delete)  DELETE=1; shift ;;
+    -L|--login)   LOGIN=1; shift ;;
+    --logout)     LOGOUT=1; shift ;;
     --)           shift; OV_ARGS+=("$@"); break ;;
     -*)           echo "ovx: unknown option: $1 (use -- to forward args to ov)" >&2; exit 1 ;;
     *)            PROFILE="$1"; shift
@@ -870,7 +1292,7 @@ fi
 # resolution — means a missing ov fails before the wizard writes a profile to
 # disk. Deleting a profile only edits ovx's own config, so it does not need ov
 # and should not be blocked by its absence.
-if [[ "$DELETE" -ne 1 ]]; then
+if [[ "$DELETE" -ne 1 && "$LOGIN" -ne 1 && "$LOGOUT" -ne 1 ]]; then
   need ov
 fi
 
@@ -889,6 +1311,24 @@ if [[ -n "$names" ]]; then
   while IFS= read -r line; do
     [[ -n "$line" ]] && PROFILE_NAMES+=("$line")
   done <<<"$names"
+fi
+
+if [[ "$LOGIN" -eq 1 || "$LOGOUT" -eq 1 ]]; then
+  action=login
+  [[ "$LOGOUT" -eq 1 ]] && action=logout
+  if [[ -z "$PROFILE" ]]; then
+    PROFILE="$(pick_existing "$action")" || exit $?
+  elif ! has_profile "$PROFILE"; then
+    echo "ovx: profile '$PROFILE' not found." >&2
+    list_profiles >&2
+    exit 1
+  fi
+  if [[ "$LOGOUT" -eq 1 ]]; then
+    oauth_logout "$PROFILE" || exit $?
+  else
+    oauth_login "$PROFILE" || exit $?
+  fi
+  exit 0
 fi
 
 if [[ "$DELETE" -eq 1 ]]; then

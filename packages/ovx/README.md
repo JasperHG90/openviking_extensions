@@ -32,12 +32,19 @@ and the `ov` CLI.
 curl -fsSL https://raw.githubusercontent.com/JasperHG90/openviking_extensions/main/packages/ovx/install.sh | bash
 ```
 
-That installs the newest [release](https://github.com/JasperHG90/openviking_extensions/releases)
+That installs the newest stable [release](https://github.com/JasperHG90/openviking_extensions/releases)
 to `~/.local/bin`. Pin a version, or pick another directory:
 
 ```bash
 curl -fsSL .../install.sh | bash -s -- --version 0.1.0
 curl -fsSL .../install.sh | bash -s -- --to /usr/local/bin
+```
+
+Prereleases are skipped by a bare install, so a beta is something you ask for
+by version and never something the one-liner hands you:
+
+```bash
+curl -fsSL .../install.sh | bash -s -- --version 0.2.0
 ```
 
 The `install.sh` attached to a release is pinned to that release, so taking the
@@ -70,6 +77,8 @@ ovx -n                 # create a profile, then run ov
 ovx -e lab             # edit `lab`, then run ov
 ovx -d lab             # delete `lab`, after confirmation
 ovx -l                 # list profiles
+ovx -L lab             # log in to `lab` through Studio, store the token
+ovx --logout lab       # revoke and forget `lab`'s stored login
 ovx -V                 # show the ovx version
 ovx -- -o json status  # pick a profile, forward `-o json status` to ov
 ```
@@ -89,6 +98,50 @@ checks every option the parser accepts appears there.
 Each run prints a one-line banner to stderr naming the profile, its URL, and a
 masked key, so you can see which instance you are about to hit. It is skipped
 when stderr is not a terminal, so it never lands in a pipeline.
+
+## Logging in
+
+`ovx -L lab` runs OpenViking's own OAuth 2.1 flow, so a profile can work with
+no API key at all:
+
+```
+$ ovx -L lab
+
+ovx: approve this login in OpenViking Studio.
+
+  1. Open  https://openviking.example.com/studio/oauth/verify
+  2. Enter  K7MPQ2
+
+Waiting for approval (Ctrl-C to abort)…
+ovx: logged in. Token stored for profile 'lab'.
+```
+
+Open that URL wherever you are already signed in to Studio, type the code, and
+`ovx` stores the resulting token at `~/.ovx/tokens/lab.json`, mode `600`. Later
+runs use it and refresh it when it expires, so you log in again only when the
+refresh token itself runs out. `ovx --logout lab` revokes it server-side and
+deletes the file.
+
+A stored token outranks the profile's own `api_key`, so a profile can carry
+both — the key stays as a fallback for when you have not logged in.
+
+### Why it polls instead of listening
+
+Most CLI logins open a browser and catch the redirect on `127.0.0.1`. This one
+does not, because OpenViking mints the authorization code inside the status
+endpoint, and that read *deletes* the pending row — the code is single-use
+across readers, not just across exchanges. Studio's consent page polls that
+same endpoint in a loop, so pointing you there would race `ovx` and win.
+
+Studio's *verify* page has no pending id and cannot poll, so sending you there
+with a code to type leaves `ovx` the only reader. No listener, no port to pick,
+no redirect URI that has to be reachable — and it works when the browser is on
+a different machine from the terminal.
+
+The six-character code is only rendered into the authorize page's HTML; the
+JSON endpoint withholds it deliberately. `ovx` reads it from that page, which
+needs no credential and already shows the code to anyone holding the pending
+id. That is a seam an upstream redesign could move.
 
 ## Config
 
@@ -166,6 +219,14 @@ What that buys you is a key on disk for the seconds a command runs instead of
 indefinitely. It is not erasure: `rm` unlinks the file, and on an SSD the blocks
 may persist until they are reused. If your threat model includes someone
 imaging the disk, this is the wrong tool.
+
+A stored OAuth token is the one thing `ovx` does leave on disk, at
+`~/.ovx/tokens/<profile>.json`, mode `600`. That is a real trade and worth
+naming: a `$VAR` reference keeps nothing, a token keeps something. What you get
+back is that the something expires, can be refreshed without you, and can be
+revoked from the server — none of which is true of the static key it replaces.
+If you would rather keep nothing at all, do not log in; `$VAR` profiles still
+work exactly as before.
 
 `ovx` also does not hide the key from the machine while it runs. It is in the
 environment you exported it from, and any process running as you can read it.

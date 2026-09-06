@@ -11,6 +11,9 @@ tests drive the script through a pty.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import http.server
 import json
 import os
 import pty
@@ -21,11 +24,13 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 import tomllib
+import urllib.parse
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -814,3 +819,487 @@ def test_real_ov_reads_the_materialized_config(
     assert seen[0].get("x-api-key") == "key-from-env", seen[0]
     # And the decoy is untouched: ovx never writes to ~/.openviking.
     assert json.loads((ov_home / "ovcli.conf").read_text())["api_key"] == "key-from-home"
+
+
+# --- OAuth login ---------------------------------------------------------
+#
+# These drive the real flow against a real HTTP server standing in for
+# OpenViking, rather than mocking urllib inside the script's heredocs. The
+# script's HTTP calls are the thing under test, so faking them out would leave
+# the interesting half unexercised.
+
+
+class FakeOpenViking(http.server.BaseHTTPRequestHandler):
+    """The five OAuth endpoints ovx talks to, plus a record of what arrived."""
+
+    seen: ClassVar[dict[str, Any]] = {}
+    approve_after: int = 0
+    # When set, the approved redirect carries a state ovx never sent, which is
+    # what a cross-session or forged response would look like.
+    corrupt_state: bool = False
+
+    def _send(self, status: int, body: bytes, ctype: str = "application/json") -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, status: int, payload: dict[str, Any]) -> None:
+        self._send(status, json.dumps(payload).encode())
+
+    def do_GET(self) -> None:
+        """Serve metadata, the authorize redirect, the page, and the status poll."""
+        parsed = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+        base = f"http://{self.headers['Host']}"
+
+        if parsed.path == "/.well-known/oauth-authorization-server":
+            self._json(
+                200,
+                {
+                    "issuer": base,
+                    "authorization_endpoint": f"{base}/authorize",
+                    "token_endpoint": f"{base}/token",
+                    "registration_endpoint": f"{base}/register",
+                    "revocation_endpoint": f"{base}/revoke",
+                },
+            )
+        elif parsed.path == "/authorize":
+            self.seen["authorize"] = {k: v[0] for k, v in query.items()}
+            self.send_response(302)
+            self.send_header("Location", f"{base}/oauth/authorize/page?pending=PEND123")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif parsed.path == "/oauth/authorize/page":
+            self.seen["page_pending"] = query.get("pending", [""])[0]
+            self._send(
+                200,
+                b'<div class="code" id="displayCode">K7MPQ2</div>',
+                "text/html",
+            )
+        elif parsed.path == "/oauth/authorize/page/status":
+            polls = self.seen.get("polls", 0) + 1
+            self.seen["polls"] = polls
+            if polls <= type(self).approve_after:
+                self._json(200, {"status": "pending"})
+                return
+            state = self.seen.get("authorize", {}).get("state", "")
+            if type(self).corrupt_state:
+                state = "not-the-state-ovx-sent"
+            redirect = self.seen.get("authorize", {}).get("redirect_uri", "")
+            self._json(
+                200,
+                {
+                    "status": "approved",
+                    "redirect_url": f"{redirect}?code=AUTHCODE&state={state}",
+                },
+            )
+        else:
+            self._json(404, {"error": "not_found"})
+
+    def do_POST(self) -> None:
+        """Serve client registration, token exchange, and revocation."""
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length).decode()
+        parsed = urllib.parse.urlparse(self.path)
+
+        if parsed.path == "/register":
+            self.seen["register"] = json.loads(raw)
+            self._json(201, {"client_id": "client-abc"})
+        elif parsed.path == "/token":
+            form = {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
+            self.seen.setdefault("token", []).append(form)
+            grant = form.get("grant_type")
+            suffix = "refreshed" if grant == "refresh_token" else "first"
+            self._json(
+                200,
+                {
+                    "access_token": f"ovat_{suffix}",
+                    "refresh_token": f"ovrt_{suffix}",
+                    "expires_in": 3600,
+                    "token_type": "Bearer",
+                },
+            )
+        elif parsed.path == "/revoke":
+            self.seen["revoke"] = {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
+            self._json(200, {})
+        else:
+            self._json(404, {"error": "not_found"})
+
+    def log_message(self, *args: object) -> None:
+        """Keep the server quiet; pytest captures enough already."""
+
+
+@pytest.fixture
+def oauth_server() -> Iterator[tuple[str, dict[str, Any]]]:
+    """Serve a stand-in OpenViking OAuth server; yield its base URL and record."""
+    FakeOpenViking.seen = {}
+    FakeOpenViking.approve_after = 0
+    FakeOpenViking.corrupt_state = False
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeOpenViking)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}", FakeOpenViking.seen
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def token_path(workspace: Path, name: str = "lab") -> Path:
+    """Where ovx stores the login for a profile."""
+    return workspace / "ovx" / "tokens" / f"{name}.json"
+
+
+def test_login_stores_a_token(
+    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+) -> None:
+    """A full login writes the access and refresh tokens to a private file."""
+    url, _seen = oauth_server
+    write_config(config, f'["lab"]\nurl = "{url}"\n')
+
+    result = run(["--login", "lab"])
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    stored = json.loads(token_path(workspace).read_text())
+    assert stored["access_token"] == "ovat_first"
+    assert stored["refresh_token"] == "ovrt_first"
+    assert stored["client_id"] == "client-abc"
+    assert stored["expires_at"] > time.time()
+
+
+def test_login_token_file_is_private(
+    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+) -> None:
+    """The stored token is readable only by its owner."""
+    url, _seen = oauth_server
+    write_config(config, f'["lab"]\nurl = "{url}"\n')
+
+    run(["--login", "lab"])
+
+    mode = stat.S_IMODE(token_path(workspace).stat().st_mode)
+    assert mode == 0o600, oct(mode)
+
+
+def test_login_prints_the_code_and_where_to_enter_it(
+    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+) -> None:
+    """The operator is told the six-character code and the Studio URL."""
+    url, _seen = oauth_server
+    write_config(config, f'["lab"]\nurl = "{url}"\n')
+
+    result = run(["--login", "lab"])
+
+    assert "K7MPQ2" in result.stderr, result.stderr
+    assert f"{url}/studio/oauth/verify" in result.stderr, result.stderr
+
+
+def test_login_uses_pkce_s256(
+    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+) -> None:
+    """The challenge is the S256 digest of the verifier sent at token exchange.
+
+    OAuth 2.1 forbids ``plain``, and a challenge that does not match its
+    verifier would be accepted by a server that never checks — so the test
+    recomputes it rather than trusting the method parameter alone.
+    """
+    url, seen = oauth_server
+    write_config(config, f'["lab"]\nurl = "{url}"\n')
+
+    run(["--login", "lab"])
+
+    assert seen["authorize"]["code_challenge_method"] == "S256"
+    verifier = seen["token"][0]["code_verifier"]
+    expected = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+        .rstrip(b"=")
+        .decode()
+    )
+    assert seen["authorize"]["code_challenge"] == expected
+
+
+def test_login_polls_until_approved(
+    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+) -> None:
+    """A status that is not yet approved is polled again, not treated as failure."""
+    url, seen = oauth_server
+    FakeOpenViking.approve_after = 1
+    write_config(config, f'["lab"]\nurl = "{url}"\n')
+
+    result = run(["--login", "lab"])
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert seen["polls"] >= 2, seen
+    assert token_path(workspace).exists()
+
+
+def test_stored_token_becomes_the_api_key(
+    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+) -> None:
+    """After login, ov is handed the OAuth token in the api_key field."""
+    url, _seen = oauth_server
+    write_config(config, f'["lab"]\nurl = "{url}"\n')
+    run(["--login", "lab"])
+
+    result = run(["lab", "health"])
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert shim_log(workspace).config["api_key"] == "ovat_first"
+
+
+def test_stored_token_outranks_the_profile_api_key(
+    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+) -> None:
+    """A logged-in profile ignores its own api_key rather than sending a stale one."""
+    url, _seen = oauth_server
+    write_config(config, f'["lab"]\nurl = "{url}"\napi_key = "static-key"\n')
+    run(["--login", "lab"])
+
+    run(["lab", "health"])
+
+    assert shim_log(workspace).config["api_key"] == "ovat_first"
+
+
+def test_expired_token_is_refreshed_before_use(
+    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+) -> None:
+    """An expired access token is exchanged for a fresh one, and the file updated."""
+    url, seen = oauth_server
+    write_config(config, f'["lab"]\nurl = "{url}"\n')
+    run(["--login", "lab"])
+
+    stored = token_path(workspace)
+    record = json.loads(stored.read_text())
+    record["expires_at"] = int(time.time()) - 10
+    stored.write_text(json.dumps(record))
+
+    result = run(["lab", "health"])
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert shim_log(workspace).config["api_key"] == "ovat_refreshed"
+    grants = [form["grant_type"] for form in seen["token"]]
+    assert "refresh_token" in grants, grants
+    # The rotated refresh token replaces the old one, or the next refresh fails.
+    assert json.loads(stored.read_text())["refresh_token"] == "ovrt_refreshed"
+
+
+def test_unexpired_token_is_not_refreshed(
+    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+) -> None:
+    """A live token is used as-is; ovx does not spend a round trip per command."""
+    url, seen = oauth_server
+    write_config(config, f'["lab"]\nurl = "{url}"\n')
+    run(["--login", "lab"])
+
+    run(["lab", "health"])
+
+    assert [form["grant_type"] for form in seen["token"]] == ["authorization_code"]
+
+
+def test_logout_revokes_and_removes_the_token(
+    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+) -> None:
+    """Logout tells the server to revoke, then deletes the local file."""
+    url, seen = oauth_server
+    write_config(config, f'["lab"]\nurl = "{url}"\n')
+    run(["--login", "lab"])
+
+    result = run(["--logout", "lab"])
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert not token_path(workspace).exists()
+    assert seen["revoke"]["token"] == "ovrt_first"
+    assert seen["revoke"]["token_type_hint"] == "refresh_token"
+
+
+def test_logout_removes_the_token_when_the_server_is_gone(
+    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+) -> None:
+    """A server that cannot be reached must not leave a token undeletable."""
+    url, _seen = oauth_server
+    write_config(config, f'["lab"]\nurl = "{url}"\n')
+    run(["--login", "lab"])
+
+    stored = token_path(workspace)
+    record = json.loads(stored.read_text())
+    # Port 9 is discard: it refuses or blackholes, so the revoke cannot succeed.
+    record["revocation_endpoint"] = "http://127.0.0.1:9/revoke"
+    stored.write_text(json.dumps(record))
+
+    result = run(["--logout", "lab"])
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert not stored.exists()
+
+
+def test_logout_without_a_login_is_not_an_error(
+    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+) -> None:
+    """Logging out twice is the same as logging out once."""
+    url, _seen = oauth_server
+    write_config(config, f'["lab"]\nurl = "{url}"\n')
+
+    result = run(["--logout", "lab"])
+
+    assert result.returncode == 0, result.stderr
+    assert "no stored login" in result.stderr
+
+
+def test_login_and_logout_do_not_need_ov(
+    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+) -> None:
+    """Neither runs ov, so neither should require it to be installed."""
+    url, _seen = oauth_server
+    write_config(config, f'["lab"]\nurl = "{url}"\n')
+    (workspace / "bin" / "ov").unlink()
+
+    assert run(["--login", "lab"]).returncode == 0
+    assert run(["--logout", "lab"]).returncode == 0
+
+
+def test_login_rejects_a_mismatched_state(
+    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+) -> None:
+    """A redirect carrying someone else's state is refused, not exchanged."""
+    url, seen = oauth_server
+    write_config(config, f'["lab"]\nurl = "{url}"\n')
+    FakeOpenViking.corrupt_state = True
+
+    result = run(["--login", "lab"])
+
+    assert result.returncode != 0
+    assert "state mismatch" in result.stderr, result.stderr
+    assert not token_path(workspace).exists()
+    # And it stopped before spending the code, rather than exchanging first.
+    assert "token" not in seen, seen
+
+
+def test_login_on_unknown_profile_is_rejected(
+    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+) -> None:
+    """A typo names a profile that does not exist rather than starting a flow."""
+    url, _seen = oauth_server
+    write_config(config, f'["lab"]\nurl = "{url}"\n')
+
+    result = run(["--login", "nope"])
+
+    assert result.returncode != 0
+    assert "not found" in result.stderr
+
+
+# --- install.sh ----------------------------------------------------------
+
+INSTALLER = Path(__file__).resolve().parent.parent / "install.sh"
+
+# What the GitHub releases API returns: newest first, prereleases mixed in,
+# and other packages' releases alongside ovx's. Compact like the real body.
+RELEASES_JSON = (
+    '[{"id":3,"author":{"login":"someone"},"tag_name":"ovx-v0.2.0",'
+    '"draft":false,"prerelease":true,"assets":[{"id":9,"name":"ovx.sh"}]},'
+    '{"id":2,"author":{"login":"someone"},"tag_name":"v0.2.0",'
+    '"draft":false,"prerelease":false,"assets":[]},'
+    '{"id":1,"author":{"login":"someone"},"tag_name":"ovx-v0.1.0",'
+    '"draft":false,"prerelease":false,"assets":[{"id":7,"name":"ovx.sh"}]}]'
+)
+
+# Stands in for curl. Answers the releases API from $FAKE_RELEASES and serves
+# any download as a script that reports the version out of its own URL, so a
+# test can see which release the installer chose.
+CURL_SHIM = """#!/usr/bin/env bash
+url=""
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+if [[ "$url" == *api.github.com* ]]; then
+  cat "$FAKE_RELEASES"
+  exit 0
+fi
+version="${url#*/download/ovx-v}"
+version="${version%/ovx.sh}"
+body="#!/usr/bin/env bash
+echo \\"ovx $version\\""
+if [ -n "$out" ]; then printf '%s\\n' "$body" > "$out"; else printf '%s\\n' "$body"; fi
+"""
+
+
+@pytest.fixture
+def installer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """PATH with a curl that serves canned releases. Returns the install dir."""
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir()
+    curl = bindir / "curl"
+    curl.write_text(CURL_SHIM)
+    curl.chmod(0o755)
+
+    releases = tmp_path / "releases.json"
+    releases.write_text(RELEASES_JSON)
+
+    target = tmp_path / "target"
+    monkeypatch.setenv("FAKE_RELEASES", str(releases))
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    return target
+
+
+def run_installer(args: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run install.sh with the current environment."""
+    return subprocess.run(
+        ["bash", str(INSTALLER), *args],
+        env=dict(os.environ),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def test_default_install_skips_prereleases(installer: Path) -> None:
+    """A bare install gets the newest stable release, not a newer beta.
+
+    The releases endpoint returns prereleases too, so "pre-release" on GitHub
+    only means something if the installer reads the flag. Without this, cutting
+    a beta silently changes what everyone's `curl | bash` hands them.
+    """
+    result = run_installer(["--to", str(installer)])
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "installed ovx 0.1.0" in result.stderr, result.stderr
+
+
+def test_default_install_ignores_other_packages_releases(installer: Path) -> None:
+    """A stable release of another package in this repo is not an ovx version."""
+    result = run_installer(["--to", str(installer)])
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    # v0.2.0 is ov-postgres', and sorts newest of the stable ones.
+    assert "0.2.0" not in result.stderr.split("downloading")[1].split("\n")[0]
+
+
+def test_explicit_version_installs_the_prerelease(installer: Path) -> None:
+    """--version is how a beta is opted into, and it bypasses the filter."""
+    result = run_installer(["--to", str(installer), "--version", "0.2.0"])
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "installed ovx 0.2.0" in result.stderr, result.stderr
+
+
+def test_no_stable_release_is_a_clear_error(
+    installer: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When every ovx release is a prerelease, say so instead of installing one."""
+    only_beta = tmp_path / "beta-only.json"
+    only_beta.write_text(
+        '[{"id":3,"author":{"login":"someone"},"tag_name":"ovx-v0.2.0",'
+        '"draft":false,"prerelease":true,"assets":[]}]'
+    )
+    monkeypatch.setenv("FAKE_RELEASES", str(only_beta))
+
+    result = run_installer(["--to", str(installer)])
+
+    assert result.returncode != 0
+    assert "found no published ovx-v* release" in result.stderr
+    assert "--version" in result.stderr
