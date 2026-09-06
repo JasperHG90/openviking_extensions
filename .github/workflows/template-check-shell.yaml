@@ -1,0 +1,51 @@
+# Test one shell package. Lint, format and shellcheck run once repo-wide in
+# ci.yaml's checks job; this workflow exists for what that job cannot cover —
+# running the suite against more than one bash.
+name: template-check-shell
+
+on:
+  workflow_call:
+    inputs:
+      package:
+        description: "Directory name under packages/, e.g. ovx."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: '0.10.x'
+
+jobs:
+  check:
+    name: ${{ inputs.package }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS still ships bash 3.2, so it rejects bash 4 syntax that passes
+        # everywhere else -- and it is what most contributors on a Mac will
+        # run this under. ubuntu covers bash 5.
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: "packages/${{ inputs.package }}/uv.lock"
+
+      # Which bash ran the suite is the first thing to know when one of these
+      # jobs fails and its twin passes.
+      - name: Show the bash under test
+        run: bash --version
+
+      # A shell package stands outside the root uv workspace, so it syncs from
+      # its own lock. --locked fails if that lock has drifted.
+      - name: Run unit tests
+        run: >
+          uv run --locked --directory packages/${{ inputs.package }}
+          pytest -v -m "not integration" --color=yes --tb=short

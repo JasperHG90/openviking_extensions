@@ -9,6 +9,13 @@ repos:
   # Hooks below are scoped per package. A new package adds its own entries
   # with its own `files:` pattern; ruff needs no scoping because each package
   # carries its own [tool.ruff] and ruff picks the nearest config per file.
+  - repo: https://github.com/koalaman/shellcheck-precommit
+    rev: v0.10.0
+    hooks:
+      - id: shellcheck
+        name: shellcheck (ovx)
+        files: ^packages/ovx/.*\.sh$
+
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.18.2
     hooks:
@@ -21,6 +28,13 @@ repos:
           - pytest>=7
         args: [--config-file=packages/ov-postgres/pyproject.toml]
 
+      - id: mypy
+        name: mypy (ovx)
+        files: ^packages/ovx/tests/
+        additional_dependencies:
+          - pytest>=8
+        args: [--config-file=packages/ovx/pyproject.toml]
+
   - repo: local
     hooks:
       # The unit suite is fast and offline, so it runs on every commit.
@@ -32,3 +46,12 @@ repos:
         pass_filenames: false
         files: ^packages/ov-postgres/
         types: [python]
+
+      # No `types:` filter: ovx is a shell script, so a change to the thing
+      # under test is a .sh change, not a .py one.
+      - id: pytest-unit-ovx
+        name: pytest (ovx, unit)
+        entry: uv run --directory packages/ovx pytest
+        language: system
+        pass_filenames: false
+        files: ^packages/ovx/
