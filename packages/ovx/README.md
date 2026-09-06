@@ -32,17 +32,27 @@ and the `ov` CLI.
 curl -fsSL https://raw.githubusercontent.com/JasperHG90/openviking_postgres/main/packages/ovx/install.sh | bash
 ```
 
-It installs to `~/.local/bin`. Pick another directory with `--to`:
+It installs the tip of `main` to `~/.local/bin`. Pin a
+[release](https://github.com/JasperHG90/openviking_postgres/releases), or pick
+another directory, with `--version` and `--to`:
 
 ```bash
+curl -fsSL .../install.sh | bash -s -- --version X.Y.Z
 curl -fsSL .../install.sh | bash -s -- --to /usr/local/bin
 ```
+
+The `install.sh` attached to a release defaults to that release, so downloading
+the pair from a release page needs no `--version`.
 
 Or from a clone:
 
 ```bash
 ./packages/ovx/install.sh --local packages/ovx/ovx.sh
 ```
+
+`ovx -V` reports the installed version. A copy taken from `main` or from a
+clone says `dev`: the version lives in the git tag, and only the release
+stamps it into the script.
 
 > On a stock macOS, `python3` is 3.9 and has no `tomllib`. Install a newer one
 > (`brew install python@3.12`, or `uv python install`) and put it ahead on
@@ -59,12 +69,21 @@ ovx -n                 # create a profile, then run ov
 ovx -e lab             # edit `lab`, then run ov
 ovx -d lab             # delete `lab`, after confirmation
 ovx -l                 # list profiles
+ovx -V                 # show the ovx version
 ovx -- -o json status  # pick a profile, forward `-o json status` to ov
 ```
 
-Everything after the profile name is passed to `ov` untouched. An option meant
-for `ov` has to come after the profile name, or after `--`; anything before it
-belongs to `ovx`.
+Everything after the profile name goes to `ov` untouched, so `ov`'s own
+subcommands and flags need no escaping — `ovx lab -o json status` works as
+written. A `--` is only needed when no profile name comes first, as in
+`ovx -- -o json status`, where `ovx` would otherwise read `-o` as its own
+option. One straight after the profile name is allowed and dropped, so
+`ovx lab -- -o json status` does the same thing as without it.
+
+`ovx --help` prints the comment block at the top of `ovx.sh`, so the help and
+the file's own header are one text rather than two that can disagree. It then
+adds the config file actually in force, which the header cannot know. A test
+checks every option the parser accepts appears there.
 
 Each run prints a one-line banner to stderr naming the profile, its URL, and a
 masked key, so you can see which instance you are about to hit. It is skipped
@@ -134,9 +153,11 @@ with Ctrl-C. `ov` runs as a child process rather than through `exec`, precisely
 so `ovx` survives to clean up.
 
 `ovx` does not trap `SIGINT` by name; bash runs the exit trap on its way out
-anyway, and trapping the signal would only convert "killed by SIGINT" into
-"exited 130", hiding from a calling script that the command was interrupted
-rather than that it failed. A `SIGKILL` leaves the file behind, as it must.
+anyway, so naming the signal would clean up no more than that does and would
+flatten every interrupt into a plain exit code. Left alone, `ovx` either dies
+from the signal or reports `ov`'s `128+n` — which of the two depends on
+scheduling, and both tell a calling script the command was interrupted rather
+than that it failed. A `SIGKILL` leaves the file behind, as it must.
 
 What that buys you is a key on disk for the seconds a command runs instead of
 indefinitely. It is not erasure: `rm` unlinks the file, and on an SSD the blocks

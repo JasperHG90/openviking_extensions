@@ -41,13 +41,13 @@ uv run --directory packages/ovx pytest        # its own project, its own lock
 
 One workflow, [`ci.yaml`](.github/workflows/ci.yaml), covers the repo: repo-wide checks run once, then each package whose files changed is tested by the template that fits it. [`template-check.yaml`](.github/workflows/template-check.yaml) tests a Python package across its supported interpreters and builds and imports its wheel; [`template-check-shell.yaml`](.github/workflows/template-check-shell.yaml) runs a shell package's suite on both Ubuntu and macOS, since macOS still ships bash 3.2 and rejects syntax every other bash accepts.
 
-Adding a package means adding one filter block to `ci.yaml` and its name to whichever of the two fallback lists matches its template. A Python package also goes in the workspace members in [`pyproject.toml`](pyproject.toml).
+Adding a package means adding one filter block to `ci.yaml` and its name to whichever of the two fallback lists matches its template. It also needs an entry in `release.yaml`'s `package` choice, and — for a shell package — its name in the `'["ovx"]'` literal that `release.yaml` tests against to pick a template. GitHub Actions cannot share a list between workflows or choose a reusable workflow from an expression, so that name is repeated rather than defined once. A Python package also goes in the workspace members in [`pyproject.toml`](pyproject.toml).
 
 ## Releases
 
-`ovx` has no release path yet: `release.yaml` builds a wheel and reads its version from hatch-vcs, neither of which fits a bash script. Install it from `main` with its [install script](packages/ovx/README.md#install).
+Each package releases on its own, from the manual [`release.yaml`](.github/workflows/release.yaml) workflow (Actions → release). Pick the package and an increment — a plain PATCH/MINOR/MAJOR bump of the package's newest tag — or type an explicit version, and run with `dry_run` first to see the plan. A real run re-tests the package, pushes an annotated `<package>-v<version>` tag, and publishes a GitHub release carrying the built artifacts. Nothing releases on push.
 
-Each Python package releases on its own, from the manual [`release.yaml`](.github/workflows/release.yaml) workflow (Actions → release). Pick the package and an increment — a plain PATCH/MINOR/MAJOR bump of the package's newest tag — or type an explicit version, and run with `dry_run` first to see the plan. A real run re-tests the package, pushes an annotated `<package>-v<version>` tag, and publishes a GitHub release carrying the built artifacts. hatch-vcs reads the version straight from that tag, so the tag is the only place a version exists. Nothing releases on push.
+The tag is the only place a version exists. A Python package gets there through hatch-vcs, which reads the tag at build time. A shell package has no wheel and no hatch-vcs, so the release stamps the version into a copy of the script and attaches that with its install script — a checkout reports `dev`, because an untagged working copy has no version to claim.
 
 ## License
 

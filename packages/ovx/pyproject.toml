@@ -10,7 +10,11 @@
 # matrix.
 [project]
 name = "ovx"
-version = "0.1.0"
+# Inert placeholder, not the released version. uv rejects a [project] table
+# without one, but nothing is built from this file: ovx releases as a stamped
+# copy of ovx.sh and its version lives in the git tag. A real number here would
+# be a second version string, free to disagree with the tag and never noticed.
+version = "0"
 description = "Run ov against a profile, without leaving an API key on disk."
 requires-python = ">=3.11"
 dependencies = []

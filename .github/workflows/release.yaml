@@ -10,6 +10,7 @@ on:
         required: true
         options:
           - ov-postgres
+          - ovx
       increment:
         description: "Bump of the package's newest tag; ignored when version is set."
         type: choice
@@ -52,15 +53,35 @@ jobs:
           exit 1
 
   # Gates the tag: nothing gets tagged that does not pass its own checks.
+  #
+  # Two jobs, because `uses:` cannot be chosen from an expression. Exactly one
+  # runs and the other skips. The shell-package list repeats ALL_SHELL in
+  # ci.yaml -- there is no way to share a list between workflows, so a new
+  # shell package has to be added in both.
   test:
     needs: guard
+    if: ${{ !contains(fromJSON('["ovx"]'), inputs.package) }}
     uses: ./.github/workflows/template-check.yaml
+    with:
+      package: ${{ inputs.package }}
+
+  test-shell:
+    needs: guard
+    if: ${{ contains(fromJSON('["ovx"]'), inputs.package) }}
+    uses: ./.github/workflows/template-check-shell.yaml
     with:
       package: ${{ inputs.package }}
 
   release:
     name: plan and tag
-    needs: [guard, test]
+    needs: [guard, test, test-shell]
+    # One of the two test jobs always skips, and a skipped need would block
+    # this job under the default rule. Proceed unless something actually
+    # failed or was cancelled.
+    if: >-
+      ${{ !cancelled()
+          && !contains(needs.*.result, 'failure')
+          && !contains(needs.*.result, 'cancelled') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write # push the tag
@@ -186,13 +207,16 @@ jobs:
           fetch-depth: 0
 
       - uses: astral-sh/setup-uv@v6
+        if: ${{ !contains(fromJSON('["ovx"]'), inputs.package) }}
         with:
           version: ${{ env.UV_VERSION }}
 
       - name: Build package
+        if: ${{ !contains(fromJSON('["ovx"]'), inputs.package) }}
         run: uv build --package ${{ inputs.package }}
 
       - name: Verify the built version matches the tag
+        if: ${{ !contains(fromJSON('["ovx"]'), inputs.package) }}
         env:
           VERSION: ${{ needs.release.outputs.version }}
           PACKAGE: ${{ inputs.package }}
@@ -202,6 +226,42 @@ jobs:
           built=$(ls dist/*.whl | sed -E "s/.*${module}-([^-]+)-py3.*/\1/")
           echo "planned=$VERSION built=$built"
           test "$VERSION" = "$built"
+
+      # A shell package has nothing to compile. hatch-vcs cannot stamp a
+      # version into it either, so do it here: the script carries
+      # <PACKAGE>_VERSION="dev" in a checkout, and the release ships a copy
+      # reporting the tag. The version still lives only in the tag.
+      - name: Package the shell script
+        if: ${{ contains(fromJSON('["ovx"]'), inputs.package) }}
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          PACKAGE: ${{ inputs.package }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          src="packages/$PACKAGE/$PACKAGE.sh"
+          var="$(printf '%s' "$PACKAGE" | tr 'a-z-' 'A-Z_')_VERSION"
+
+          sed "s/^${var}=\"dev\"\$/${var}=\"${VERSION}\"/" "$src" > "dist/$PACKAGE.sh"
+          chmod 755 "dist/$PACKAGE.sh"
+
+          # Point the shipped installer at this release's asset. Copied
+          # unchanged it would default to main, so someone downloading
+          # install.sh from the release page would get main's script sitting
+          # next to the pinned one -- the opposite of what a release is for.
+          asset="https://github.com/$GITHUB_REPOSITORY/releases/download"
+          sed "s|^DEFAULT_URL=.*|DEFAULT_URL=\"$asset/$PACKAGE-v$VERSION/$PACKAGE.sh\"|" \
+            "packages/$PACKAGE/install.sh" > dist/install.sh
+          chmod 755 dist/install.sh
+
+          # Both stamps are plain seds against lines that could be renamed at
+          # any time. Check them rather than trust them, so a tagged release
+          # can never ship a script reporting "dev" or an installer pointing
+          # at the wrong place.
+          got="$(bash "dist/$PACKAGE.sh" -V)"
+          echo "planned=$PACKAGE $VERSION got=$got"
+          test "$got" = "$PACKAGE $VERSION"
+          grep -q "releases/download/$PACKAGE-v$VERSION/$PACKAGE.sh" dist/install.sh
 
       - name: Create GitHub Release
         env:

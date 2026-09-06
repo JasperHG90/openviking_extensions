@@ -1,14 +1,60 @@
 #!/usr/bin/env bash
-# ovx — run ov against a profile from ~/.ovx/config.toml, without ever
-# leaving an API key on disk.
+# ovx — run ov against a profile, without leaving an API key on disk.
 #
 # ov reads its client settings from ovcli.conf, normally ~/.openviking/ovcli.conf,
 # where the API key sits in plain text for as long as the file exists. ovx keeps
 # the key out of that file: a profile holds a $VAR reference, ovx expands it from
 # the environment at launch, writes the result to a private temporary file, points
 # $OPENVIKING_CLI_CONFIG_FILE at it, runs ov, and deletes the file on the way out.
+#
+# Usage: ovx [PROFILE] [ov args...]
+#
+# Options:
+#   -l, --list       List configured profiles and exit
+#   -n, --new        Run the create-profile wizard, then run ov with it
+#   -e, --edit [P]   Edit profile P (or pick one) in the wizard, then run ov
+#   -d, --delete [P] Delete profile P (or pick one), after confirmation
+#   -V, --version    Show the ovx version and exit
+#   -h, --help       Show this help
+#
+# Behavior:
+#   ovx                    Interactive: pick a profile, create a new one, or edit
+#   ovx lab                Run bare 'ov' with profile 'lab'
+#   ovx lab find "query"   Run 'ov find "query"' with profile 'lab'
+#   ovx -e lab             Edit profile 'lab' (pre-filled), then run ov
+#   ovx -e                 Pick a profile to edit
+#   ovx -d lab             Delete profile 'lab', after confirmation
+#   ovx -- -o json status  Pick a profile, forward '-o json status' to ov
+#
+# Everything after the profile name goes to ov untouched, so ov's own
+# subcommands and flags need no escaping: 'ovx lab -o json status' works as
+# written. A '--' is only needed when no profile name comes first, as in
+# 'ovx -- -o json status', where ovx would otherwise read '-o' as its own.
+# A '--' straight after the profile name is allowed and dropped, so
+# 'ovx lab -- -o json status' passes '-o json status' to ov as well.
+#
+# Config: ~/.ovx/config.toml  (override with $OVX_CONFIG_FILE or $OVX_DIR)
+# Format: TOML, one [profile] table per OpenViking instance. Keys are the keys
+# of ovcli.conf:
+#
+#   [lab]
+#   url = "https://openviking.example.com"
+#   api_key = "$OV_LAB_API_KEY"   # expanded from env at launch
+#   account = "acme"
+#   user = "jasper"
+#
+# 'url' is required. A value containing $VAR or ${VAR} is expanded from your
+# environment at launch; an unresolved reference is an error, so a missing
+# secret fails loudly instead of running against a half-built config.
 
 set -euo pipefail
+
+# Stamped with the release version when release.yaml packages this script for
+# a GitHub release. A checkout or a copy taken straight from main reads "dev",
+# which is the honest answer: the version lives in the git tag, and an
+# unreleased working copy has no tag to claim.
+OVX_VERSION="dev"
+OVX_HOMEPAGE="https://github.com/JasperHG90/openviking_postgres/tree/main/packages/ovx"
 
 OVX_DIR="${OVX_DIR:-$HOME/.ovx}"
 CONFIG_FILE="${OVX_CONFIG_FILE:-$OVX_DIR/config.toml}"
@@ -58,50 +104,36 @@ OV_ARGS=()
 # Set once a temporary config exists, so the exit trap knows what to remove.
 TMPROOT=""
 
+# Print the comment block at the top of this file as the help text: the
+# documentation a reader sees on opening the script IS the documentation
+# --help prints, so the two cannot drift apart. Everything from line 2 to the
+# first blank line, with the leading "# " stripped.
+#
+# Keeping the text in a comment rather than a heredoc also means no
+# backslash-escaping: $VAR and ${VAR} appear in the help exactly as they must
+# be typed into a config file.
 usage() {
-  cat <<EOF
+  local body=""
+  # $0 is not always this file: `bash < ovx.sh` makes it "bash", and a stripped
+  # copy may not be readable. awk is POSIX and effectively always present, but
+  # --help runs before need(), so check rather than fail with "awk: not found".
+  if [[ -r "$0" ]] && command -v awk >/dev/null 2>&1; then
+    body="$(awk 'NR == 1 { next }                       # skip the shebang
+                 /^#/    { sub(/^# ?/, ""); print; next }
+                 { exit }' "$0")"
+  fi
+  if [[ -z "$body" ]]; then
+    body="ovx — run ov against a profile, without leaving an API key on disk.
+
 Usage: ovx [PROFILE] [ov args...]
 
-Run ov against a profile from $CONFIG_FILE.
-
-A profile holds the client settings ov reads from ovcli.conf. ovx expands any
-\$VAR references from the environment, writes the result to a private temporary
-file, points \$OPENVIKING_CLI_CONFIG_FILE at it, runs ov, and deletes the file
-when ov exits. Nothing is written to ~/.openviking.
-
-Options:
-  -l, --list       List configured profiles and exit
-  -n, --new        Run the create-profile wizard, then run ov with it
-  -e, --edit [P]   Edit profile P (or pick one) in the wizard, then run ov
-  -d, --delete [P] Delete profile P (or pick one), after confirmation
-  -h, --help       Show this help
-
-Behavior:
-  ovx                    Interactive: pick a profile, create a new one, or edit
-  ovx lab                Run bare 'ov' with profile 'lab'
-  ovx lab find "query"   Run 'ov find "query"' with profile 'lab'
-  ovx -e lab             Edit profile 'lab' (pre-filled), then run ov
-  ovx -e                 Pick a profile to edit
-  ovx -d lab             Delete profile 'lab', after confirmation
-  ovx -- -o json status  Pick a profile, forward '-o json status' to ov
-
-An option meant for ov must come after the profile name, or after '--'.
-Everything following the profile name is passed to ov untouched.
-
-Config: $CONFIG_FILE  (override with \$OVX_CONFIG_FILE or \$OVX_DIR)
-Format: TOML, one [profile] table per OpenViking instance. Keys are the keys
-of ovcli.conf:
-
-  [lab]
-  url = "https://openviking.example.com"
-  api_key = "\$OV_LAB_API_KEY"   # expanded from env at launch
-  account = "acme"
-  user = "jasper"
-
-'url' is required. A value containing \$VAR or \${VAR} is expanded from your
-environment at launch; an unresolved reference is an error, so a missing
-secret fails loudly instead of running against a half-built config.
-EOF
+The full help is the comment block at the top of ovx.sh, which could not be
+read here. See $OVX_HOMEPAGE"
+  fi
+  # One write, not three: `ovx --help | head` closes the pipe early, and each
+  # separate write past that point earns its own "write error: Broken pipe".
+  # The header documents the default config path; this reports the one in force.
+  printf '%s\n\nConfig in use: %s\n' "$body" "$CONFIG_FILE"
 }
 
 need() {
@@ -142,14 +174,29 @@ cleanup() {
   fi
 }
 
-# EXIT alone covers the signals too: bash runs an EXIT trap on its way out
-# after an untrapped SIGINT, SIGTERM, or SIGHUP, and only once the foreground
-# child has exited, so ov finishes its own teardown before the config
-# disappears. Trapping those signals by name would add nothing but would
-# convert "killed by SIGINT" into "exited 130", hiding from a caller that the
-# command was interrupted rather than failed. SIGKILL leaves the file behind;
-# nothing can prevent that.
+# Clean up on the way out, however we get there.
+#
+# An EXIT trap alone is not enough. On bash 3.2 — what macOS ships, so what
+# most people run this under — a SIGINT arriving while ov holds the foreground
+# sometimes kills the shell WITHOUT running the EXIT trap, leaving the
+# materialized key on disk. It is a few percent of interrupts under load, not a
+# rarity worth ignoring. Naming each signal installs a real handler, so the
+# signal is caught rather than fatal and cleanup always runs.
+#
+# Each handler re-raises the signal after cleaning up, so ovx still dies from
+# it and a caller can tell an interrupt from a failure. SIGKILL cannot be
+# trapped: that one leaks the file, and nothing can prevent it.
+#
+# shellcheck disable=SC2317  # reached through the traps below, not by a call
+on_signal() {
+  cleanup
+  trap - "$1"
+  kill -"$1" $$
+}
 trap cleanup EXIT
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
+trap 'on_signal HUP' HUP
 
 # Emit existing profile names, one per line. No output (exit 0) if the file
 # is missing or has no profiles; exit 2 on a parse error.
@@ -797,6 +844,7 @@ run_ov() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help)    usage; exit 0 ;;
+    -V|--version) echo "ovx $OVX_VERSION"; exit 0 ;;
     -l|--list)    LIST=1; shift ;;
     -n|--new)     NEW=1; shift ;;
     -e|--edit)    EDIT=1; shift ;;

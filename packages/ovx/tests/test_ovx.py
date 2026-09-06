@@ -299,9 +299,9 @@ def test_temp_config_is_removed_on_sigint(workspace: Path, config: Path) -> None
 
     assert not conf_path.exists(), f"config survived a SIGINT at {conf_path}"
     assert not conf_path.parent.exists(), "temp directory survived a SIGINT"
-    # ovx does not trap SIGINT by name, so it dies from the signal rather than
-    # exiting with a code. That is deliberate: it keeps the interrupt visible
-    # to whatever called ovx.
+    # ovx traps SIGINT, cleans up, then re-raises it, so the interrupt stays
+    # visible to the caller no matter what ov's own exit status was. Without
+    # the trap this varied between -2, 130 and even 0 depending on scheduling.
     assert proc.returncode == -signal.SIGINT, proc.returncode
 
 
@@ -482,6 +482,62 @@ def test_unknown_ovx_option_is_refused(workspace: Path, config: Path) -> None:
     assert result.returncode == 1
     assert "unknown option" in result.stderr
     assert not shim_log(workspace).ran
+
+
+def test_help_and_version_need_nothing_installed(workspace: Path) -> None:
+    """-h and -V answer before any dependency check, so they always work."""
+    # bash for the shebang and awk for the help text, which is all -h and -V
+    # may rely on. Deliberately no python3 and no ov.
+    minimal = workspace / "nobin"
+    minimal.mkdir()
+    for tool in ("bash", "awk"):
+        found = shutil.which(tool)
+        assert found is not None, tool
+        (minimal / tool).symlink_to(found)
+    env = dict(os.environ, PATH=str(minimal))
+
+    for flag in ("-h", "--help"):
+        result = subprocess.run(
+            [str(OVX), flag], env=env, capture_output=True, text=True, timeout=30
+        )
+        assert result.returncode == 0, result.stderr
+        assert "Usage: ovx [PROFILE]" in result.stdout, result.stdout
+
+    result = subprocess.run(
+        [str(OVX), "-V"], env=env, capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stderr
+    # "dev" in a checkout; release.yaml stamps the tag's version in its place.
+    assert re.fullmatch(r"ovx \S+\n", result.stdout), result.stdout
+
+
+def test_help_reports_the_config_file_in_force(workspace: Path, config: Path) -> None:
+    """The header documents the default path; --help names the one in use."""
+    result = run(["--help"])
+    assert result.returncode == 0, result.stderr
+    assert f"Config in use: {config}" in result.stdout, result.stdout
+
+
+def test_every_option_is_documented(workspace: Path) -> None:
+    """Each flag the parser accepts appears in --help.
+
+    The help text is the comment block at the top of ovx.sh, so it is edited
+    in a different place from the case statement that implements the flags.
+    This is what stops the two drifting apart.
+    """
+    source = OVX.read_text()
+    case_body = source.split("--- arg parsing ---")[1]
+    # Long options, with their short alias where there is one. A long-only arm
+    # has to be caught too, which an alias-only pattern would silently miss.
+    # The bare "--)" separator and the "-*)" catch-all are not options and do
+    # not match.
+    arms = re.findall(r"^\s+((?:-\w\|)?--[\w-]+)\)", case_body, re.MULTILINE)
+    assert arms, "found no option cases to check"
+
+    help_text = run(["--help"]).stdout
+    for arm in sorted(set(arms)):
+        expected = arm.replace("|", ", ")
+        assert expected in help_text, f"{arm} is undocumented"
 
 
 def test_list_does_not_need_ov(workspace: Path, config: Path) -> None:
