@@ -195,7 +195,15 @@ jobs:
   publish:
     name: build and publish
     needs: release
-    if: ${{ !inputs.dry_run }}
+    # `!cancelled()` is load-bearing, not decoration. Without a status-check
+    # function GitHub adds an implicit success() covering the dependency
+    # graph, and one of test/test-shell is always skipped -- so this job
+    # skipped even on a real run, tagging a release that never published.
+    # Naming the one result that matters replaces the implicit check.
+    if: >-
+      ${{ !inputs.dry_run
+          && !cancelled()
+          && needs.release.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the GitHub release
