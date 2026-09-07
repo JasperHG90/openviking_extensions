@@ -617,8 +617,12 @@ export class OvClient {
     if (terms.length === 0) return found;
 
     // grep takes one uri, so a second scope is a second call per term.
+    // Capped once, then spread across the scopes. Slicing inside the map made
+    // the cap per-scope, so a two-scope deployment ran twice what the constant
+    // promises — about sixty seconds of upstream work for one GET.
+    const capped = terms.slice(0, MAX_GREP_TERMS);
     const jobs = this.searchRoots.flatMap((root) =>
-      terms.slice(0, MAX_GREP_TERMS).map((term) => ({ root, term })),
+      capped.map((term) => ({ root, term })),
     );
     const results = await inBatches(jobs, MAX_CONCURRENT_UPSTREAM, async (job) => {
       const raw = await this.guard(`grepping ${job.term}`, () =>

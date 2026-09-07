@@ -308,3 +308,66 @@ describe("where a file may land", () => {
     expect(calls).toHaveLength(0);
   });
 });
+
+describe("the scope guard under the root that actually ships", () => {
+  // The fixture above pins OV_ROOT to "viking://user", the uid-less spelling
+  // OpenViking rejects. So none of it exercised the per-user prefix that is
+  // the real default, and prefix confusion is exactly the risk that root has.
+  const shipped = devConfig({ OV_ROOT: "viking://user/{user}" });
+
+  it("accepts the caller's own tree", () => {
+    expect(resolveTarget(shipped, JASPER, "")).toBe("viking://user/jasper/resources");
+    expect(resolveTarget(shipped, JASPER, "viking://user/jasper/notes")).toBe(
+      "viking://user/jasper/notes",
+    );
+  });
+
+  it("refuses a neighbour whose name merely starts the same", () => {
+    for (const bad of [
+      "viking://user/jasperX/notes",
+      "viking://user/jasper-evil/notes",
+      "viking://user/jasper.old",
+      "viking://user/jaspers",
+      "viking://user/ada/resources",
+      "viking://user",
+    ]) {
+      expect(() => resolveTarget(shipped, JASPER, bad), bad).toThrow(
+        /outside the scopes/,
+      );
+    }
+  });
+
+  it("is not fooled by case", () => {
+    for (const bad of [
+      "VIKING://user/jasper/notes",
+      "viking://USER/jasper/notes",
+      "viking://user/JASPER/notes",
+    ]) {
+      expect(() => resolveTarget(shipped, JASPER, bad), bad).toThrow(
+        /outside the scopes/,
+      );
+    }
+  });
+
+  it("refuses a climb out of the caller's own tree", () => {
+    for (const bad of [
+      "viking://user/jasper/../ada",
+      "viking://user/jasper/%2e%2e/ada",
+      "viking://user/jasper/..\\ada",
+    ]) {
+      expect(() => resolveTarget(shipped, JASPER, bad), bad).toThrow(
+        /walks outside|escape/,
+      );
+    }
+  });
+
+  it("refuses an account that could collapse a templated root", () => {
+    // {account} reaches rootsFor straight from a Vault token, where only
+    // ov_user passes through requireUserId.
+    for (const bad of ["", "..", "a/b"]) {
+      expect(() => rootsFor(shipped, { ...JASPER, account: bad }), bad).toThrow(
+        /no usable account/,
+      );
+    }
+  });
+});

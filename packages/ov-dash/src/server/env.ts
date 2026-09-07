@@ -42,7 +42,12 @@ export type AuthMode = z.infer<typeof authModeSchema>;
  * Vault's `sub` is an entity id and never matches, so the default takes the
  * local part of the email — `jasper@example.com` becomes `jasper`.
  */
-const identityFromSchema = z.enum(["email-local", "email", "sub", "preferred_username"]);
+/*
+ * "email" is deliberately absent. An OpenViking user id becomes a path
+ * segment, so it cannot contain "@" — configuring it would have been accepted
+ * at boot and then refused every single login.
+ */
+const identityFromSchema = z.enum(["email-local", "sub", "preferred_username"]);
 export type IdentityFrom = z.infer<typeof identityFromSchema>;
 
 /** Where a person's OpenViking API key comes from. */

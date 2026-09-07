@@ -21,6 +21,16 @@ interface Entry {
 
 const store = new Map<string, Entry>();
 
+/**
+ * Bumped by every invalidation.
+ *
+ * A load already in flight when the cache is cleared would otherwise resolve
+ * afterwards and write its now-stale value back in — deleting a memory while
+ * the list was loading put the deleted one back for a full TTL. A load only
+ * stores its result if no invalidation happened while it was running.
+ */
+let generation = 0;
+
 /** How long a cached answer stays good, in milliseconds. */
 export const TTL = 60_000;
 
@@ -46,9 +56,16 @@ export async function cached<T>(
   if (hit?.pending) return hit.pending as Promise<T>;
   if (hit && now - hit.at < ttl) return hit.value as T;
 
+  const startedAt = generation;
   const pending = load()
     .then((value) => {
-      store.set(key, { at: Date.now(), value });
+      // Dropped rather than stored if the cache was cleared meanwhile. The
+      // caller still gets the value; it just does not outlive the request.
+      if (generation === startedAt) {
+        store.set(key, { at: Date.now(), value });
+      } else {
+        store.delete(key);
+      }
       return value;
     })
     .catch((error: unknown) => {
@@ -67,6 +84,7 @@ export async function cached<T>(
  * @param prefix - Clears only keys starting with it. Omit to clear everything.
  */
 export function invalidate(prefix?: string): void {
+  generation += 1;
   if (!prefix) {
     store.clear();
     return;

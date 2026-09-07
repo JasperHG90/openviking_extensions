@@ -10,7 +10,7 @@ import { describe, expect, it } from "vitest";
 import { buildTree, visibleRows } from "../src/client/lib/tree";
 import { folderFor, isOrganisingFolder } from "../src/server/app";
 import { loadConfig } from "../src/server/env";
-import { usefulAbstract } from "../src/server/ov";
+import { MAX_GREP_TERMS, usefulAbstract } from "../src/server/ov";
 import type { Node } from "../src/shared/schemas";
 
 function node(relPath: string, isDir: boolean): Node {
@@ -131,5 +131,20 @@ describe("only real folders are offered as destinations", () => {
     expect(isOrganisingFolder("blog-scraper")).toBe(true);
     expect(isOrganisingFolder("handoffs")).toBe(true);
     expect(isOrganisingFolder("model_gebruiksovereenkomst_zonder_HHR")).toBe(true);
+  });
+});
+
+describe("the grep fan-out is capped once, not once per scope", () => {
+  it("keeps the promised bound with a shared scope configured", () => {
+    // The slice used to sit inside the per-scope map, so the default
+    // OV_SHARED_ROOT doubled it: ~60s of upstream work for one GET.
+    const terms = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
+    const capped = terms.slice(0, MAX_GREP_TERMS);
+    const scopes = ["viking://user/jasper", "viking://resources"];
+    const jobs = scopes.flatMap((root) => capped.map((term) => ({ root, term })));
+
+    expect(capped).toHaveLength(MAX_GREP_TERMS);
+    expect(jobs).toHaveLength(MAX_GREP_TERMS * scopes.length);
+    expect(new Set(jobs.map((j) => j.term)).size).toBe(MAX_GREP_TERMS);
   });
 });

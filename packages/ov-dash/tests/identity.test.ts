@@ -170,14 +170,11 @@ describe("mapping an identity from an email", () => {
     ).toThrow(/domain is not one this dashboard accepts/);
   });
 
-  it("refuses a claim that is not a safe path segment", () => {
-    expect(() =>
-      viewerFromClaims(emailConfig({ IDENTITY_FROM: "email" }), {
-        sub: "s",
-        email: "jasper@x.com",
-        email_verified: true,
-      }),
-    ).toThrow(IdentityError);
+  it("does not offer a mapping that could never work", () => {
+    // An OpenViking user id is a path segment, so it cannot hold "@". Offering
+    // IDENTITY_FROM=email meant a config that booted fine and then refused
+    // every login; the option is gone rather than dead.
+    expect(() => emailConfig({ IDENTITY_FROM: "email" })).toThrow(/IDENTITY_FROM/);
   });
 
   it("does not check the email rules when mapping from sub", () => {

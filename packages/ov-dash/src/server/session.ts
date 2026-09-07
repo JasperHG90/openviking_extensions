@@ -20,6 +20,21 @@ import type { Viewer } from "../shared/schemas";
 import type { Config } from "./env";
 
 const ISSUER = "ov-dash";
+
+/** Raised when a session cannot be built or read. */
+export class SessionError extends Error {
+  /**
+   * @param message - What went wrong, safe to show.
+   * @param status - HTTP status the request should end with.
+   */
+  constructor(
+    message: string,
+    readonly status = 400,
+  ) {
+    super(message);
+    this.name = "SessionError";
+  }
+}
 const SESSION_AUDIENCE = "ov-dash/session";
 const LOGIN_AUDIENCE = "ov-dash/login";
 
@@ -216,7 +231,9 @@ export async function startCredentialSession(
   const budget = expiresAt ? Math.max(0, expiresAt - now) : config.SESSION_TTL_SECONDS;
   const ttl = Math.min(config.SESSION_TTL_SECONDS, budget);
   if (ttl <= 0) {
-    throw new Error("that credential has already expired");
+    // A typed error, so this surfaces as "sign in again" rather than as the
+    // generic 500 a bare Error falls through to.
+    throw new SessionError("that credential has already expired — sign in again", 401);
   }
 
   const jwe = await new EncryptJWT({ ...viewer, ov: token })

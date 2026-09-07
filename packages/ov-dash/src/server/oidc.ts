@@ -279,8 +279,7 @@ export function viewerFromClaims(
   const email = str(claims.email);
   const sub = str(claims.sub);
   const preferred = str(claims.preferred_username);
-  const fromEmail =
-    config.IDENTITY_FROM === "email-local" || config.IDENTITY_FROM === "email";
+  const fromEmail = config.IDENTITY_FROM === "email-local";
 
   if (fromEmail && config.OIDC_REQUIRE_EMAIL_VERIFIED && claims.email_verified !== true) {
     throw new OidcError(
@@ -307,9 +306,6 @@ export function viewerFromClaims(
   switch (config.IDENTITY_FROM) {
     case "email-local":
       user = email.split("@")[0] ?? "";
-      break;
-    case "email":
-      user = email;
       break;
     case "sub":
       user = sub;

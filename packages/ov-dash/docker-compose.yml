@@ -19,7 +19,9 @@ services:
     read_only: true
     tmpfs:
       # Uploads land in a private temp file before OpenViking imports them.
-      - /tmp:mode=1777,size=256m
+      # Comfortably above MAX_UPLOAD_BYTES (256 MiB): sized exactly to it, an
+      # upload at the documented maximum had nowhere to be written.
+      - /tmp:mode=1777,size=512m
     security_opt:
       - no-new-privileges:true
     cap_drop:

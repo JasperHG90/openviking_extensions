@@ -27,7 +27,7 @@ import type {
 } from "../shared/schemas";
 import { searchModeSchema } from "../shared/schemas";
 import type { Config } from "./env";
-import { IdentityError } from "./identity";
+import { IdentityError, isSafeUserId } from "./identity";
 import { KeyError, KeyResolver } from "./keys";
 import { OidcClient, OidcError } from "./oidc";
 import {
@@ -40,6 +40,7 @@ import {
   relativeTo,
 } from "./ov";
 import {
+  SessionError,
   endSession,
   readCredentialSession,
   readSession,
@@ -99,11 +100,9 @@ export function buildServices(config: Config): Services {
 /**
  * Work out who is calling.
  *
- * A paired extension's bearer token wins in every mode, because it was minted
- * from a real login and travels without a cookie. Failing that: in `oidc` mode
- * this is the signed cookie the callback wrote, in `trusted-header` mode it is
- * whatever the authenticating proxy injected, read fresh each request, and in
- * `dev` mode it is a fixed identity.
+ * In `oidc` and `vault-userpass` modes this is the signed cookie the sign-in
+ * wrote. In `trusted-header` mode it is whatever the authenticating proxy
+ * injected, read fresh each request. In `dev` mode it is a fixed identity.
  */
 async function currentViewer(c: Context, config: Config): Promise<Viewer | null> {
   if (config.AUTH_MODE === "vault-userpass") {
@@ -207,7 +206,14 @@ export function createApp(services: Services) {
   // The password is posted here and used once, server-side, to get a Vault
   // session; what is kept is the OpenViking token minted from it. Nothing
   // stores the password, and the browser never sees the token.
-  app.post("/auth/vault-login", async (c) => {
+  //
+  // Guarded like every other state-changing route. Without it any page could
+  // post a form here and have the browser answer with a Set-Cookie for an
+  // account the attacker controls — same cookie name, so the victim's own
+  // session is replaced and everything they add afterwards lands in the
+  // attacker's OpenViking tree. SameSite=Lax does not help: it governs when a
+  // cookie is sent, not whether a cross-site response may set one.
+  app.post("/auth/vault-login", csrf({ origin: originOf(config) }), async (c) => {
     if (config.AUTH_MODE !== "vault-userpass") {
       throw new VaultError("this dashboard does not sign in through Vault", 404);
     }
@@ -260,7 +266,10 @@ export function createApp(services: Services) {
     const sent = c.req.header("origin");
     const expected = originOf(config);
     const changesState = c.req.method !== "GET" && c.req.method !== "HEAD";
-    if (changesState && !c.req.header("authorization") && sent && sent !== expected) {
+    // No exemption for an Authorization header. There is no bearer path in
+    // this app, and carving a hole for one that does not exist leaves the
+    // guard pre-weakened for whoever adds a JSON route later.
+    if (changesState && sent && sent !== expected) {
       return c.json(
         {
           error: {
@@ -512,6 +521,15 @@ export function createApp(services: Services) {
     const contents: Record<string, Uint8Array> = {};
     let bytes = 0;
     for (const file of files) {
+      // Checked against the declared size first, so an over-budget archive
+      // stops before the file that would blow it is pulled into memory.
+      if (bytes + file.size > MAX_ZIP_BYTES) {
+        throw new OvError(
+          `${node.name} is larger than ${Math.round(MAX_ZIP_BYTES / 1_000_000)} MB — download it in parts`,
+          413,
+          "TOO_LARGE",
+        );
+      }
       const body = await ov.download(file.uri);
       bytes += body.length;
       if (bytes > MAX_ZIP_BYTES) {
@@ -583,6 +601,26 @@ export function createApp(services: Services) {
 
   app.post("/api/upload", async (c) => {
     const ov = c.get("ov");
+
+    /*
+     * Checked before the body is read, not after.
+     *
+     * `parseBody` materialises the whole multipart body and `arrayBuffer`
+     * copies it again, so a limit applied downstream is a limit applied once
+     * the damage is done — measured, a 300 MB post cost ~1.8 GB of RSS before
+     * the 413 came back. Content-Length can be absent or a lie, so the
+     * post-parse check below stays as the real bound; this only stops the
+     * honest large upload from being buffered at all.
+     */
+    const declared = Number(c.req.header("content-length") ?? "0");
+    if (Number.isFinite(declared) && declared > MAX_UPLOAD_BYTES) {
+      throw new OvError(
+        `that upload is larger than ${Math.round(MAX_UPLOAD_BYTES / 1_000_000)} MB`,
+        413,
+        "TOO_LARGE",
+      );
+    }
+
     const body = await c.req.parseBody();
     const file = body.file;
     if (!(file instanceof File)) {
@@ -640,6 +678,12 @@ export function createApp(services: Services) {
     if (error instanceof OvError) {
       return c.json(
         { error: { code: error.code, message: error.message } },
+        error.status as 400,
+      );
+    }
+    if (error instanceof SessionError) {
+      return c.json(
+        { error: { code: "SESSION_EXPIRED", message: error.message } },
         error.status as 400,
       );
     }
@@ -741,27 +785,6 @@ export function originOf(config: Config): string {
   return new URL(config.PUBLIC_ORIGIN).origin;
 }
 
-/**
- * Whether an origin may call the API cross-site.
- *
- * Only browser extensions. A web page proves nothing by asserting an origin,
- * and an extension authenticates with a bearer token rather than a cookie.
- */
-export function isAllowedOrigin(config: Config, origin: string): boolean {
-  if (origin === originOf(config)) return true;
-  if (origin.startsWith("moz-extension://") || origin.startsWith("chrome-extension://")) {
-    return true;
-  }
-  return false;
-}
-
-/** The bearer token on a request, or null when there is none. */
-export function bearerToken(c: Context): string | null {
-  const header = c.req.header("authorization") ?? "";
-  const match = /^Bearer\s+(.+)$/i.exec(header.trim());
-  return match?.[1]?.trim() || null;
-}
-
 /** The two roots this person may write into. `shared` is null when disabled. */
 export function rootsFor(
   config: Config,
@@ -772,6 +795,16 @@ export function rootsFor(
     // everybody's tree. Nothing upstream should produce this; refusing here
     // means a future caller that does cannot turn it into a scope.
     throw new OvError("this caller has no user id to scope to", 403, "NO_IDENTITY");
+  }
+  // The same hazard, for the same reason. A deployment templating on
+  // `{account}` gets the identical collapse, and `ov_account` reaches here
+  // straight from a Vault token without passing through requireUserId.
+  if (!isSafeUserId(viewer.account)) {
+    throw new OvError(
+      "this caller has no usable account to scope to",
+      403,
+      "NO_IDENTITY",
+    );
   }
   const fill = (template: string) =>
     template.replaceAll("{user}", viewer.user).replaceAll("{account}", viewer.account);
