@@ -163,18 +163,22 @@ so there is no grant to exchange. `ovx` re-mints instead. Every run checks the
 stored token, and within five minutes of expiry asks Vault for a new one before
 handing it to `ov`.
 
-How long a token lasts is set on the Vault role, currently a week:
+How long a token lasts is set on the Vault role, not by `ovx`:
 
 ```bash
-vault write identity/oidc/role/openviking ttl=168h
+vault read  identity/oidc/role/openviking          # what it grants today
+vault write identity/oidc/role/openviking ttl=168h # change it
 ```
 
 `ovx` never assumes that number. It reads the `exp` the token itself carries,
 so changing the role's `ttl` takes effect on the next mint with no change here.
+To see what you were actually granted, decode a stored token's `exp` from
+`~/.ovx/tokens/<profile>.json` — it is the real answer, and it is worth
+checking, since it is also the whole of your exposure window (see below).
 
 Re-minting needs a live Vault session rather than a stored secret — which is
 the point. The renewable thing is your Vault login, which lives in Vault's own
-token helper, not a refresh token sitting in `~/.ovx`. At a week-long `ttl` the
+token helper, not a refresh token sitting in `~/.ovx`. With a long `ttl` the
 token will usually outlive the Vault session that minted it; that is fine,
 since the token stands on its own. You only need Vault again when the token
 nears expiry, and if the session has lapsed by then `ovx` says to run `vault
@@ -187,9 +191,10 @@ identity token server-side, so there is no revocation endpoint to call, and
 `vault token revoke -self` would destroy your whole Vault session — taking
 every other tool on the machine with it.
 
-So the token stays valid until it expires — a week, at the current role `ttl`.
-If you need one dead sooner, the only lever is the Vault side: rotate or revoke
-the entity's access. Worth knowing before you raise the `ttl` further.
+So the token stays valid until it expires, however long the role grants. If you
+need one dead sooner, the only lever is the Vault side: rotate or revoke the
+entity's access. Check what your role actually grants before trusting
+`--logout` to mean anything.
 
 ### How it reaches the server
 
@@ -295,13 +300,14 @@ naming plainly: a `$VAR` reference keeps nothing, a token keeps something.
 
 What you get back is that the something expires on its own, which a static key
 never does. What you do *not* get back is revocation — there is none for an
-identity token. At the current week-long `ttl` that means a leaked token is
-usable by whoever holds it for up to a week, and deleting your copy with
-`--logout` does nothing about it.
+identity token. A leaked token is usable by whoever holds it until it expires,
+and deleting your copy with `--logout` does nothing about that.
 
-That is a weaker position than the hour-long token this replaced, and worth
-weighing against the `api_key` it removes: the key is worse (it never expires),
-but the gap has narrowed. If you would rather keep nothing at all, do not log
+So the role's `ttl` is the whole of your exposure window — read it off a stored
+token's `exp` rather than assuming, because it is easy to set generously and
+there is no revoke to fall back on. Weigh it against the `api_key` it removes:
+the key is worse, since it never expires at all, but at a long `ttl` the gap is
+narrow. If you would rather keep nothing at all, do not log
 in; `$VAR` profiles still work exactly as before.
 
 `ovx` also does not hide the key from the machine while it runs. It is in the

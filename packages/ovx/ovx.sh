@@ -48,9 +48,11 @@
 #
 #   The token is a JWT, which OpenViking accepts in the api_key slot, so a
 #   profile that has logged in needs no api_key at all. How long it lasts is
-#   the Vault role's business, not ovx's — currently a week. ovx reads the
-#   token's own 'exp' rather than assuming a lifetime, and mints a fresh one as
-#   it nears expiry, so changing the role's ttl needs no change here.
+#   the Vault role's business, not ovx's: ovx reads the token's own 'exp'
+#   rather than assuming a lifetime, and mints a fresh one as it nears expiry,
+#   so changing the role's ttl needs no change here. Run 'ovx <profile> --'
+#   after a login and check ~/.ovx/tokens/<profile>.json if you want to know
+#   what your role actually grants.
 #
 #   The role is 'openviking'; override it with $OVX_VAULT_ROLE.
 #
