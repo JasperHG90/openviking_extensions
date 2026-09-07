@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { zipSync } from "fflate";
 import { Hono } from "hono";
-import type { Context } from "hono";
+import type { Context, Next } from "hono";
 import { csrf } from "hono/csrf";
 import { HTTPException } from "hono/http-exception";
 import type {
@@ -73,6 +73,9 @@ const TREE_NODE_LIMIT = 2000;
  */
 const MAX_ZIP_BYTES = 512 * 1024 * 1024;
 
+/** Most bytes one single-file download may buffer before it is refused. */
+const MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024;
+
 /** Most bytes accepted from one upload. */
 const MAX_UPLOAD_BYTES = 256 * 1024 * 1024;
 
@@ -105,19 +108,35 @@ export function buildServices(config: Config): Services {
  * injected, read fresh each request. In `dev` mode it is a fixed identity.
  */
 async function currentViewer(c: Context, config: Config): Promise<Viewer | null> {
+  return (await resolveCaller(c, config))?.viewer ?? null;
+}
+
+/**
+ * Who is calling, and the credential they arrived with.
+ *
+ * Returned together because in `vault-userpass` both live in one encrypted
+ * cookie, and reading it twice left a window where the JWE could expire
+ * between the two reads.
+ */
+async function resolveCaller(
+  c: Context,
+  config: Config,
+): Promise<{ viewer: Viewer; credential?: string } | null> {
   if (config.AUTH_MODE === "vault-userpass") {
     const session = await readCredentialSession(c, config);
-    return session?.viewer ?? null;
+    return session ? { viewer: session.viewer, credential: session.token } : null;
   }
 
   if (config.AUTH_MODE === "dev") {
     const user = config.DEV_USER;
     return {
-      sub: user,
-      name: user,
-      email: config.DEV_EMAIL,
-      account: config.OV_ACCOUNT || user,
-      user,
+      viewer: {
+        sub: user,
+        name: user,
+        email: config.DEV_EMAIL,
+        account: config.OV_ACCOUNT || user,
+        user,
+      },
     };
   }
 
@@ -133,15 +152,18 @@ async function currentViewer(c: Context, config: Config): Promise<Viewer | null>
     // `viewerFromClaims`; the header path has to refuse it too.
     if (!user) return null;
     return {
-      sub: raw,
-      name: user,
-      email: email || raw,
-      account: config.OV_ACCOUNT || user,
-      user,
+      viewer: {
+        sub: raw,
+        name: user,
+        email: email || raw,
+        account: config.OV_ACCOUNT || user,
+        user,
+      },
     };
   }
 
-  return readSession(c, config);
+  const viewer = await readSession(c, config);
+  return viewer ? { viewer } : null;
 }
 
 /** Build the app. Exported separately from `main` so tests can mount it. */
@@ -196,10 +218,15 @@ export function createApp(services: Services) {
 
   // Same reasoning as the `/api/*` guard below: without it any page could sign
   // somebody out of the dashboard by submitting a form at it.
-  app.post("/auth/logout", csrf({ origin: originOf(config) }), async (c) => {
-    endSession(c, config);
-    return c.body(null, 204);
-  });
+  app.post(
+    "/auth/logout",
+    sameOriginOnly(config),
+    csrf({ origin: originOf(config) }),
+    async (c) => {
+      endSession(c, config);
+      return c.body(null, 204);
+    },
+  );
 
   // ── signing in through Vault ─────────────────────────────────
   //
@@ -213,27 +240,47 @@ export function createApp(services: Services) {
   // session is replaced and everything they add afterwards lands in the
   // attacker's OpenViking tree. SameSite=Lax does not help: it governs when a
   // cookie is sent, not whether a cross-site response may set one.
-  app.post("/auth/vault-login", csrf({ origin: originOf(config) }), async (c) => {
-    if (config.AUTH_MODE !== "vault-userpass") {
-      throw new VaultError("this dashboard does not sign in through Vault", 404);
-    }
+  app.post(
+    "/auth/vault-login",
+    sameOriginOnly(config),
+    csrf({ origin: originOf(config) }),
+    async (c) => {
+      if (config.AUTH_MODE !== "vault-userpass") {
+        throw new VaultError("this dashboard does not sign in through Vault", 404);
+      }
 
-    const body = await c.req.parseBody();
-    const username = typeof body.username === "string" ? body.username.trim() : "";
-    const password = typeof body.password === "string" ? body.password : "";
+      const body = await c.req.parseBody();
+      const username = typeof body.username === "string" ? body.username.trim() : "";
+      const password = typeof body.password === "string" ? body.password : "";
 
-    const credential = await signIn(config, username, password);
-    await startCredentialSession(
-      c,
-      config,
-      credential.viewer,
-      credential.token,
-      credential.expiresAt,
-    );
-    return c.json({ signedIn: true, viewer: credential.viewer });
-  });
+      const credential = await signIn(config, username, password);
+      await startCredentialSession(
+        c,
+        config,
+        credential.viewer,
+        credential.token,
+        credential.expiresAt,
+      );
+      return c.json({ signedIn: true, viewer: credential.viewer });
+    },
+  );
 
   // ── who am I ─────────────────────────────────────────────────
+
+  /*
+   * Every API answer is one person's private data.
+   *
+   * The shell is no-store and the hashed assets are immutable, but the JSON
+   * between them had no cache directive at all, which leaves it heuristically
+   * cacheable. Browsers happen to be conservative about that; a shared cache
+   * deliberately placed in front of the dashboard would not be, and would
+   * serve one person's tree to another.
+   */
+  app.use("/api/*", async (c, next) => {
+    await next();
+    c.header("cache-control", "private, no-store");
+    c.header("vary", "cookie");
+  });
 
   app.get("/api/session", async (c) => {
     const viewer = await currentViewer(c, config);
@@ -259,50 +306,38 @@ export function createApp(services: Services) {
   // an accident of cookie policy rather than a check; `trusted-header` and
   // `dev` have no such luck.
   //
-  // Hono's csrf answers a mismatch with a bare "refused", which sends whoever
-  // hits it looking through server code for a bug that is really a misconfigured
-  // PUBLIC_ORIGIN. This says what was expected and what arrived.
-  app.use("/api/*", async (c, next) => {
-    const sent = c.req.header("origin");
-    const expected = originOf(config);
-    const changesState = c.req.method !== "GET" && c.req.method !== "HEAD";
-    // No exemption for an Authorization header. There is no bearer path in
-    // this app, and carving a hole for one that does not exist leaves the
-    // guard pre-weakened for whoever adds a JSON route later.
-    if (changesState && sent && sent !== expected) {
-      return c.json(
-        {
-          error: {
-            code: "BAD_ORIGIN",
-            message: `this request came from ${sent}, but the dashboard is configured as ${expected} — set PUBLIC_ORIGIN to the address people actually reach`,
-          },
-        },
-        403,
-      );
-    }
-    return next();
-  });
-
-  app.use("/api/*", csrf({ origin: originOf(config) }));
+  // Stated positively: a state-changing call must *prove* it came from here.
+  // An earlier version only refused a mismatched `Origin`, which let a request
+  // carrying neither `Origin` nor `Sec-Fetch-Site` straight through — and
+  // Hono's csrf only inspects form-shaped content types, so a JSON DELETE was
+  // covered by nothing but the absence of a CORS middleware. That is a
+  // property of what is missing, not a check.
+  //
+  // Some expensive reads are guarded too. "GET changes nothing" is true about
+  // state and false about cost: one search can be sixteen twenty-second greps,
+  // and one folder download half a gigabyte. Those are worth a hostile page's
+  // while in exactly the modes whose identity is ambient.
+  const EXPENSIVE_GETS = new Set(["/api/search", "/api/download"]);
+  app.use("/api/*", sameOriginOnly(config, EXPENSIVE_GETS));
 
   app.use("/api/*", async (c, next) => {
     if (c.req.path === "/api/session") return next();
 
-    const viewer = await currentViewer(c, config);
-    if (!viewer) {
+    const caller = await resolveCaller(c, config);
+    if (!caller) {
       return c.json(
         { error: { code: "UNAUTHENTICATED", message: "not signed in" } },
         401,
       );
     }
+    const { viewer, credential } = caller;
     c.set("viewer", viewer);
-    // In vault-userpass the credential was minted at sign-in and lives in the
-    // session, so there is nothing for the key resolver to look up.
-    const held =
-      config.AUTH_MODE === "vault-userpass"
-        ? (await readCredentialSession(c, config))?.token
-        : undefined;
-    c.set("ov", await OvClient.forViewer(config, services.keys, viewer, held));
+    // Read once, not twice. Decrypting the credential cookie again here left a
+    // window where the JWE could expire between the two reads, dropping the
+    // request through to the key resolver — which in this mode has no per-user
+    // key to find, so an expired session surfaced as a confusing NO_KEY rather
+    // than "sign in again".
+    c.set("ov", await OvClient.forViewer(config, services.keys, viewer, credential));
     return next();
   });
 
@@ -493,10 +528,20 @@ export function createApp(services: Services) {
     const node = await ov.stat(uri);
 
     if (!node.isDir) {
+      // The folder branch below has always been bounded; this one was not,
+      // even with the declared size sitting right here. One 4 GB resource is
+      // one allocation large enough to end the process.
+      if (node.size > MAX_DOWNLOAD_BYTES) {
+        throw new OvError(
+          `${node.name} is larger than ${Math.round(MAX_DOWNLOAD_BYTES / 1_000_000)} MB — fetch it from OpenViking directly`,
+          413,
+          "TOO_LARGE",
+        );
+      }
       const bytes = await ov.download(uri);
       return c.body(bytes as unknown as ArrayBuffer, 200, {
         "content-type": "application/octet-stream",
-        "content-disposition": `attachment; filename="${filenameFor(node.name)}"`,
+        "content-disposition": contentDisposition(node.name),
       });
     }
 
@@ -539,12 +584,15 @@ export function createApp(services: Services) {
           "TOO_LARGE",
         );
       }
-      contents[relativeTo(uri, file.uri)] = body;
+      // The entry name comes from OpenViking, not from this dashboard, so it
+      // is not a path we may trust: a resource named with "../" would write
+      // outside the archive root when extracted.
+      contents[safeZipEntry(relativeTo(uri, file.uri))] = body;
     }
     const zipped = zipSync(contents, { level: 0 });
     return c.body(zipped as unknown as ArrayBuffer, 200, {
       "content-type": "application/zip",
-      "content-disposition": `attachment; filename="${filenameFor(`${node.name}.zip`)}"`,
+      "content-disposition": contentDisposition(`${node.name}.zip`),
     });
   });
 
@@ -780,6 +828,59 @@ async function readMemory(ov: OvClient, node: Node): Promise<Memory> {
   };
 }
 
+/**
+ * Refuse a request that cannot show it came from this dashboard.
+ *
+ * Stated positively on purpose. Refusing only a *mismatched* `Origin` lets a
+ * request carrying no origin header at all through, and Hono's `csrf` only
+ * inspects form-shaped content types — so a JSON `DELETE` was covered by
+ * nothing but the absence of a CORS middleware, which is a property of what is
+ * missing rather than a check.
+ *
+ * @param config - Supplies the origin people actually reach.
+ * @param costlyGets - Paths where a GET is expensive enough to be worth a
+ *   hostile page's while, and so is guarded like a write.
+ */
+export function sameOriginOnly(
+  config: Config,
+  costlyGets: ReadonlySet<string> = new Set(),
+) {
+  const expected = originOf(config);
+
+  return async (c: Context, next: Next): Promise<Response | void> => {
+    const origin = c.req.header("origin");
+    const site = c.req.header("sec-fetch-site");
+    const changesState = c.req.method !== "GET" && c.req.method !== "HEAD";
+    if (!changesState && !costlyGets.has(c.req.path)) return next();
+
+    // A same-origin GET carries no Origin at all, so a missing one cannot be
+    // treated as failure there; Sec-Fetch-Site is what separates it from a
+    // cross-site load, and every browser able to mount this attack sends it.
+    const proven =
+      origin === expected ||
+      (origin === undefined && (site === "same-origin" || site === "none"));
+
+    // A costly read with neither header is a script or an old client, not a
+    // cross-site page. Refusing it would break curl for no gain.
+    if (!changesState && origin === undefined && site === undefined) return next();
+
+    if (!proven) {
+      return c.json(
+        {
+          error: {
+            code: "BAD_ORIGIN",
+            message: origin
+              ? `this request came from ${origin}, but the dashboard is configured as ${expected} — set PUBLIC_ORIGIN to the address people actually reach`
+              : `this request did not prove it came from ${expected}`,
+          },
+        },
+        403,
+      );
+    }
+    return next();
+  };
+}
+
 /** The origin the dashboard is served from, used for the CSRF check. */
 export function originOf(config: Config): string {
   return new URL(config.PUBLIC_ORIGIN).origin;
@@ -790,7 +891,10 @@ export function rootsFor(
   config: Config,
   viewer: Viewer,
 ): { user: string; shared: string | null } {
-  if (!viewer.user) {
+  // Checked the same way as `account` below. This was previously truthiness
+  // only, which fails closed today because every live path validates `user`
+  // earlier — and is a trap for the next caller that does not.
+  if (!isSafeUserId(viewer.user)) {
     // A root templated on an empty user renders as its own parent, which is
     // everybody's tree. Nothing upstream should produce this; refusing here
     // means a future caller that does cannot turn it into a scope.
@@ -920,9 +1024,53 @@ export function safeReturnTo(value: string | undefined): string {
   return `${resolved.pathname}${resolved.search}${resolved.hash}`;
 }
 
-/** Strip anything that would let a name escape the Content-Disposition quote. */
-function filenameFor(name: string): string {
-  return name.replace(/["\\\r\n]/g, "_");
+/**
+ * Build a `Content-Disposition` for a download.
+ *
+ * Header values are ByteStrings, so a name carrying any code point above
+ * U+00FF throws inside the response constructor — before the handler returns,
+ * so it surfaces as a bare 500 and the browser's hidden download frame shows
+ * nothing at all. That is not exotic input: a smart quote or an em dash in a
+ * title is enough, and anything written by an agent rather than uploaded here
+ * has never been through `sanitizeName`.
+ *
+ * RFC 6266 is the answer: a plain ASCII `filename` every client understands,
+ * plus `filename*` carrying the real name percent-encoded as UTF-8.
+ */
+export function contentDisposition(name: string): string {
+  const ascii =
+    // eslint-disable-next-line no-control-regex
+    name.replace(/[^\x20-\x7E]/g, "_").replace(/["\\]/g, "_") || "download";
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+}
+
+/**
+ * Reduce one zip entry path to something safe to extract.
+ *
+ * Leading slashes, drive letters and any `..` segment are dropped, so an
+ * archive cannot write outside the directory it is unpacked into.
+ */
+export function safeZipEntry(path: string): string {
+  const cleaned = path
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter((part) => part && part !== "." && part !== "..")
+    .join("/");
+  return cleaned || "file";
+}
+
+/**
+ * Whether a directory is somewhere to put a file, rather than a file itself.
+ *
+ * OpenViking stores each imported resource as a directory named after the
+ * document — `introducing-agentic-video-in-gemini.md/` is a directory, not a
+ * folder anyone means to add to. Offering those as destinations buries the
+ * handful of real ones, so anything whose name carries a file extension is
+ * left out.
+ */
+export function isOrganisingFolder(name: string): boolean {
+  if (name === "assets") return false;
+  return !/\.[A-Za-z0-9]{1,8}$/.test(name);
 }
 
 /**
@@ -965,20 +1113,6 @@ async function importWithRetry(
       await new Promise((resolve) => setTimeout(resolve, 400 * attempt));
     }
   }
-}
-
-/**
- * Whether a directory is somewhere to put a file, rather than a file itself.
- *
- * OpenViking stores each imported resource as a directory named after the
- * document — `introducing-agentic-video-in-gemini.md/` is a directory, not a
- * folder anyone means to add to. Offering those as destinations buries the
- * handful of real ones, so anything whose name carries a file extension is
- * left out.
- */
-export function isOrganisingFolder(name: string): boolean {
-  if (name === "assets") return false;
-  return !/\.[A-Za-z0-9]{1,8}$/.test(name);
 }
 
 /** Reduce an uploaded name to one safe path segment. */

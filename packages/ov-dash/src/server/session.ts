@@ -11,7 +11,7 @@
  * they cannot change them, and a signature gives that.
  */
 
-import { createHash } from "node:crypto";
+import { hkdfSync } from "node:crypto";
 import type { Context } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { EncryptJWT, SignJWT, jwtDecrypt, jwtVerify } from "jose";
@@ -63,8 +63,24 @@ const loginClaimsSchema = z.object({
 });
 export type LoginState = z.infer<typeof loginClaimsSchema>;
 
+/**
+ * Derive a purpose-specific key from the configured secret.
+ *
+ * The signing key and the credential-encryption key used to be the same
+ * secret fed to two algorithms — one raw, one through a bare SHA-256. Same
+ * input, no domain separation, and `SESSION_SECRET` has a length floor but no
+ * entropy requirement, so a passphrase-shaped secret plus one captured cookie
+ * is an offline guess that ends in a live OpenViking token. HKDF gives each
+ * use its own key, so breaking one tells you nothing about the other.
+ */
+function derive(config: Config, purpose: string, bytes = 32): Uint8Array {
+  return new Uint8Array(
+    hkdfSync("sha256", config.SESSION_SECRET, "ov-dash", purpose, bytes),
+  );
+}
+
 function key(config: Config): Uint8Array {
-  return new TextEncoder().encode(config.SESSION_SECRET);
+  return derive(config, "session-signing");
 }
 
 function loginCookieName(config: Config): string {
@@ -202,7 +218,7 @@ const CREDENTIAL_AUDIENCE = "ov-dash/credential";
  * from a long secret.
  */
 function encryptionKey(config: Config): Uint8Array {
-  return new Uint8Array(createHash("sha256").update(config.SESSION_SECRET).digest());
+  return derive(config, "credential-encryption");
 }
 
 /**

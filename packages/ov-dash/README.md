@@ -69,8 +69,11 @@ value names itself.
 
 The three that decide the shape:
 
-- `AUTH_MODE` — `oidc` (the dashboard runs the login), `trusted-header` (a proxy
-  already did), or `dev` (one fixed identity).
+- `AUTH_MODE` — `vault-userpass` (the dashboard signs people into Vault and
+  mints the token OpenViking accepts — the one that works against a
+  Vault-backed OpenViking), `oidc` (the dashboard runs an OIDC login itself,
+  for a provider whose tokens OpenViking accepts), `trusted-header` (a proxy
+  already did it), or `dev` (one fixed identity).
 - `KEY_SOURCE` — `vault` (per-person keys from KV), `static-map` (a JSON object),
   or `env` (one key for everyone; single-user or local only).
 - `IDENTITY_FROM` — which claim becomes the OpenViking user. Vault's `sub` is an
@@ -110,8 +113,19 @@ decision, and `trusted-header` and `dev` had no such luck.
 
 So every state-changing `/api/*` call, and `POST /auth/logout` with it, must
 carry an `Origin` or `Sec-Fetch-Site` that says it came from this dashboard.
-`GET` is left alone: it changes nothing, and a web page cannot read the answer
-anyway, because no `Access-Control-Allow-Origin` is sent.
+Most `GET`s are left alone: they change nothing, and a web page cannot read the
+answer anyway, because no `Access-Control-Allow-Origin` is sent. Two are not,
+because "changes nothing" is true about state and false about cost — one search
+can be sixteen twenty-second greps, and one folder download half a gigabyte.
+`/api/search` and `/api/download` are guarded like writes.
+
+The check is stated positively: a guarded call must *show* it came from here,
+by a matching `Origin` or a same-origin `Sec-Fetch-Site`. Refusing only a
+*mismatched* `Origin` is not the same thing — it lets a request carrying no
+origin header at all straight through, and Hono's `csrf` does not close that,
+since it only inspects form-shaped content types. A JSON `DELETE` was once
+covered by nothing but the absence of a CORS middleware, which is a property of
+what is missing rather than a check.
 
 `/api/upload` also checks where the file is going. A destination outside
 `OV_ROOT` and `OV_SHARED_ROOT` is refused, including one that climbs out with
@@ -150,6 +164,23 @@ npm test        # vitest
 Biome is scoped to TypeScript; Svelte components are type-checked by
 `svelte-check`, since Biome 1.x only half-parses `.svelte` and wants to reformat
 every script block.
+
+## What scopes a read
+
+Nothing in this dashboard. `viking://` URIs are checked for their scheme and
+passed upstream, so a read is scoped by exactly one thing: the credential
+OpenViking answers as. That is the premise the whole design rests on, and it
+holds wherever each person has their own credential — `vault-userpass`, or
+`KEY_SOURCE=vault`.
+
+It does **not** hold under `KEY_SOURCE=env`, where one key serves every caller.
+There, anyone who can sign in can read anyone else's tree by asking for their
+URI. That mode is for a single-user instance or local work, and it is not a
+way to run this for a team.
+
+Writes are scoped here as well as upstream — `resolveTarget` holds an upload to
+the offered scopes, and a memory delete must sit under the memories root — but
+that is defence against a mistyped path, not what keeps two people apart.
 
 ## Verified against the lab cluster
 

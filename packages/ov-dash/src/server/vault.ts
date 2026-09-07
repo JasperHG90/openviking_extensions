@@ -131,8 +131,13 @@ export async function login(
   });
 
   if (response.status === 400 || response.status === 401 || response.status === 403) {
+    // One message for every refusal. Vault distinguishes "invalid username or
+    // password" from "permission denied", which tells an attacker which of the
+    // two they got right; the person signing in cannot act on the difference.
+    // The detail is logged instead, where an operator can still see it.
     const why = await detail(response);
-    throw new VaultError(why || "Vault rejected that username or password", 401);
+    if (why) console.warn(`vault sign-in refused: ${why}`);
+    throw new VaultError("that username and password were not accepted", 401);
   }
   if (!response.ok) {
     throw new VaultError(`Vault returned HTTP ${response.status}`);
@@ -172,10 +177,11 @@ export async function mint(config: Config, vaultToken: string): Promise<VaultCre
   });
 
   if (response.status === 403 || response.status === 401) {
-    throw new VaultError(
-      `Vault would not mint from role ${role} for this user — check the role's allowed_client_ids and the user's policy`,
-      403,
+    // The role name and its configuration are ours, not the caller's business.
+    console.warn(
+      `vault would not mint from role ${role} — check its allowed_client_ids and the user's policy`,
     );
+    throw new VaultError("this account cannot be given an OpenViking token", 403);
   }
   if (!response.ok) {
     throw new VaultError(`minting from role ${role} returned HTTP ${response.status}`);

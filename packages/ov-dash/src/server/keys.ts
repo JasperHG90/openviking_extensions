@@ -91,7 +91,13 @@ export class KeyResolver {
     requireUserId(user, "resolved user");
 
     const cached = this.cache.get(user);
-    if (cached && cached.expiresAt > this.now()) return cached.key;
+    if (cached) {
+      if (cached.expiresAt > this.now()) return cached.key;
+      // Dropped, not just skipped. Left in place, one entry per distinct user
+      // id accumulated for the life of the process, holding credentials in
+      // memory long after they stopped being used.
+      this.cache.delete(user);
+    }
 
     const key = await this.lookup(user);
     if (this.config.KEY_CACHE_TTL_SECONDS > 0) {
