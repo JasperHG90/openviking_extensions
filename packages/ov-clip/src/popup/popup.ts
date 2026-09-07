@@ -54,7 +54,10 @@ let settings: Settings | null = null;
 let scopes: Scope[] = [];
 let extraction: Extraction | null = null;
 
-function setStatus(message: string, kind: "" | "error" | "working" | "success" = ""): void {
+function setStatus(
+  message: string,
+  kind: "" | "error" | "working" | "success" = "",
+): void {
   statusEl.textContent = message;
   statusEl.className = kind;
 }
@@ -90,10 +93,7 @@ async function init(): Promise<void> {
 
   settings = await loadSettings();
   if (!settings.profile) {
-    showUnavailable(
-      "No ovx profile chosen yet.",
-      "Open settings and pick one.",
-    );
+    showUnavailable("No ovx profile chosen yet.", "Open settings and pick one.");
     await pending;
     return;
   }

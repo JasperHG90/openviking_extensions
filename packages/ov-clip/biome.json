@@ -1,14 +1,8 @@
 {
   "$schema": "https://biomejs.dev/schemas/1.9.4/schema.json",
   "files": {
-    "ignore": [
-      "dist",
-      "node_modules",
-      "web-ext-artifacts",
-      "background.js",
-      "popup/**",
-      "options/**"
-    ]
+    "include": ["src/**", "tests/**", "*.json", "*.mjs", "*.ts"],
+    "ignore": ["node_modules"]
   },
   "formatter": {
     "enabled": true,

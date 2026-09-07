@@ -557,8 +557,9 @@ def test_help_keeps_its_line_breaks(tmp_path: Path) -> None:
         timeout=30,
         check=False,
     )
-    # Rich colours an example's flags when it thinks it has a terminal, which
-    # puts escape sequences mid-example; this test is about the line breaks.
+    # Rich colours an example's flags when typer tells it it has a terminal,
+    # which puts escape sequences mid-example; see tests/conftest.py. This
+    # test is about the line breaks.
     help_text = strip_ansi(result.stdout)
     assert "\\b" not in help_text, "click's marker is being printed literally"
     # Each example must still be on its own line.

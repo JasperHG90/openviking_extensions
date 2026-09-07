@@ -91,7 +91,9 @@ async function refresh(): Promise<void> {
   } catch (error) {
     setState("ovx is not answering", false);
     if (error instanceof OvxError) {
-      ovxHintEl.textContent = error.hint ? `${error.message} ${error.hint}` : error.message;
+      ovxHintEl.textContent = error.hint
+        ? `${error.message} ${error.hint}`
+        : error.message;
     } else {
       ovxHintEl.textContent = error instanceof Error ? error.message : String(error);
     }
