@@ -403,8 +403,8 @@ def _assigned_key(line: str) -> str | None:
 
 
 __all__ = [
-    "ask",
     "FIELD_TYPES",
+    "ask",
     "choose_or_create",
     "choose_profile",
     "create_profile",
