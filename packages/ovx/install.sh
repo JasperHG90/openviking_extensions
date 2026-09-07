@@ -50,8 +50,13 @@ asset_url() {
 
 # Newest published stable ovx version, or empty. The repository holds several
 # packages, so /releases/latest is no use here -- it could name an
-# ov-postgres release. Filter the list by tag prefix instead; the API returns
-# it newest first. No jq: this runs on whatever machine curls it.
+# ov-postgres release. Filter the list by tag prefix instead. No jq: this runs
+# on whatever machine curls it.
+#
+# Every match is collected and sorted by version, rather than taking the first
+# the API returns. The list endpoint orders by creation date, not by version,
+# and this repository's own releases already come back out of order -- so
+# taking the first match would hand out an older release as "newest".
 #
 # Prereleases are skipped. The list endpoint returns them alongside stable
 # releases, so marking a release "pre-release" on GitHub does nothing here on
@@ -70,10 +75,11 @@ latest_version() {
         $2 == "prerelease" {
           if ($0 !~ /true/ && index(tag, prefix) == 1) {
             print substr(tag, length(prefix) + 1)
-            exit
           }
         }
-      '
+      ' \
+    | sort -V \
+    | tail -n1
 }
 
 # Every option here takes a value. Without this check a trailing `--version`
