@@ -24,7 +24,15 @@ classifiers = [
 ]
 
 dependencies = [
-    "openviking>=0.4.16",
+    # Capped: the adapter factory is a documented extension point, but what
+    # this package subclasses is not. It inherits `CollectionAdapter` and
+    # depends on `_normalize_record_for_write`, `_URI_FIELD_NAMES`,
+    # `_TRUNCATABLE_TEXT_FIELDS` and `USE_CONTENT_FIELD` behaving as they do
+    # today, and on the filter DSL's exact semantics -- which the differential
+    # test pins against OpenViking's own evaluator. OpenViking is pre-1.0, so
+    # the minor version is where breakage lands. Raise it once a version has
+    # been tested against this suite.
+    "openviking>=0.4.16,<0.5",
     "psycopg[binary,pool]>=3.1",
     "pydantic>=2",
 ]

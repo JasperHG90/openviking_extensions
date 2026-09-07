@@ -24,7 +24,19 @@ classifiers = [
 ]
 
 dependencies = [
-    "openviking>=0.4.16",
+    # Capped deliberately, against the usual advice for libraries. This package
+    # binds to OpenViking's *internals*, not its public API: it rebinds
+    # `HierarchicalRetriever` by name, calls `super().retrieve`, reads
+    # `LEVEL_URI_SUFFIX` and `_append_level_suffix`, and reaches
+    # `_build_scope_filter` and `_shared_adapter` on the vector store. None of
+    # that is promised to survive a release. OpenViking is pre-1.0, so the
+    # minor version is where breakage lands.
+    #
+    # `install()` verifies what it patches at startup, so an unexpected version
+    # fails loudly rather than silently reverting to vector-only -- but a cap
+    # stops the bad combination being installed at all. Raise it once a version
+    # has been tested, not before.
+    "openviking>=0.4.16,<0.5",
     "pydantic>=2",
     "pydantic-settings>=2",
 ]
