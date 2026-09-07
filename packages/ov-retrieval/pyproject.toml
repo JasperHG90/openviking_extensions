@@ -50,12 +50,35 @@ ov-retrieval-server = "ov_retrieval.__main__:main"
 Homepage = "https://github.com/JasperHG90/openviking_extensions"
 Issues = "https://github.com/JasperHG90/openviking_extensions/issues"
 
+# Version comes from git tags, so a build always matches a commit and there is
+# no number to forget to bump. Tags carry the package name -- this repo holds
+# several packages, and a bare v* tag cannot say which one it releases.
+# setuptools-scm's default tag_regex already strips a "<name>-" prefix, so
+# "ov-retrieval-v0.1.0" parses as 0.1.0 without extra config.
 [tool.hatch.version]
 source = "vcs"
-raw-options = { root = "../..", search_parent_directories = true }
+# The git repository sits two levels above this package. Only git checkouts
+# use this; a build from the sdist finds no repo there and takes
+# setuptools-scm's PKG-INFO fallback, which reads the version baked in beside
+# this file.
+raw-options.root = "../.."
+# --match is load-bearing, not tidiness: without it `git describe` returns the
+# newest tag of *any* package in the repo, so a build here would take
+# ov-postgres's version.
+raw-options.git_describe_command = [
+    "git", "describe", "--dirty", "--tags", "--long", "--match", "ov-retrieval-v*",
+]
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/ov_retrieval/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ov_retrieval"]
+
+# Without this the sdist sweeps in everything not gitignored -- editor config,
+# the lockfile, unrelated project files. Name what belongs in a source release.
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/tests", "/README.md", "/pyproject.toml", "/LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -80,8 +103,12 @@ plugins = ["pydantic.mypy"]
 module = ["openviking.*", "openviking_cli.*", "testcontainers.*"]
 ignore_missing_imports = true
 
+[tool.uv.sources]
+ov-postgres = { workspace = true }
+
 [dependency-groups]
 dev = [
+    "ov-postgres",
     "psycopg>=3.3.4",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",

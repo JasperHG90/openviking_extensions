@@ -36,9 +36,20 @@ __all__ = [
     "DEFAULT_ENTITY_WEIGHT",
     "DEFAULT_LAMBDA",
     "RRF_K",
+    "__version__",
     "blend_similarity",
     "jaccard_similarity",
     "mmr_select",
     "rrf_fuse",
     "tag_similarity_matrix",
 ]
+
+try:  # populated by hatch-vcs at build time
+    from ._version import __version__
+except ImportError:  # editable install or source checkout
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        __version__ = version("ov-retrieval")
+    except PackageNotFoundError:
+        __version__ = "0.0.0+unknown"

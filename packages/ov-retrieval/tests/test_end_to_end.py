@@ -26,6 +26,13 @@ from typing import Any
 
 import pytest
 
+# The backend under test. A dev dependency, not a runtime one: this package
+# works with any OpenViking backend and degrades where one cannot do keywords
+# or pairwise similarity. Only *proving* it works needs a real database.
+pytest.importorskip(
+    "ov_postgres", reason="the end-to-end suite needs the PostgreSQL backend"
+)
+
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
 DIM = 8

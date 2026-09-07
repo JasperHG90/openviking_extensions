@@ -2714,6 +2714,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "ov-postgres" },
     { name = "psycopg" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -2729,6 +2730,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "ov-postgres", editable = "packages/ov-postgres" },
     { name = "psycopg", specifier = ">=3.3.4" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "pytest-asyncio", specifier = ">=1.4.0" },
