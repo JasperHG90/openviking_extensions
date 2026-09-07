@@ -13,6 +13,12 @@ __pycache__/
 build/
 dist/
 
+# Node. The npm packages under packages/ install here, and their tooling
+# writes caches into it, so leaving it untracked also keeps `prek` from
+# reporting a test run as a working-tree change.
+node_modules/
+web-ext-artifacts/
+
 # Environments
 .venv/
 

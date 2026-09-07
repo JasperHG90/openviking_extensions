@@ -10,7 +10,7 @@ Packages that extend [OpenViking](https://github.com/volcengine/OpenViking), col
 | [`ovx`](packages/ovx/) | Python | Run `ov` against a named profile, without leaving an API key on disk |
 | [`ov-skills`](packages/ov-skills/) | Markdown + Bash | `/handoff`, `/continue`, `/learnings`, `/ingest` for Claude Code, opencode, and Hermes |
 | [`ov-dash`](packages/ov-dash/) | TypeScript | A dashboard over OpenViking that logs people in with OIDC and holds their API key server-side |
-| [`ov-clip`](packages/ov-clip/) | TypeScript | Firefox extension that saves the page you are reading into OpenViking, through `ov-dash` |
+| [`ov-clip`](packages/ov-clip/) | TypeScript | Firefox extension that saves the page you are reading into OpenViking, using `ovx`'s Vault login |
 
 Each package has its own README with install and usage instructions.
 
@@ -56,6 +56,19 @@ Adding a package means adding one filter block to `ci.yaml` and its name to whic
 Each package releases on its own, from the manual [`release.yaml`](.github/workflows/release.yaml) workflow (Actions → release). Pick the package and an increment — a plain PATCH/MINOR/MAJOR bump of the package's newest tag — or type an explicit version, and run with `dry_run` first to see the plan. A real run re-tests the package, pushes an annotated `<package>-v<version>` tag, and publishes a GitHub release carrying the built artifacts. Nothing releases on push.
 
 The tag is the only place a version exists. A Python package gets there through hatch-vcs, which reads the tag at build time. A shell package has no wheel and no hatch-vcs, so the release stamps the version in and attaches an installer pinned to the same release — a checkout claims no version, because an untagged working copy has none. `ov-skills` stamps its plugin manifest, which reads `0.0.0` in a checkout, and ships a tarball of `skills/`; its installer defaults to the newest release rather than to `main`, and installing the branch tip is opt-in via `--main`.
+
+`ov-clip` follows the same rule: its `manifest.json` reads `0.0.0` in a checkout and the release stamps the tag in, then checks the stamp took — Firefox refuses to install two builds claiming the same version, so a stamp that silently failed would look like "the update did not apply". With `AMO_JWT_ISSUER` and `AMO_JWT_SECRET` set, the release signs through AMO and attaches an installable `.xpi`; without them it attaches an unsigned `.zip` rather than failing, so a fork can still cut a release.
+
+## Shared actions
+
+Two composite actions under [`.github/actions/`](.github/actions/), for the Node packages that keep arriving:
+
+| Action | What it does |
+| --- | --- |
+| [`setup-node-package`](.github/actions/setup-node-package/) | Install Node and one package's locked dependencies. Used by the CI template and by the release build, so both install a package the same way. |
+| [`build-firefox-extension`](.github/actions/build-firefox-extension/) | Stamp the version into `manifest.json`, build, and sign through AMO when credentials exist. Falls back to an unsigned `.zip` and says which it produced. |
+
+They are composite actions rather than reusable workflows because both have to run *inside* another job — a reusable workflow cannot.
 
 ## License
 

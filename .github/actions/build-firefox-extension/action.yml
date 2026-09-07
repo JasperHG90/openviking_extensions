@@ -1,0 +1,103 @@
+# Stamp, build, and sign a Firefox extension.
+#
+# Signing needs AMO credentials. Without them this still produces an installable
+# artifact — an unsigned .zip — rather than failing, so the release path works
+# in a fork or before anyone has set the secrets up. The caller is told which it
+# got, because it changes what a person has to do to install the thing.
+#
+# Assumes the package's dependencies are already installed; pair it with the
+# setup-node-package action.
+name: Build a Firefox extension
+description: Stamp the version into manifest.json, build, and sign with AMO when credentials exist.
+
+inputs:
+  package:
+    description: "Directory name under packages/, e.g. ov-clip."
+    required: true
+  version:
+    description: "Version to stamp, without a leading v. The git tag is the only place this exists."
+    required: true
+  amo-jwt-issuer:
+    description: "AMO API key. Leave empty to produce an unsigned .zip instead."
+    required: false
+    default: ""
+  amo-jwt-secret:
+    description: "AMO API secret."
+    required: false
+    default: ""
+
+outputs:
+  signed:
+    description: '"true" when AMO signed it, "false" when the artifact is an unsigned .zip.'
+    value: ${{ steps.build.outputs.signed }}
+  artifact:
+    description: "Path to the built artifact, relative to the repository root."
+    value: ${{ steps.build.outputs.artifact }}
+
+runs:
+  using: composite
+  steps:
+    # The repository carries 0.0.0 for the same reason ovx.sh carries "dev":
+    # the version lives in the git tag, and a real number committed to the file
+    # would be free to disagree with it.
+    - name: Stamp the version
+      shell: bash
+      working-directory: packages/${{ inputs.package }}
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        node -e '
+          const fs = require("fs");
+          const manifest = JSON.parse(fs.readFileSync("manifest.json", "utf8"));
+          manifest.version = process.argv[1];
+          fs.writeFileSync("manifest.json", `${JSON.stringify(manifest, null, 2)}\n`);
+        ' "$VERSION"
+
+        # Checked rather than trusted: the stamp edits a file that could be
+        # restructured at any time, and a tagged release must never ship an
+        # extension that reports 0.0.0. Firefox also refuses to install two
+        # builds that claim the same version, so this failing silently would
+        # look like "the update did not apply".
+        got="$(node -p 'require("./manifest.json").version')"
+        echo "planned=$VERSION got=$got"
+        test "$got" = "$VERSION"
+
+    - name: Build, and sign if we can
+      id: build
+      shell: bash
+      working-directory: packages/${{ inputs.package }}
+      env:
+        WEB_EXT_API_KEY: ${{ inputs.amo-jwt-issuer }}
+        WEB_EXT_API_SECRET: ${{ inputs.amo-jwt-secret }}
+      run: |
+        set -euo pipefail
+        npm run build
+
+        if [ -n "${WEB_EXT_API_KEY:-}" ] && [ -n "${WEB_EXT_API_SECRET:-}" ]; then
+          # `unlisted` means AMO signs it and hands it back rather than listing
+          # it on addons.mozilla.org. That is what makes an .xpi installable on
+          # release Firefox without publishing the add-on to the world.
+          #
+          # What gets included comes from web-ext-config.mjs, so the source and
+          # test trees are not shipped.
+          npx web-ext sign --channel unlisted --artifacts-dir dist
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "::notice::No AMO credentials, so the release carries an unsigned .zip."
+          npx web-ext build --overwrite-dest --artifacts-dir dist
+          echo "signed=false" >> "$GITHUB_OUTPUT"
+        fi
+
+        # web-ext names the file itself, from the manifest. Find it rather than
+        # predict it, and fail loudly if it produced nothing — an empty release
+        # is worse than a failed one, because it looks finished.
+        # `-print -quit` rather than `| head -n1`: under `set -o pipefail`,
+        # head closing early makes find take SIGPIPE and the step exit 141.
+        artifact="$(find dist -maxdepth 1 -type f \( -name '*.xpi' -o -name '*.zip' \) -print -quit)"
+        if [ -z "$artifact" ]; then
+          echo "::error::web-ext produced no .xpi or .zip in dist/."
+          exit 1
+        fi
+        echo "artifact=packages/${{ inputs.package }}/$artifact" >> "$GITHUB_OUTPUT"
+        echo "Built $artifact"

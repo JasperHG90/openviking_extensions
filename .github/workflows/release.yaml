@@ -368,7 +368,7 @@ jobs:
             echo '```'
             echo
             echo "Restart Firefox, open the extension's settings, and pick the"
-            echo "profile. Needs ovx $VERSION-era or newer, for the host."
+            echo "profile. Needs an ovx with \`--install-firefox-host\`."
           } > NOTES.md
 
       - name: Create GitHub Release

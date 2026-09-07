@@ -1,0 +1,34 @@
+# Install Node and one package's locked dependencies.
+#
+# Every Node package under packages/ starts a job the same way, and there will
+# be more of them. A composite action rather than a reusable workflow because
+# this has to run *inside* someone else's job — the release build needs it in
+# the same job that then packages the result.
+name: Set up a Node package
+description: Install Node and run npm ci for one package under packages/.
+
+inputs:
+  package:
+    description: "Directory name under packages/, e.g. ov-clip."
+    required: true
+  node-version:
+    description: "Node to install. Keep in step with what the packages declare in engines."
+    required: false
+    default: "22.x"
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: npm
+        cache-dependency-path: packages/${{ inputs.package }}/package-lock.json
+
+    # `npm ci` rather than `npm install`: it fails on a lockfile that has
+    # drifted from package.json instead of quietly resolving something new, so
+    # a build nobody can reproduce is caught here.
+    - name: Install
+      shell: bash
+      working-directory: packages/${{ inputs.package }}
+      run: npm ci --no-audit --no-fund

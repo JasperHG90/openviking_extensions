@@ -1,0 +1,78 @@
+# Test one Node package. Unlike the Python and shell templates, this one owns
+# its whole toolchain: the repo-wide prek hooks are Python-shaped and cannot
+# type-check TypeScript or parse Svelte, so type-check, lint and tests all run
+# here.
+name: template-check-node
+
+on:
+  workflow_call:
+    inputs:
+      package:
+        description: "Directory name under packages/, e.g. ov-dash."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '22.x'
+
+jobs:
+  check:
+    name: ${{ inputs.package }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: packages/${{ inputs.package }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Shared with the release build, so both install a package the same way.
+      - uses: ./.github/actions/setup-node-package
+        with:
+          package: ${{ inputs.package }}
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Type-check
+        run: npm run check
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm test
+
+      # Against a real OpenViking, in a container the harness starts. Opt-in
+      # per package via the script existing, and only on a branch push or when
+      # asked: it pulls a large image and takes minutes, which is too much for
+      # every pull request.
+      - name: Integration tests
+        if: >-
+          ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+              && hashFiles(format('packages/{0}/vitest.integration.config.ts', inputs.package)) != '' }}
+        run: npm run test:integration
+
+      # Whatever the package actually ships gets built, because a package that
+      # passes its tests and then cannot be packaged is still broken. Which of
+      # these applies is decided by what the package carries, so a new Node
+      # package needs no edit here.
+      - name: Build the image
+        if: hashFiles(format('packages/{0}/Dockerfile', inputs.package)) != ''
+        run: docker build -t ${{ inputs.package }}:ci .
+
+      - name: Build the extension
+        if: hashFiles(format('packages/{0}/manifest.json', inputs.package)) != ''
+        run: npm run package
+
+      # A branch build you can actually install. An extension is hard to review
+      # from a diff, and this is the only way to try one before it is released.
+      - name: Keep the extension build
+        if: hashFiles(format('packages/{0}/manifest.json', inputs.package)) != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.package }}-unsigned
+          path: packages/${{ inputs.package }}/dist/*.zip
+          if-no-files-found: error
+          retention-days: 14
