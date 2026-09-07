@@ -555,13 +555,42 @@ def test_every_option_is_documented(workspace: Path) -> None:
     from ovx.cli import KNOWN_OPTIONS
 
     help_text = run(["--help"]).stdout
-    # Completion flags are typer's own and are listed under a separate heading
-    # that click may wrap; the rest are ovx's and must all appear.
-    ours = {o for o in KNOWN_OPTIONS if not o.startswith("--install")} - {
-        "--show-completion"
-    }
+    # Typer's own completion flags are listed under a separate heading that
+    # click may wrap; the rest are ovx's and must all appear. Named exactly,
+    # not by prefix: a `--install-*` prefix would also excuse ovx's own
+    # --install-firefox-host from ever being checked.
+    ours = KNOWN_OPTIONS - {"--install-completion", "--show-completion"}
     missing = [option for option in sorted(ours) if option not in help_text]
     assert not missing, f"undocumented: {missing}\n{help_text}"
+
+
+def test_every_declared_option_is_known(workspace: Path) -> None:
+    """Each flag the command declares is one the parser will accept.
+
+    The other direction from the test above, and the one that bites: options
+    are declared on the command signature, but `reject_unknown_options` runs
+    before click sees them and refuses anything not in KNOWN_OPTIONS. Adding a
+    flag and forgetting the list makes it unusable, while --help advertises it.
+    """
+    import typer.main
+
+    from ovx.cli import KNOWN_OPTIONS, app
+
+    command = typer.main.get_command(app)
+    # Anything spelled with a leading dash is a flag. Not `isinstance(param,
+    # click.Option)`: typer vendors its own click, so its TyperOption does not
+    # subclass the top-level one and that check silently matches nothing —
+    # which is exactly how this test passed while being vacuous.
+    declared = {
+        opt
+        for param in command.params
+        for opt in [*param.opts, *(param.secondary_opts or [])]
+        if opt.startswith("-")
+    }
+    assert declared, "found no options at all; this test is not checking anything"
+
+    unusable = sorted(declared - KNOWN_OPTIONS)
+    assert not unusable, f"declared but rejected at parse time: {unusable}"
 
 
 def test_help_carries_the_reference_sections(workspace: Path) -> None:
@@ -1165,7 +1194,10 @@ def test_login_through_a_terminal_authenticates_then_mints(
     """With no session, ovx posts the password to Vault and then mints."""
     write_config(config, '["lab"]\nurl = "https://ov.example.com"\nuser = "jasper"\n')
 
-    out = run_pty(["--login", "lab"], [("Password", "hunter2\n")])
+    out = run_pty(
+        ["--login", "lab"],
+        [("Vault username", "\n"), ("Password", "hunter2\n")],
+    )
 
     assert "logged in" in out, out
     assert vault.seen["login"][0]["path"] == "/v1/auth/userpass/login/jasper"
@@ -1179,7 +1211,10 @@ def test_login_caches_the_session_token_privately(
     """The Vault session is cached where the CLI keeps its own, at 0600."""
     write_config(config, '["lab"]\nurl = "https://ov.example.com"\nuser = "jasper"\n')
 
-    run_pty(["--login", "lab"], [("Password", "hunter2\n")])
+    run_pty(
+        ["--login", "lab"],
+        [("Vault username", "\n"), ("Password", "hunter2\n")],
+    )
 
     helper = workspace / "vault-token"
     assert helper.read_text().strip() == "s.session"
@@ -1192,7 +1227,10 @@ def test_password_never_reaches_the_command_line(
     """The password goes in the request body, never argv or the environment."""
     write_config(config, '["lab"]\nurl = "https://ov.example.com"\nuser = "jasper"\n')
 
-    out = run_pty(["--login", "lab"], [("Password", "hunter2\n")])
+    out = run_pty(
+        ["--login", "lab"],
+        [("Vault username", "\n"), ("Password", "hunter2\n")],
+    )
 
     assert vault.seen["login"][0]["password"] == "hunter2"
     # And it is not echoed back to the terminal.
@@ -1205,7 +1243,10 @@ def test_failed_vault_login_stores_nothing(
     """Bad credentials leave no token behind."""
     write_config(config, '["lab"]\nurl = "https://ov.example.com"\nuser = "jasper"\n')
 
-    out = run_pty(["--login", "lab"], [("Password", "wrong\n")])
+    out = run_pty(
+        ["--login", "lab"],
+        [("Vault username", "\n"), ("Password", "wrong\n")],
+    )
 
     assert "Vault login failed" in out, out
     assert not token_path(workspace).exists()

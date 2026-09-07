@@ -186,8 +186,8 @@ def _login(locations: Locations, name: str) -> None:
                 "no Vault session, and no terminal to log in from",
                 "Set $VAULT_TOKEN, or log in where you can type.",
             )
+        print("ovx: no Vault session.", file=sys.stderr)
         user = _vault_username(locations, name)
-        print(f"ovx: no Vault session; logging in as {user!r}.", file=sys.stderr)
         # Mint with the session this login just returned. Falling back to the
         # ambient one would pick up a stale $VAULT_TOKEN and 403 after the
         # password was already typed.
@@ -202,24 +202,30 @@ def _login(locations: Locations, name: str) -> None:
 
 
 def _vault_username(locations: Locations, name: str) -> str:
-    """Return the Vault username for a profile, prompting when unset.
+    """Ask which Vault account to log in as, defaulting to the profile's user.
 
-    The profile's ``user`` field doubles as the Vault username. OpenViking no
-    longer takes identity from it — that comes from the token's claims — but it
-    still picks the Vault account.
+    The profile's ``user`` field is offered rather than used outright. It is a
+    weak signal: OpenViking no longer reads it for identity at all -- that
+    comes from the token's claims -- so it may be stale, may differ in case
+    from the Vault account, or may simply be someone's display name. Vault's
+    userpass method is case-sensitive, so a silent mismatch means typing a
+    real password at a prompt for the wrong account and getting a bare
+    "invalid username or password" back.
+
+    Confirming costs one Enter, and only on the branch where no Vault session
+    exists -- which is days apart, not every command.
     """
     try:
-        user = load_profile(locations.config_file, name).user
+        default = load_profile(locations.config_file, name).user
     except OvxError:
-        user = ""
-    if user:
-        return user
+        default = ""
+
     # From the terminal, not stdin. typer.prompt reads stdin, so a pipe could
     # choose the username -- and the operator would then be asked for their
     # real password against an account they did not pick.
     from ovx.wizard import ask
 
-    answer = str(ask("Vault username"))
+    answer = str(ask("Vault username", default=default))
     if not answer:
         raise OvxError("no Vault username given")
     return answer
@@ -258,8 +264,13 @@ def _firefox_host(*, install: bool) -> None:
             print(f"ovx: nothing to remove at {where}.", file=sys.stderr)
         return
 
-    path = native_install.install()
+    # The executable is reported, not just the manifest: Firefox will exec that
+    # exact path for ever, so an install run from a throwaway environment is
+    # worth seeing now rather than when it stops working.
+    executable = native_install.host_path()
+    path = native_install.install(executable=executable)
     print(f"ovx: wrote {path}.", file=sys.stderr)
+    print(f"     It will run {executable}.", file=sys.stderr)
     print(
         f"     {native_install.OV_CLIP_ID} may now ask ovx for a token.",
         file=sys.stderr,
@@ -343,7 +354,7 @@ def main(
         help="Show the ovx version and exit.",
     ),
 ) -> None:
-    r"""Run ov against a named profile, without leaving an API key on disk.
+    """Run ov against a named profile, without leaving an API key on disk.
 
     \b
     ov reads its settings from ovcli.conf, normally ~/.openviking/ovcli.conf,

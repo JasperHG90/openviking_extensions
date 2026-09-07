@@ -519,3 +519,85 @@ def test_the_vault_token_file_is_not_clobbered_when_the_env_wins(
     with pytest.raises(vault.VaultError):
         vault.log_in("jasper", password="hunter2")
     assert helper.read_text() == "s.pre-existing"
+
+
+def test_help_shows_no_click_escape_markers() -> None:
+    r"""``\b`` is click's do-not-rewrap marker and must never be visible.
+
+    It has to be the real escape (ASCII backspace), so the command docstring
+    cannot be a raw string. Ruff's D301 asks for ``r\"\"\"`` on any docstring
+    holding a backslash; complying turned the marker into two literal
+    characters and printed it eleven times in ``ovx --help``.
+    """
+    from ovx.cli import main
+
+    assert "\\x08" in main.__doc__ or "\b" in main.__doc__, (
+        "the docstring lost click's marker -- is it a raw string again?"
+    )
+    assert "\\\\b" not in repr(main.__doc__), "the marker is literal, not an escape"
+
+
+def test_help_keeps_its_line_breaks(tmp_path: Path) -> None:
+    """The Behavior block is a table; rewrapped into a paragraph it is useless."""
+    config = tmp_path / "config.toml"
+    config.write_text('["lab"]\nurl = "https://x"\n')
+    result = subprocess.run(
+        [str(Path(sys.executable).parent / "ovx"), "-h"],
+        env={
+            **os.environ,
+            "OVX_DIR": str(tmp_path / "ovx"),
+            "OVX_CONFIG_FILE": str(config),
+            "COLUMNS": "100",
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert "\\b" not in result.stdout, "click's marker is being printed literally"
+    # Each example must still be on its own line.
+    for example in ("ovx lab find", "ovx -e lab", "ovx -- -o json status"):
+        assert any(example in line for line in result.stdout.splitlines()), (
+            f"{example!r} was rewrapped away"
+        )
+
+
+def test_the_vault_username_is_a_prompt_not_a_silent_default() -> None:
+    """The profile's ``user`` is offered, never used outright.
+
+    OpenViking stopped reading that field for identity, so it drifts: it may
+    be a display name, or differ in case from the Vault account. Vault's
+    userpass is case-sensitive, so using it silently means typing a real
+    password at a prompt for the wrong account.
+    """
+    import inspect
+
+    from ovx import cli
+
+    source = inspect.getsource(cli._vault_username)
+    assert "default=default" in source, "the profile value is not a default"
+    # The old shape returned early when the profile had a user, skipping the
+    # prompt entirely.
+    assert "if user:\n        return user" not in source
+
+
+def test_a_secret_is_passed_exactly_as_typed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Trimming a password turns a correct one into a bare 401.
+
+    Ordinary answers are stripped -- nobody means the newline after a profile
+    name -- but a secret is whatever was typed.
+    """
+    from ovx import wizard
+
+    monkeypatch.setattr(wizard.getpass, "getpass", lambda _prompt: "  pa ss  ")
+    assert wizard.ask("api_key", secret=True) == "  pa ss  "
+
+
+def test_an_empty_secret_keeps_the_current_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Enter on an api_key prompt means "leave it alone", not "blank it"."""
+    from ovx import wizard
+
+    monkeypatch.setattr(wizard.getpass, "getpass", lambda _prompt: "")
+    assert wizard.ask("api_key", secret=True, default="$OLD") == "$OLD"

@@ -40,7 +40,14 @@ def ask(prompt: str, *, secret: bool = False, default: str = "") -> str:
         # No stream argument: getpass opens /dev/tty itself, with echo off.
         # Handing it a text-mode "r+" handle raises "not seekable" on a
         # character device, which crashed every prompt in the wizard.
-        return getpass.getpass(f"{prompt}: ").strip() or default
+        #
+        # Not stripped. A password is whatever was typed, trailing space and
+        # all, and silently trimming one turns a correct password into
+        # "invalid username or password" with nothing to see. Only the empty
+        # answer means "keep the current value", which is why the emptiness
+        # test is on the raw string.
+        typed = getpass.getpass(f"{prompt}: ")
+        return typed if typed else default
 
     shown = f" [{default}]" if default else ""
     # Two handles rather than one "r+": the same not-seekable problem.
