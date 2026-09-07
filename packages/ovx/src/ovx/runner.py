@@ -13,6 +13,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -22,35 +23,55 @@ from ovx.config import Profile, banner, materialize
 from ovx.errors import OvxError
 from ovx.fs import PRIVATE_DIR
 
+# How long ov is given to shut down after a signal before ovx stops waiting
+# and cleans up regardless. The credential comes off disk either way.
+OV_SHUTDOWN_GRACE_SECONDS = 5.0
+
 # Signals worth cleaning up after. SIGKILL cannot be caught and does leave the
 # file behind, as it must.
 _TRAPPED = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
 
-class _Interrupted(Exception):
-    """A trapped signal arrived; unwind so the temp directory is removed."""
+class _SignalBox:
+    """Records the first trapped signal, without interrupting anything.
 
-    def __init__(self, signum: int) -> None:
-        super().__init__(signum)
-        self.signum = signum
+    Attributes
+    ----------
+    signum : int | None
+        The signal received, or ``None``.
+    """
+
+    def __init__(self) -> None:
+        self.signum: int | None = None
 
 
 @contextmanager
-def _cleanup_on_signal() -> Iterator[None]:
-    """Turn SIGTERM and SIGHUP into exceptions so ``finally`` blocks run.
+def _cleanup_on_signal() -> Iterator[_SignalBox]:
+    """Record SIGINT, SIGTERM and SIGHUP instead of acting on them.
 
-    Python's default handlers for these terminate the interpreter outright,
-    which skips every ``finally`` and would leave the materialized credential
-    on disk. SIGINT already raises ``KeyboardInterrupt``, so it needs no help,
-    but it is trapped alongside them to keep the re-raise uniform.
+    Python's default handlers for TERM and HUP end the interpreter outright,
+    skipping every ``finally`` and leaving the materialized credential on disk.
+    SIGINT raises ``KeyboardInterrupt``, which unwinds from wherever it lands.
 
-    Each signal is re-raised with the default handler after cleanup, so ovx
-    still dies from it and a calling script can tell an interrupt from a
-    failure.
+    Both are wrong here. Raising from the handler means a signal arriving
+    during ``mkdtemp``, ``materialize``, ``Popen`` or -- worst -- during the
+    ``rmtree`` that removes the credential, escapes as an exception: the first
+    three surface a traceback, and the last aborts the removal and leaves a
+    live token on disk for good. A second Ctrl-C is enough to do it.
+
+    So the handler only records. Nothing is interrupted, every ``finally``
+    runs to completion, and the caller re-raises the signal afterwards, once
+    the temp directory is gone.
+
+    ``ov`` shares this terminal's process group, so it receives the signal
+    directly and shuts itself down; ovx simply waits for it, which is what the
+    shell version did.
     """
+    box = _SignalBox()
 
     def handle(signum: int, _frame: FrameType | None) -> None:
-        raise _Interrupted(signum)
+        if box.signum is None:
+            box.signum = signum
 
     previous = {}
     for signum in _TRAPPED:
@@ -61,7 +82,7 @@ def _cleanup_on_signal() -> Iterator[None]:
             # happens through `finally`; only the signal path is unprotected.
             pass
     try:
-        yield
+        yield box
     finally:
         for signum, handler in previous.items():
             signal.signal(signum, handler)
@@ -123,7 +144,7 @@ def run_ov(
     if shutil.which("ov") is None:
         raise OvxError("required command not found: ov")
 
-    with _cleanup_on_signal(), private_workspace() as root:
+    with _cleanup_on_signal() as signals, private_workspace() as root:
         # Named ovcli.conf, not a random name: ov derives sibling paths such
         # as ovcli.conf.<name> from it.
         conf = root / "ovcli.conf"
@@ -148,25 +169,28 @@ def run_ov(
 
         env = dict(os.environ)
         env["OPENVIKING_CLI_CONFIG_FILE"] = str(conf)
-        code, interrupted = _wait_for_ov(args, env)
+        code = _wait_for_ov(args, env, signals)
 
     # Outside the `with`, so the temp directory is already gone. Killing
     # ourselves inside it would end the process at the os.kill syscall and the
     # cleanup would never run, leaving the materialized credential on disk for
     # good -- which is the one thing this tool exists to prevent.
-    if interrupted is not None:
-        _die_from(interrupted)
+    if signals.signum is not None:
+        _die_from(signals.signum)
     return code
 
 
-def _wait_for_ov(args: list[str], env: dict[str, str]) -> tuple[int, int | None]:
-    """Run ``ov`` to completion, tolerating a signal along the way.
+def _wait_for_ov(args: list[str], env: dict[str, str], signals: _SignalBox) -> int:
+    """Run ``ov`` to completion and return its exit code.
 
-    ``subprocess.run`` is not used here: on an exception it kills the child.
-    ``ov`` shares this terminal's process group, so it receives Ctrl-C
-    directly and may be shutting down cleanly — killing it would cut that
-    short. Instead the wait is resumed until the child actually exits, which
-    is what the shell version did.
+    ``subprocess.run`` is not used: on an exception it kills the child, and
+    ``ov`` may be shutting down cleanly.
+
+    When a signal arrives it is forwarded to ``ov`` and then waited on for a
+    short grace period. Waiting indefinitely would hang ovx behind an ``ov``
+    that ignores the signal; not waiting at all would kill it mid-shutdown.
+    Either way the temp directory is removed afterwards, because the caller
+    does that on the way out of the ``with``.
 
     Parameters
     ----------
@@ -174,22 +198,36 @@ def _wait_for_ov(args: list[str], env: dict[str, str]) -> tuple[int, int | None]
         Arguments forwarded to ``ov``.
     env :
         Environment for the child.
+    signals :
+        Where the handler records a trapped signal.
 
     Returns
     -------
-    tuple[int, int | None]
-        ``ov``'s exit code, and the signal to die from afterwards, if any.
+    int
+        ``ov``'s exit code, or ``128 + signum`` if it outlived the grace
+        period.
     """
     process = subprocess.Popen(["ov", *args], env=env)
-    interrupted: int | None = None
+    forwarded = False
+    deadline = 0.0
     while True:
         try:
-            return process.wait(), interrupted
-        except _Interrupted as signalled:
-            # Remember it and keep waiting; ov is handling the same signal.
-            interrupted = interrupted or signalled.signum
-        except KeyboardInterrupt:
-            interrupted = interrupted or signal.SIGINT
+            return process.wait(timeout=0.1)
+        except subprocess.TimeoutExpired:
+            pass
+        if signals.signum is None:
+            continue
+        if not forwarded:
+            forwarded = True
+            deadline = time.monotonic() + OV_SHUTDOWN_GRACE_SECONDS
+            # ov usually has the signal already -- it shares this terminal's
+            # process group -- but not when ovx alone was signalled.
+            try:
+                process.send_signal(signals.signum)
+            except OSError:
+                pass
+        elif time.monotonic() > deadline:
+            return 128 + signals.signum
 
 
 def _die_from(signum: int) -> None:

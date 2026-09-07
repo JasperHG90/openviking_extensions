@@ -12,6 +12,7 @@ on:
           - ov-postgres
           - ovx
           - ov-skills
+          - ov-clip
       increment:
         description: "Bump of the package's newest tag; ignored when version is set."
         type: choice
@@ -55,14 +56,14 @@ jobs:
 
   # Gates the tag: nothing gets tagged that does not pass its own checks.
   #
-  # Two jobs, because `uses:` cannot be chosen from an expression. Exactly one
-  # runs and the other skips. The shell-package list repeats ALL_SHELL in
-  # ci.yaml -- there is no way to share a list between workflows, so a new
-  # shell package has to be added in both. ovx used to be on that list; it is
-  # a Python package now and builds a wheel like ov-postgres.
+  # One job per template, because `uses:` cannot be chosen from an expression.
+  # Exactly one runs and the rest skip. Each list repeats ci.yaml's -- there is
+  # no way to share a list between workflows, so a new package has to be added
+  # in both. ovx used to be on the shell list; it is a Python package now and
+  # builds a wheel like ov-postgres.
   test:
     needs: guard
-    if: ${{ !contains(fromJSON('["ov-skills"]'), inputs.package) }}
+    if: ${{ !contains(fromJSON('["ov-skills", "ov-clip"]'), inputs.package) }}
     uses: ./.github/workflows/template-check.yaml
     with:
       package: ${{ inputs.package }}
@@ -74,10 +75,17 @@ jobs:
     with:
       package: ${{ inputs.package }}
 
+  test-node:
+    needs: guard
+    if: ${{ contains(fromJSON('["ov-clip"]'), inputs.package) }}
+    uses: ./.github/workflows/template-check-node.yaml
+    with:
+      package: ${{ inputs.package }}
+
   release:
     name: plan and tag
-    needs: [guard, test, test-shell]
-    # One of the two test jobs always skips, and a skipped need would block
+    needs: [guard, test, test-shell, test-node]
+    # All but one of the test jobs always skips, and a skipped need would block
     # this job under the default rule. Proceed unless something actually
     # failed or was cancelled.
     if: >-
@@ -199,7 +207,7 @@ jobs:
     needs: release
     # `!cancelled()` is load-bearing, not decoration. Without a status-check
     # function GitHub adds an implicit success() covering the dependency
-    # graph, and one of test/test-shell is always skipped -- so this job
+    # graph, and all but one test job is always skipped -- so this job
     # skipped even on a real run, tagging a release that never published.
     # Naming the one result that matters replaces the implicit check.
     if: >-
@@ -217,16 +225,18 @@ jobs:
           fetch-depth: 0
 
       - uses: astral-sh/setup-uv@v6
-        if: ${{ !contains(fromJSON('["ov-skills"]'), inputs.package) }}
+        if: ${{ !contains(fromJSON('["ov-skills", "ov-clip"]'), inputs.package) }}
         with:
           version: ${{ env.UV_VERSION }}
 
       - name: Build package
-        if: ${{ !contains(fromJSON('["ov-skills"]'), inputs.package) }}
-        run: uv build --package ${{ inputs.package }}
+        if: ${{ !contains(fromJSON('["ov-skills", "ov-clip"]'), inputs.package) }}
+        # By path, not --package: --package resolves workspace members only,
+        # and a standalone project like ovx is excluded from the workspace.
+        run: uv build packages/${{ inputs.package }} --out-dir dist
 
       - name: Verify the built version matches the tag
-        if: ${{ !contains(fromJSON('["ov-skills"]'), inputs.package) }}
+        if: ${{ !contains(fromJSON('["ov-skills", "ov-clip"]'), inputs.package) }}
         env:
           VERSION: ${{ needs.release.outputs.version }}
           PACKAGE: ${{ inputs.package }}
@@ -293,11 +303,86 @@ jobs:
           bash dist/install.sh --local "$RUNNER_TEMP/unpack" --to "$RUNNER_TEMP/verify"
           test -f "$RUNNER_TEMP/verify/handoff/SKILL.md"
 
+      # A Firefox extension is neither a wheel nor a script: it is a directory
+      # with a manifest, stamped with the version and zipped. Signing turns
+      # that into an .xpi release Firefox will install; without AMO credentials
+      # the release still carries the unsigned .zip rather than failing, so a
+      # fork can cut one.
+      - name: Set up the extension
+        if: ${{ inputs.package == 'ov-clip' }}
+        uses: ./.github/actions/setup-node-package
+        with:
+          package: ${{ inputs.package }}
+
+      - name: Package the extension
+        id: extension
+        if: ${{ inputs.package == 'ov-clip' }}
+        uses: ./.github/actions/build-firefox-extension
+        with:
+          package: ${{ inputs.package }}
+          version: ${{ needs.release.outputs.version }}
+          amo-jwt-issuer: ${{ secrets.AMO_JWT_ISSUER }}
+          amo-jwt-secret: ${{ secrets.AMO_JWT_SECRET }}
+
+      - name: Collect the extension and write its install notes
+        if: ${{ inputs.package == 'ov-clip' }}
+        env:
+          ARTIFACT: ${{ steps.extension.outputs.artifact }}
+          SIGNED: ${{ steps.extension.outputs.signed }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "$ARTIFACT" dist/
+
+          {
+            echo "## Save to OpenViking $VERSION"
+            echo
+            echo "A Firefox extension that saves the page you are reading into"
+            echo "OpenViking. It holds no credential: it asks \`ovx\` for a token"
+            echo "each time it saves."
+            echo
+            echo "### Install"
+            echo
+            if [ "$SIGNED" = "true" ]; then
+              echo "1. Download the \`.xpi\` below."
+              echo "2. Open \`about:addons\`, and drag the file onto the page."
+              echo "   (Or gear icon → **Install Add-on From File…**)"
+            else
+              echo "> This build is **unsigned**, so release Firefox will refuse it."
+              echo "> Use Developer Edition or Nightly with"
+              echo "> \`xpinstall.signatures.required = false\` in \`about:config\`,"
+              echo "> or load it temporarily from \`about:debugging\`."
+              echo
+              echo "1. Download and unzip the \`.zip\` below."
+              echo "2. Open \`about:debugging#/runtime/this-firefox\`."
+              echo "3. **Load Temporary Add-on…**, and pick \`manifest.json\`."
+            fi
+            echo
+            echo "### Then set it up"
+            echo
+            echo '```bash'
+            echo "ovx -n                      # make a profile, if you have none"
+            echo "ovx --login <profile>       # sign in through Vault"
+            echo "ovx --install-firefox-host  # let the extension ask ovx for tokens"
+            echo '```'
+            echo
+            echo "Restart Firefox, open the extension's settings, and pick the"
+            echo "profile. Needs ovx $VERSION-era or newer, for the host."
+          } > NOTES.md
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.release.outputs.tag }}
         run: |
           set -euo pipefail
-          # GitHub generates the notes; unscoped commits may mention other packages.
-          gh release create "$TAG" --title "$TAG" --target "$GITHUB_SHA" --generate-notes dist/*
+          # GitHub generates the notes; unscoped commits may mention other
+          # packages. A package that wrote NOTES.md gets those on top, which is
+          # where install instructions belong for anything a person installs by
+          # hand from the release page.
+          args=(--title "$TAG" --target "$GITHUB_SHA" --generate-notes)
+          if [ -f NOTES.md ]; then
+            args+=(--notes-file NOTES.md)
+          fi
+          gh release create "$TAG" "${args[@]}" dist/*

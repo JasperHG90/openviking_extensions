@@ -1,12 +1,17 @@
-# Test and build one package. Lint, format and types run once repo-wide in
-# ci.yaml's checks job.
+# Test one Python package: run its suite across the interpreters it supports,
+# then build a wheel and check it installs and imports on its own.
+#
+# Works for a workspace member (ov-postgres) and for a standalone project with
+# its own lock (ovx). Everything here is addressed by path rather than by
+# `--package`, which only resolves workspace members -- `uv build --package
+# ovx` fails outright, because the root pyproject excludes it.
 name: template-check
 
 on:
   workflow_call:
     inputs:
       package:
-        description: "Directory name under packages/, e.g. ov-postgres. Also the distribution name."
+        description: "Directory name under packages/, e.g. ov-postgres."
         required: true
         type: string
 
@@ -17,15 +22,54 @@ env:
   UV_VERSION: '0.10.x'
 
 jobs:
+  # The interpreters to test on come from the package's own requires-python,
+  # so a package that needs 3.11+ is not run on 3.10 and a new floor needs no
+  # edit here. Testing the floor and the newest catches both ends.
+  interpreters:
+    name: ${{ inputs.package }} / interpreters
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      versions: ${{ steps.pick.outputs.versions }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: pick
+        shell: bash
+        env:
+          PACKAGE: ${{ inputs.package }}
+        run: |
+          set -euo pipefail
+          floor=$(
+            python3 - <<'PY'
+          import os
+          import re
+          import tomllib
+
+          package = os.environ["PACKAGE"]
+          with open(f"packages/{package}/pyproject.toml", "rb") as handle:
+              spec = tomllib.load(handle)["project"]["requires-python"]
+          match = re.search(r"(\d+)\.(\d+)", spec)
+          print(f"{match.group(1)}.{match.group(2)}" if match else "3.10")
+          PY
+          )
+          newest="3.12"
+          if [ "$floor" = "$newest" ]; then
+            versions="[\"$floor\"]"
+          else
+            versions="[\"$floor\", \"$newest\"]"
+          fi
+          echo "versions=$versions" >> "$GITHUB_OUTPUT"
+          echo "Testing $PACKAGE on $versions (floor from requires-python)"
+
   check:
+    needs: interpreters
     name: ${{ inputs.package }} / py${{ matrix.python-version }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        # The floor from requires-python and the version the tools pin.
-        python-version: ["3.10", "3.12"]
+        python-version: ${{ fromJSON(needs.interpreters.outputs.versions) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -37,23 +81,33 @@ jobs:
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
-          cache-dependency-glob: "uv.lock"
+          cache-dependency-glob: "packages/${{ inputs.package }}/uv.lock"
 
-      - name: Install workspace
-        # --locked fails if uv.lock has drifted from any member's pyproject.toml.
-        run: uv sync --locked --all-packages --python ${{ matrix.python-version }}
+      # --directory, not --all-packages: a standalone project is not in the
+      # workspace, so --all-packages would silently not install it and every
+      # later step would fail on `import <package>`.
+      #
+      # --locked fails if the lock has drifted from pyproject.toml.
+      - name: Install the package
+        run: >
+          uv sync --locked --directory packages/${{ inputs.package }}
+          --python ${{ matrix.python-version }}
 
       - name: Run unit tests
-        run: uv run --no-sync --directory packages/${{ inputs.package }} pytest -v -m "not integration" --color=yes --tb=short
+        run: >
+          uv run --directory packages/${{ inputs.package }}
+          pytest -v -m "not integration" --color=yes --tb=short
 
       # Integration suites may start containers through testcontainers.
       # ubuntu-latest ships a running Docker daemon, so no service container is
       # needed; a suite skips itself if it needs one and none is present.
       - name: Run integration tests
-        run: uv run --no-sync --directory packages/${{ inputs.package }} pytest -v -m "integration" --color=yes --tb=short
+        run: >
+          uv run --directory packages/${{ inputs.package }}
+          pytest -v -m "integration" --color=yes --tb=short
 
       - name: Build sdist and wheel
-        run: uv build --package ${{ inputs.package }}
+        run: uv build packages/${{ inputs.package }} --out-dir dist
 
       # Install with its real dependencies: a --no-deps check would fail on the
       # first import of a dependency. The import name is the distribution name
@@ -63,7 +117,7 @@ jobs:
           PACKAGE: ${{ inputs.package }}
         run: |
           set -euo pipefail
-          uv venv /tmp/wheelcheck
+          uv venv /tmp/wheelcheck --python ${{ matrix.python-version }}
           uv pip install --python /tmp/wheelcheck/bin/python dist/*.whl
           module="${PACKAGE//-/_}"
           /tmp/wheelcheck/bin/python -c "import ${module}; print(${module}.__version__)"

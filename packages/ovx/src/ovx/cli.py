@@ -16,8 +16,9 @@ from dataclasses import dataclass, field
 import typer
 
 from ovx import __version__, tokens, vault
+from ovx import login as login_module
 from ovx.config import load_profile, profile_names
-from ovx.errors import OvxError, UnusableLogin
+from ovx.errors import OvxError
 from ovx.fs import ensure_private_dir
 from ovx.paths import Locations
 from ovx.runner import run_ov
@@ -93,6 +94,8 @@ KNOWN_OPTIONS = frozenset(
         "-L",
         "--login",
         "--logout",
+        "--install-firefox-host",
+        "--uninstall-firefox-host",
         "-V",
         "--version",
         "-h",
@@ -211,7 +214,12 @@ def _vault_username(locations: Locations, name: str) -> str:
         user = ""
     if user:
         return user
-    answer = str(typer.prompt("Vault username", err=True)).strip()
+    # From the terminal, not stdin. typer.prompt reads stdin, so a pipe could
+    # choose the username -- and the operator would then be asked for their
+    # real password against an account they did not pick.
+    from ovx.wizard import ask
+
+    answer = str(ask("Vault username"))
     if not answer:
         raise OvxError("no Vault username given")
     return answer
@@ -231,52 +239,48 @@ def _has_tty() -> bool:
     return True
 
 
+def _firefox_host(*, install: bool) -> None:
+    """Register or remove the Firefox native-messaging host.
+
+    Parameters
+    ----------
+    install :
+        True to write the manifest, False to delete it.
+    """
+    from ovx import native_install
+
+    if not install:
+        removed = native_install.uninstall()
+        where = native_install.manifest_dir() / f"{native_install.HOST_NAME}.json"
+        if removed:
+            print(f"ovx: removed {where}.", file=sys.stderr)
+        else:
+            print(f"ovx: nothing to remove at {where}.", file=sys.stderr)
+        return
+
+    path = native_install.install()
+    print(f"ovx: wrote {path}.", file=sys.stderr)
+    print(
+        f"     {native_install.OV_CLIP_ID} may now ask ovx for a token.",
+        file=sys.stderr,
+    )
+    print("     Restart Firefox for it to notice.", file=sys.stderr)
+
+
 def _current_token(locations: Locations, name: str) -> tuple[str, bool]:
     """Return a usable token for a profile, minting a replacement if stale.
+
+    Thin wrapper over :func:`ovx.login.current_token`, which the Firefox
+    native-messaging host calls too. Kept as a name in this module because the
+    CLI reads better for it.
 
     Returns
     -------
     tuple[str, bool]
         The token (empty when the profile has never logged in), and whether a
-        login existed at all. The second value matters: no login is ordinary
-        and falls back to the profile's ``api_key``, while a *broken* login
-        raises instead of downgrading.
+        login existed at all.
     """
-    stored = tokens.load(locations.token_dir, name)
-    if stored is None:
-        return "", False
-    if not stored.is_stale():
-        return stored.token, True
-
-    # Expiring, so mint a replacement. Meant to be invisible while the Vault
-    # session lives; it only speaks up when it cannot be done.
-    if not vault.address():
-        raise UnusableLogin(
-            f"the stored login for {name!r} expired and $VAULT_ADDR is not set",
-            "Set it to renew, or set the profile's api_key.",
-        )
-    try:
-        vault.check_session()
-    except vault.VaultError as error:
-        # Say what actually failed. "Your session is gone" sent the operator to
-        # `ovx --login`, which fails identically when the real cause was a bad
-        # $VAULT_CACERT or a Vault that is simply unreachable.
-        raise UnusableLogin(
-            f"the stored login for {name!r} expired and cannot be renewed: {error}",
-            f"If your Vault session lapsed, run 'ovx --login {name}'.",
-        ) from None
-    chosen = stored.role or vault.role()
-    try:
-        token = vault.mint(chosen)
-        tokens.save(locations.token_dir, name, token, chosen)
-    except OvxError as error:
-        # Still a login that exists and cannot be used, so it must exit 2 and
-        # never fall back to the profile's api_key.
-        raise UnusableLogin(
-            f"the stored login for {name!r} expired and could not be renewed: {error}",
-            f"Run 'ovx --login {name}' and try again.",
-        ) from None
-    return token, True
+    return login_module.current_token(locations, name)
 
 
 def _epilog() -> str:
@@ -319,6 +323,16 @@ def main(
     ),
     logout: bool = typer.Option(
         False, "--logout", help="Remove a profile's stored login."
+    ),
+    install_firefox_host: bool = typer.Option(
+        False,
+        "--install-firefox-host",
+        help="Let the ov-clip Firefox extension ask ovx for a token.",
+    ),
+    uninstall_firefox_host: bool = typer.Option(
+        False,
+        "--uninstall-firefox-host",
+        help="Stop letting any extension ask ovx for a token.",
     ),
     version: bool = typer.Option(
         False,
@@ -413,6 +427,10 @@ def main(
 
     if list_profiles:
         wizard.list_profiles(locations.config_file)
+        raise typer.Exit
+
+    if install_firefox_host or uninstall_firefox_host:
+        _firefox_host(install=install_firefox_host)
         raise typer.Exit
 
     if login or logout:

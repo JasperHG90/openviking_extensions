@@ -29,7 +29,7 @@ from ovx.fs import ensure_private_dir, write_private
 SECRET_FIELDS = frozenset({"api_key", "root_api_key", "gateway_token", "ldap_password"})
 
 
-def _ask(prompt: str, *, secret: bool = False, default: str = "") -> str:
+def ask(prompt: str, *, secret: bool = False, default: str = "") -> str:
     """Ask on the controlling terminal, never on stdin.
 
     typer.prompt reads stdin, so `yes | ovx -d prod` would answer its own
@@ -56,7 +56,7 @@ def _ask(prompt: str, *, secret: bool = False, default: str = "") -> str:
 
 def _confirm(question: str) -> bool:
     """Ask a yes/no question on the controlling terminal."""
-    return _ask(f"{question} [y/N]").lower() in ("y", "yes")
+    return ask(f"{question} [y/N]").lower() in ("y", "yes")
 
 
 def require_tty() -> None:
@@ -124,7 +124,7 @@ def pick_existing(names: list[str], action: str) -> str:
     for index, name in enumerate(names, start=1):
         print(f"  {index}) [{name}]", file=sys.stderr)
     while True:
-        answer = _ask(f"{action} which")
+        answer = ask(f"{action} which")
         if answer in names:
             return answer
         if answer.isdigit() and 1 <= int(answer) <= len(names):
@@ -191,7 +191,7 @@ def choose_profile(names: list[str]) -> str:
     for index, name in enumerate(names, start=1):
         print(f"  {index}) [{name}]", file=sys.stderr)
     while True:
-        answer = _ask("Choose")
+        answer = ask("Choose")
         if answer in names:
             return answer
         if answer.isdigit() and 1 <= int(answer) <= len(names):
@@ -213,9 +213,9 @@ def _prompt_fields(defaults: dict[str, str]) -> dict[str, str]:
                 if current
                 else f"{name} (literal or $VAR, blank for none)"
             )
-            answers[name] = _ask(prompt, secret=True, default=current)
+            answers[name] = ask(prompt, secret=True, default=current)
         else:
-            answers[name] = _ask(f"{name} [{current}]", default=current)
+            answers[name] = ask(f"{name} [{current}]", default=current)
     if not answers.get("url"):
         raise OvxError("a profile needs a url")
     return answers
@@ -235,7 +235,7 @@ def create_profile(config_file: Path, name: str | None) -> str:
     # offers "lab" and still lets you type something else, which is what the
     # shell version did.
     suffix = f" [{name}]" if name else ""
-    chosen = _ask(f"Profile name{suffix}", default=name or "")
+    chosen = ask(f"Profile name{suffix}", default=name or "")
     if not chosen:
         raise OvxError("a profile needs a name")
     if chosen in existing:
@@ -403,6 +403,7 @@ def _assigned_key(line: str) -> str | None:
 
 
 __all__ = [
+    "ask",
     "FIELD_TYPES",
     "choose_or_create",
     "choose_profile",

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -343,3 +344,178 @@ def test_ov_does_not_inherit_the_token(tmp_path: Path) -> None:
         check=False,
     )
     assert "SECRETSIG" not in dump.read_text(), dump.read_text()
+
+
+# --- the five mutations a review found unpinned ---------------------------
+
+
+def _signal_fixture(tmp_path: Path) -> tuple[Path, dict[str, str]]:
+    """Build a workspace whose fake ov sleeps, and report the config path."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    shim = bindir / "ov"
+    shim.write_text(
+        '#!/usr/bin/env bash\necho "$OPENVIKING_CLI_CONFIG_FILE" > "$CONFECHO"\n'
+        "sleep 30\n"
+    )
+    shim.chmod(0o755)
+    config = tmp_path / "config.toml"
+    config.write_text('["lab"]\nurl = "https://x"\napi_key = "$K"\n')
+    env = {
+        **os.environ,
+        "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}",
+        "OVX_DIR": str(tmp_path / "ovx"),
+        "OVX_CONFIG_FILE": str(config),
+        "CONFECHO": str(tmp_path / "conf"),
+        "K": "LEAKED-SECRET",
+    }
+    return tmp_path / "conf", env
+
+
+@pytest.mark.parametrize(
+    "signum", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP], ids=lambda s: s.name
+)
+def test_the_credential_is_removed_on_every_trapped_signal(
+    signum: signal.Signals, tmp_path: Path
+) -> None:
+    """Not just SIGINT.
+
+    TERM and HUP end the interpreter outright under Python's defaults, so
+    without a handler each leaves a live token on disk permanently. A review
+    found dropping them from _TRAPPED left every test green.
+    """
+    echo, env = _signal_fixture(tmp_path)
+    process = subprocess.Popen(
+        [str(Path(sys.executable).parent / "ovx"), "lab", "status"],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.time() + 10
+    while not echo.exists() or not echo.read_text().strip():
+        if time.time() > deadline:
+            process.kill()
+            pytest.fail("ov never started")
+        time.sleep(0.05)
+
+    process.send_signal(signum)
+    # A second signal is the case that used to abort the removal itself. The
+    # process may already be gone, which is fine.
+    try:
+        process.send_signal(signum)
+    except (ProcessLookupError, OSError):
+        pass
+    process.wait(timeout=20)
+
+    conf = Path(echo.read_text().strip())
+    assert not conf.exists(), f"{signum.name} left the credential at {conf}"
+    assert not conf.parent.exists(), f"{signum.name} left {conf.parent}"
+
+
+def _calls_named(module: str, dotted: str) -> bool:
+    """Whether ``module`` really calls ``dotted``, ignoring comments and text.
+
+    A plain substring search matches the word inside a docstring explaining
+    why the call was removed, which is exactly backwards.
+    """
+    import ast
+
+    source = (
+        Path(__file__).resolve().parent.parent / "src" / "ovx" / f"{module}.py"
+    ).read_text()
+    wanted = dotted.split(".")
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        parts: list[str] = []
+        target: ast.expr = node.func
+        while isinstance(target, ast.Attribute):
+            parts.append(target.attr)
+            target = target.value
+        if isinstance(target, ast.Name):
+            parts.append(target.id)
+        if list(reversed(parts)) == wanted:
+            return True
+    return False
+
+
+def test_the_wizard_prompts_do_not_read_stdin() -> None:
+    """typer.prompt reads stdin, so a pipe could answer its own confirmation.
+
+    Both halves were regressions the shell version did not have: the api_key
+    was displayed and echoed, and `yes | ovx -d prod` deleted a profile.
+    """
+    assert not _calls_named("wizard", "typer.prompt")
+    assert not _calls_named("wizard", "typer.confirm")
+    assert _calls_named("wizard", "getpass.getpass"), "secrets are not hidden"
+
+
+def test_the_username_prompt_does_not_read_stdin() -> None:
+    """A pipe must not choose whose password the operator is asked for."""
+    assert not _calls_named("cli", "typer.prompt")
+
+
+def test_a_piped_answer_cannot_delete_a_profile(tmp_path: Path) -> None:
+    """The end-to-end half: stdin is not a terminal, so the wizard refuses."""
+    config = tmp_path / "config.toml"
+    config.write_text('["lab"]\nurl = "https://x"\n')
+    before = config.read_text()
+
+    result = subprocess.run(
+        [str(Path(sys.executable).parent / "ovx"), "-d", "lab"],
+        env={
+            **os.environ,
+            "OVX_DIR": str(tmp_path / "ovx"),
+            "OVX_CONFIG_FILE": str(config),
+        },
+        input="y\n",
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert config.read_text() == before, "a piped 'y' deleted the profile"
+
+
+def test_the_banner_goes_to_stderr(tmp_path: Path) -> None:
+    """On stdout it would corrupt whatever is parsing ov's output."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "ov").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (bindir / "ov").chmod(0o755)
+    config = tmp_path / "config.toml"
+    config.write_text('["lab"]\nurl = "https://x"\napi_key = "$K"\n')
+
+    result = subprocess.run(
+        [str(Path(sys.executable).parent / "ovx"), "lab", "status"],
+        env={
+            **os.environ,
+            "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}",
+            "OVX_DIR": str(tmp_path / "ovx"),
+            "OVX_CONFIG_FILE": str(config),
+            "K": "a-key",
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert "profile=" not in result.stdout, result.stdout
+
+
+def test_the_vault_token_file_is_not_clobbered_when_the_env_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """$VAULT_TOKEN is the caller's session to manage, not a file to overwrite."""
+    from ovx import vault
+
+    helper = tmp_path / "vault-token"
+    helper.write_text("s.pre-existing")
+    monkeypatch.setenv("VAULT_TOKEN_FILE", str(helper))
+    monkeypatch.setenv("VAULT_TOKEN", "s.from-the-env")
+    monkeypatch.setenv("VAULT_ADDR", "http://127.0.0.1:1")
+
+    with pytest.raises(vault.VaultError):
+        vault.log_in("jasper", password="hunter2")
+    assert helper.read_text() == "s.pre-existing"

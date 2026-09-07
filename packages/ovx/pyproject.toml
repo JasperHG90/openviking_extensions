@@ -22,6 +22,9 @@ dependencies = [
 
 [project.scripts]
 ovx = "ovx.cli:entrypoint"
+# Firefox executes a native-messaging host by absolute path and cannot pass it
+# arguments, so the host needs an entry point of its own rather than a flag.
+ovx-firefox-host = "ovx.native_host:entrypoint"
 
 [project.urls]
 Homepage = "https://github.com/JasperHG90/openviking_extensions/tree/main/packages/ovx"
@@ -73,6 +76,11 @@ markers = [
 [tool.ruff]
 line-length = 90
 target-version = "py311"
+# hatch-vcs writes _version.py at build time. It is gitignored, so ruff skips
+# it inside a git checkout -- but not in an sdist or an exported tree, where
+# ruff cannot read .gitignore and then fails on generated code nobody edits.
+# per-file-ignores would not help: they do not apply to the formatter.
+extend-exclude = ["src/ovx/_version.py"]
 
 [tool.ruff.lint]
 select = [
