@@ -98,6 +98,9 @@ class PgVectorParams(BaseModel):
     keyword_fields : list[str] | None
         Text columns included in the full-text index. ``None`` selects
         :data:`DEFAULT_KEYWORD_FIELDS`.
+    store_content : bool
+        Whether to persist each record's ``content`` (its body text). Off by
+        default, matching every non-VikingDB backend.
     text_search_config : str
         PostgreSQL text search configuration used to build tsvectors.
     tz_policy : TimezonePolicy
@@ -154,6 +157,14 @@ class PgVectorParams(BaseModel):
     )
     keyword_fields: list[str] | None = Field(
         default=None, description="Text columns to include in the full-text index."
+    )
+    store_content: bool = Field(
+        default=False,
+        description=(
+            "Persist each record's body text in the 'content' column. Off by "
+            "default: OpenViking drops 'content' before the write unless the "
+            "adapter asks for it, and only VikingDB-backed backends do."
+        ),
     )
     text_search_config: str = Field(
         default="simple",

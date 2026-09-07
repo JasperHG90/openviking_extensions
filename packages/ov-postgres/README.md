@@ -279,6 +279,7 @@ Every option this package accepts, set explicitly, in a complete file. Values sh
         "create_extension": true,
         "distance": "cosine",
         "keyword_fields": ["name", "description", "abstract", "tags", "search_tags"],
+        "store_content": false,
         "text_search_config": "english",
         "tz_policy": "local",
         "min_pool_size": 2,
@@ -305,6 +306,110 @@ Three of those deserve a note:
 - **`distance`** duplicates the outer `distance_metric`. Set either; `custom_params.distance` wins if both are present.
 - **`storage.agfs`** is OpenViking's document store and is entirely separate from the vector store. Changing the vector backend does not move your documents.
 
+### Storing document bodies with `store_content`
+
+By default this backend stores metadata — name, description, abstract, tags —
+but not the body of each document.
+
+**Read this first: turning it on changes nothing about how OpenViking searches
+today.** The only code path that calls `search_by_keywords` is OpenViking's
+grep, and grep never routes to this backend (see [What this does not
+do](#what-this-does-not-do)). No server route, MCP endpoint, or retrieval
+pipeline performs a keyword search. So bodies land in the column and nothing
+reads them.
+
+Turn it on when you want one of these:
+
+- You call `PgVectorCollection.search_by_keywords` yourself.
+- You query the `content` column directly with SQL.
+- You are preparing for one of the above and want the data accumulating now,
+  since existing rows do not backfill.
+
+With that understood, storing bodies is one key:
+
+```json
+"custom_params": {
+  "store_content": true
+}
+```
+
+That fills the `content` column and leaves the full-text index alone. It is the
+recommended starting point: you accumulate bodies from now on — which you
+cannot get retroactively, since existing rows do not backfill — without paying
+to index them or changing how anything ranks.
+
+**Indexing them is a second, separate key.** `store_content` decides whether
+bodies are *written*; `keyword_fields` decides whether they are *searched*:
+
+```json
+"custom_params": {
+  "store_content": true,
+  "keyword_fields": ["name", "description", "abstract", "tags", "search_tags", "content"]
+}
+```
+
+Setting only `keyword_fields` indexes an empty column. Before adding `content`
+there, read the duplication note below — for memories and directories the body
+repeats the abstract, so indexing it skews ranking rather than improving it.
+
+#### Why a flag rather than always-on
+
+OpenViking drops the `content` field before every write unless the adapter asks
+for it, via a `USE_CONTENT_FIELD` attribute it reads off the adapter. Only its
+two VikingDB backends set it, because only they need bodies for server-side
+grep. `store_content` sets that attribute per collection, so one collection can
+store bodies while another does not.
+
+#### What lands in the column
+
+Bodies come from OpenViking, and it materializes two different things:
+
+- **Leaf resources and skills that are text files** get the raw file, read back
+  from the document store at write time.
+- **Everything else** — memories, directories, abstracts, non-text resources —
+  gets the text that was embedded, falling back to the abstract.
+
+So every record gets a body; a memory's is its own text rather than a file on
+disk. For a memory or a directory that text is usually the same string already
+stored in `abstract`, so adding `content` to `keyword_fields` double-counts
+those terms in the tsvector and ranks those records above files whose body
+genuinely differs from their abstract. The bodies worth searching are the leaf
+resources and skills.
+
+OpenViking caps a body at 1 MiB of *characters* before this backend sees it —
+up to 4 MiB of UTF-8. This package then truncates `content` and `abstract` to
+448 KiB each on a character boundary, because PostgreSQL refuses to build a
+tsvector from more than 1048575 bytes and the full-text index builds one on
+every write. Without that cut an oversized body would abort the `INSERT`, not
+just its indexing.
+
+#### What it costs
+
+- **Bodies ride along on default reads.** `content` is an ordinary selectable
+  column, so any `search`, `filter`, or `scroll` that does not pass
+  `output_fields` returns it. OpenViking's own retrieval paths all pass
+  explicit field lists and none includes `content`, so normal search is
+  unaffected — but a direct caller that omits `output_fields`, or the debug
+  scroll route, now pulls full bodies. Pass `output_fields` on those.
+- **Every context hit rewrites the body.** `increment_active_count` re-fetches
+  each record in full and re-upserts it, so touching a context round-trips its
+  body through Python and recomputes its tsvector.
+- **Disk.** The table itself grows by less than your corpus, since `content` is
+  stored out of line and compressed. The full-text index over real bodies is
+  the larger and less obvious cost.
+
+#### Turning it on for an existing collection
+
+Two steps, in this order:
+
+1. **Re-key the full-text index.** Adding `content` to `keyword_fields` changes
+   the index expression, so run `ensure_indexes` (see below). Skipping it
+   leaves keyword search scanning the whole table.
+2. **Backfill.** Rows written before the flag hold an empty `content`, and
+   `backfill_defaults` will not touch them — it only fills NULLs, and `''` is
+   not NULL. Existing rows need re-indexing through OpenViking to pick up their
+   bodies.
+
 ### All configuration options
 
 Every key goes under `custom_params`. Unknown keys are **rejected at startup**, so a typo fails loudly instead of silently leaving a default in place.
@@ -320,6 +425,7 @@ Every key goes under `custom_params`. Unknown keys are **rejected at startup**, 
 | `iterative_scan` | `relaxed_order` | `off`, `strict_order`, or `relaxed_order` |
 | `distance` | from `distance_metric` | `cosine`, `l2`, or `ip` |
 | `keyword_fields` | name, description, abstract, tags, search_tags | Columns in the full-text index |
+| `store_content` | `false` | Persist each record's body text in `content` |
 | `text_search_config` | `simple` | Text search configuration |
 | `tz_policy` | `local` | Timezone for naive timestamps |
 | `min_pool_size` / `max_pool_size` | `1` / `8` | Connection pool bounds |
@@ -365,7 +471,7 @@ pgvector's `vector` type stores **float4**, so components are rounded on write: 
 - **A `bool`, `vector`, `sparse_vector` or `geo_point` primary key is refused** when the collection is defined. A `bool` key cannot work at all: OpenViking's own wrapper replaces a falsy id with a generated one, so `False` never reaches the database.
 - **A primary key of the wrong type is refused on write**, matching the built-in backend: `{"id": 3}` against a `string` key raises rather than storing `"3"`. An `int64` key accepts what the engine's validator accepts, so `"7"` and `True` become `7` and `1`. Reads are lenient, again matching: the engine keys rows on a hash of `str(key)`, so `fetch_data([3])` finds the record stored under `"3"` — and `[7.0]` finds nothing on an `int64` key, because `"7.0"` is not `"7"`. A key no stored row can equal is reported as not found rather than raising.
 - **`search_by_keywords` takes at most 16384 distinct terms.** Each binds two parameters against PostgreSQL's limit of 65535, and planning costs roughly a millisecond per term. Repeated terms are collapsed before any of that.
-- **Server-side grep** never routes here. OpenViking's `_resolve_grep_engine` hard-codes `("volcengine", "vikingdb")`, so grep falls back to the filesystem and the `content` field is not stored.
+- **Server-side grep** never routes here. OpenViking's `_resolve_grep_engine` hard-codes `("volcengine", "vikingdb")`, so grep always falls back to the filesystem — even with `store_content` on. Grep is also the only OpenViking code path that calls `search_by_keywords`, so no stock deployment issues a keyword query against this backend; reaching one means calling `search_by_keywords` yourself.
 
 **`search_by_keywords` is implemented** using PostgreSQL full-text search, so lexical search needs no embedding model.
 

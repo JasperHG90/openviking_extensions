@@ -64,6 +64,9 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
     ----------
     mode : str
         Backend identifier reported to OpenViking; always ``"pgvector"``.
+    USE_CONTENT_FIELD : bool
+        Whether OpenViking should write each record's body text to the
+        ``content`` column. Taken from ``params.store_content``.
     """
 
     # Declared because the base class is untyped, so mypy cannot otherwise
@@ -73,10 +76,32 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
     # PostgreSQL has no per-statement row cap; batching uses executemany.
     _DATA_BATCH_SIZE: int | None = None
 
-    # Full-text grep routing in openviking/storage/viking_fs/_grep.py hard-codes
-    # ("volcengine", "vikingdb"), so this backend can never be selected for
-    # server-side grep. Storing `content` would cost space and buy nothing.
+    # OpenViking reads this off the adapter to decide two things: whether to
+    # materialise a record's body text at all
+    # (``TextEmbeddingHandler._materialize_content``), and whether to keep it on
+    # the payload or drop it (``_SingleAccountBackend._prepare_upsert_payload``).
+    # Both read it through the instance, so ``__init__`` overrides it per
+    # collection from ``store_content``.
+    #
+    # False by default. Full-text grep routing in
+    # openviking/storage/viking_fs/_grep.py hard-codes ("volcengine",
+    # "vikingdb"), so this backend is never chosen for server-side grep, and
+    # content costs space that only keyword search can spend.
     USE_CONTENT_FIELD: bool = False
+
+    # PostgreSQL refuses to build a tsvector from more than 1048575 bytes, and
+    # the full-text index computes one on *every* write -- so an oversized body
+    # aborts the INSERT itself, not merely its indexing. OpenViking caps
+    # `content` at 1 MiB of *characters*, which is up to 4 MiB of UTF-8, so its
+    # cap alone does not keep us under the limit.
+    #
+    # The base class truncates each field in ``_TRUNCATABLE_TEXT_FIELDS``
+    # ("content", "abstract") to this many bytes, on a UTF-8 character
+    # boundary. Both can land in one tsvector alongside the shorter keyword
+    # columns, so the budget is set below half the limit rather than at it.
+    # Applied whether or not `store_content` is on: a large `abstract` is in
+    # the default keyword fields and could overflow the same index on its own.
+    _TEXT_FIELD_BYTE_LIMIT: int = 448 * 1024
 
     def __init__(
         self,
@@ -91,6 +116,9 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
         self.mode = "pgvector"
         self._dsn = dsn
         self._params = params
+        # Shadows the class attribute, so one collection can store bodies while
+        # another does not. Set before anything can read it.
+        self.USE_CONTENT_FIELD = params.store_content
         self._sparse_weight = sparse_weight
         self._pool: ConnectionPool | None = None
         self._bootstrapped = False
