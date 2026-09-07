@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
+from conftest import strip_ansi
 
 # The console entrypoint, not the retired ovx.sh. Resolved from this
 # interpreter's own bin directory so the suite drives the package it was
@@ -154,10 +155,14 @@ def write_config(path: Path, text: str) -> None:
 
 
 def run(args: list[str], **overrides: str) -> subprocess.CompletedProcess[str]:
-    """Run ovx headless with the current environment plus ``overrides``."""
+    """Run ovx headless with the current environment plus ``overrides``.
+
+    Both captured streams come back with ANSI escapes removed, so an
+    assertion holds whether or not rich decided to colour the output.
+    """
     env = dict(os.environ)
     env.update(overrides)
-    return subprocess.run(
+    done = subprocess.run(
         [str(OVX), *args],
         env=env,
         start_new_session=True,
@@ -165,6 +170,9 @@ def run(args: list[str], **overrides: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         timeout=30,
+    )
+    return subprocess.CompletedProcess(
+        done.args, done.returncode, strip_ansi(done.stdout), strip_ansi(done.stderr)
     )
 
 

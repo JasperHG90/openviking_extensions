@@ -1,0 +1,186 @@
+:root {
+  color-scheme: light dark;
+  --accent: #1d4ed8;
+  --edge: color-mix(in srgb, currentColor 18%, transparent);
+  --muted: color-mix(in srgb, currentColor 60%, transparent);
+}
+
+body {
+  margin: 0;
+  padding: 2rem 1.5rem;
+  font: 14px/1.5 system-ui, sans-serif;
+}
+
+main {
+  max-width: 34rem;
+  margin: 0 auto;
+}
+
+h1 {
+  font-size: 1.2rem;
+  margin: 0 0 0.6rem;
+}
+
+h2 {
+  font-size: 0.95rem;
+  margin: 0 0 0.8rem;
+}
+
+.lede {
+  margin: 0 0 1.75rem;
+  color: var(--muted);
+}
+
+section {
+  padding: 1.1rem 1.2rem;
+  margin-bottom: 1.25rem;
+  border: 1px solid var(--edge);
+  border-radius: 0.6rem;
+}
+
+label {
+  display: block;
+  margin: 0.9rem 0 0.25rem;
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+label:first-of-type {
+  margin-top: 0;
+}
+
+input[type="url"] {
+  width: 100%;
+  box-sizing: border-box;
+  font: inherit;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid var(--edge);
+  border-radius: 0.35rem;
+  background: transparent;
+  color: inherit;
+}
+
+label.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin-top: 1.1rem;
+  font-weight: 400;
+}
+
+.hint {
+  margin: 0.35rem 0 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.actions {
+  display: flex;
+  gap: 0.6rem;
+  margin-top: 1.25rem;
+}
+
+button {
+  font: inherit;
+  padding: 0.5rem 1.1rem;
+  border-radius: 0.35rem;
+  border: 1px solid var(--edge);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+button.primary {
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent);
+  border-color: transparent;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.state {
+  margin: 0;
+  font-weight: 600;
+}
+
+select {
+  width: 100%;
+  box-sizing: border-box;
+  font: inherit;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid var(--edge);
+  border-radius: 0.35rem;
+  background: transparent;
+  color: inherit;
+}
+
+input[type="text"] {
+  width: 100%;
+  box-sizing: border-box;
+  font: inherit;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid var(--edge);
+  border-radius: 0.35rem;
+  background: transparent;
+  color: inherit;
+}
+
+.optional {
+  font-weight: 400;
+  color: var(--muted);
+}
+
+.steps {
+  margin: 0;
+  padding-left: 1.2rem;
+}
+
+.steps li {
+  margin-bottom: 0.4rem;
+}
+
+code {
+  font-size: 0.9em;
+  padding: 0.05rem 0.25rem;
+  border-radius: 0.2rem;
+  background: color-mix(in srgb, currentColor 10%, transparent);
+}
+
+.state.connected::before {
+  content: "● ";
+  color: #15803d;
+}
+
+.state.disconnected::before {
+  content: "● ";
+  color: #b91c1c;
+}
+
+#status {
+  margin: 0.5rem 0 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+  min-height: 1em;
+}
+
+#status.error {
+  color: #b91c1c;
+}
+
+#status.success {
+  color: #15803d;
+}
+
+@media (prefers-color-scheme: dark) {
+  #status.error {
+    color: #fca5a5;
+  }
+
+  #status.success {
+    color: #86efac;
+  }
+}

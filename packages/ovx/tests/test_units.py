@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 
 import pytest
+from conftest import strip_ansi
 
 from ovx import tokens
 from ovx.cli import KNOWN_OPTIONS, reject_unknown_options, split_argv
@@ -556,10 +557,13 @@ def test_help_keeps_its_line_breaks(tmp_path: Path) -> None:
         timeout=30,
         check=False,
     )
-    assert "\\b" not in result.stdout, "click's marker is being printed literally"
+    # Rich colours an example's flags when it thinks it has a terminal, which
+    # puts escape sequences mid-example; this test is about the line breaks.
+    help_text = strip_ansi(result.stdout)
+    assert "\\b" not in help_text, "click's marker is being printed literally"
     # Each example must still be on its own line.
     for example in ("ovx lab find", "ovx -e lab", "ovx -- -o json status"):
-        assert any(example in line for line in result.stdout.splitlines()), (
+        assert any(example in line for line in help_text.splitlines()), (
             f"{example!r} was rewrapped away"
         )
 

@@ -38,7 +38,15 @@ jobs:
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
+      # The Node hooks shell out to each package's own node_modules, which this
+      # job never installs -- it is a Python job. Left in, they fail on a
+      # missing biome rather than on anything about the code, and the tsc they
+      # do find is the runner's global one. test-node runs the same three
+      # commands per package with the package's pinned toolchain, so the cover
+      # is there; this only says where.
       - name: Run prek hooks
+        env:
+          SKIP: check-ov-dash,lint-ov-dash,test-ov-dash,check-ov-clip,lint-ov-clip,test-ov-clip
         run: uvx prek@0.2.25 run --all-files --show-diff-on-failure
 
   # The package list lives in the filters below and in the two fallback lists;

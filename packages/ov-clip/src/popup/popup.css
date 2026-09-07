@@ -1,0 +1,165 @@
+:root {
+  color-scheme: light dark;
+  --accent: #1d4ed8;
+  --edge: color-mix(in srgb, currentColor 18%, transparent);
+  --muted: color-mix(in srgb, currentColor 60%, transparent);
+}
+
+body {
+  width: 24rem;
+  margin: 0;
+  padding: 0.9rem 1rem 1rem;
+  font: 13px/1.45 system-ui, sans-serif;
+}
+
+header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+h1 {
+  font-size: 0.95rem;
+  margin: 0;
+}
+
+header a {
+  color: var(--accent);
+  font-size: 0.8rem;
+  text-decoration: none;
+}
+
+header a:hover {
+  text-decoration: underline;
+}
+
+.url {
+  margin: 0.35rem 0 0.9rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lede {
+  margin: 0 0 0.4rem;
+  font-weight: 600;
+}
+
+.hint {
+  margin: 0.4rem 0 0;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+label {
+  display: block;
+  margin: 0.7rem 0 0.2rem;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.optional {
+  font-weight: 400;
+  color: var(--muted);
+}
+
+input[type="text"],
+select,
+textarea {
+  width: 100%;
+  box-sizing: border-box;
+  font: inherit;
+  padding: 0.4rem 0.5rem;
+  border: 1px solid var(--edge);
+  border-radius: 0.35rem;
+  background: transparent;
+  color: inherit;
+}
+
+textarea {
+  resize: vertical;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.6rem;
+}
+
+.row label {
+  margin-top: 0.7rem;
+}
+
+label.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-weight: 400;
+}
+
+label.checkbox input {
+  width: auto;
+}
+
+details {
+  margin-top: 0.8rem;
+}
+
+summary {
+  cursor: pointer;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+button.primary {
+  width: 100%;
+  margin-top: 1rem;
+  padding: 0.55rem;
+  font: inherit;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent);
+  border: 0;
+  border-radius: 0.35rem;
+  cursor: pointer;
+}
+
+button.primary:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+button.primary.saved {
+  background: #15803d;
+}
+
+#status {
+  margin: 0.6rem 0 0;
+  font-size: 0.8rem;
+  min-height: 1em;
+}
+
+#status.error {
+  color: #b91c1c;
+}
+
+#status.working {
+  color: var(--muted);
+}
+
+#status.success {
+  color: #15803d;
+}
+
+@media (prefers-color-scheme: dark) {
+  #status.error {
+    color: #fca5a5;
+  }
+
+  #status.success {
+    color: #86efac;
+  }
+}

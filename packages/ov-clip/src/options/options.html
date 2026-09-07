@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Save to OpenViking — settings</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Save to OpenViking</h1>
+      <p class="lede">
+        This extension stores no credential. It asks <code>ovx</code> for a
+        token every time it saves, and <code>ovx</code> renews that token from
+        your Vault session — so there is no password here, nothing to paste, and
+        nothing left on disk when Firefox closes.
+      </p>
+
+      <section>
+        <h2>ovx</h2>
+        <p id="ovx-state" class="state">Checking…</p>
+        <p id="ovx-hint" class="hint"></p>
+
+        <label for="profile">Profile</label>
+        <select id="profile"></select>
+        <p class="hint">
+          The <code>ovx</code> profile to save through. Its <code>url</code> is
+          where files go, and its stored login is the credential.
+        </p>
+
+        <div class="actions">
+          <button id="recheck-btn" type="button" class="primary">Check again</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>Where files go</h2>
+
+        <label for="user-scope">My files</label>
+        <input id="user-scope" type="text" spellcheck="false" autocomplete="off" />
+        <p class="hint">
+          <code>viking://~</code> is OpenViking's home alias — it resolves to
+          whoever your token says you are, so nothing here has to know your user
+          id. Leave empty to hide this option.
+        </p>
+
+        <label for="shared-scope">Shared with the account</label>
+        <input id="shared-scope" type="text" spellcheck="false" autocomplete="off" />
+        <p class="hint">
+          Readable by everyone in the account. Leave empty to hide this option.
+        </p>
+
+        <label for="default-folder">Folder <span class="optional">optional</span></label>
+        <input id="default-folder" type="text" spellcheck="false" autocomplete="off" />
+        <p class="hint">
+          Every clip goes into this folder below the scope you pick, so the
+          default lands at <code>viking://~/resources/clips/…</code>. The popup
+          lets you change it for one save. Leave empty to save straight into the
+          scope.
+        </p>
+
+        <label for="url">OpenViking address <span class="optional">optional</span></label>
+        <input id="url" type="url" inputmode="url" spellcheck="false" autocomplete="off" />
+        <p class="hint">
+          Only if it should differ from the profile's own <code>url</code>.
+          Normally leave this empty.
+        </p>
+      </section>
+
+      <section>
+        <h2>Setting it up</h2>
+        <ol class="steps">
+          <li>Install <code>ovx</code>, and make a profile: <code>ovx -n</code></li>
+          <li>Sign in once: <code>ovx --login &lt;profile&gt;</code></li>
+          <li>
+            Let this extension ask <code>ovx</code> for tokens:
+            <code>ovx --install-firefox-host</code>
+          </li>
+          <li>Restart Firefox, then press <strong>Check again</strong> above.</li>
+        </ol>
+      </section>
+
+      <p id="status" role="status"></p>
+    </main>
+
+    <script src="options.js"></script>
+  </body>
+</html>

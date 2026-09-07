@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { zipSync } from "fflate";
 import { Hono } from "hono";
-import type { Context, Next } from "hono";
+import type { Context, MiddlewareHandler } from "hono";
 import { csrf } from "hono/csrf";
 import { HTTPException } from "hono/http-exception";
 import type {
@@ -844,10 +844,10 @@ async function readMemory(ov: OvClient, node: Node): Promise<Memory> {
 export function sameOriginOnly(
   config: Config,
   costlyGets: ReadonlySet<string> = new Set(),
-) {
+): MiddlewareHandler {
   const expected = originOf(config);
 
-  return async (c: Context, next: Next): Promise<Response | void> => {
+  return async (c, next) => {
     const origin = c.req.header("origin");
     const site = c.req.header("sec-fetch-site");
     const changesState = c.req.method !== "GET" && c.req.method !== "HEAD";

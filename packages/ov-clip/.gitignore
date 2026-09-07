@@ -1,9 +1,14 @@
 # Build output. esbuild writes compiled JS beside the HTML it belongs to, so
 # the loadable extension is the package root and these are the parts of it that
 # are generated.
+#
+# Every build path is anchored with a leading slash. Unanchored, `popup/` and
+# `options/` match at any depth, so they also hid src/popup/ and src/options/ —
+# the popup and options pages never reached the repo, and CI's build died on a
+# source file that only ever existed on one laptop.
 node_modules/
-background.js
-popup/
-options/
-dist/
-web-ext-artifacts/
+/background.js
+/popup/
+/options/
+/dist/
+/web-ext-artifacts/

@@ -1,7 +1,8 @@
 # Test one Node package. Unlike the Python and shell templates, this one owns
-# its whole toolchain: the repo-wide prek hooks are Python-shaped and cannot
-# type-check TypeScript or parse Svelte, so type-check, lint and tests all run
-# here.
+# its whole toolchain: type-check, lint and tests all run here, against the
+# node_modules this job installs. The repo-wide prek run has hooks calling the
+# same three commands, for the benefit of a local commit, but the checks job
+# has no node_modules to call them with and skips them by name.
 name: template-check-node
 
 on:

@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Save to OpenViking</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Save to OpenViking</h1>
+      <a id="open-settings" href="#" role="button">Settings</a>
+    </header>
+
+    <p id="url-preview" class="url"></p>
+
+    <section id="disconnected" hidden>
+      <p class="lede">Not ready to save yet.</p>
+      <p id="disconnected-why" class="hint"></p>
+      <p class="hint">
+        This extension holds no credential. It asks <code>ovx</code> for a token
+        each time it saves, so whatever <code>ov</code> can reach, it can too.
+      </p>
+      <button id="connect-btn" type="button" class="primary">Open settings</button>
+    </section>
+
+    <form id="save-form" hidden>
+      <label for="title">Title</label>
+      <input id="title" type="text" autocomplete="off" />
+
+      <div class="row">
+        <div>
+          <label for="scope">Save into</label>
+          <select id="scope"></select>
+        </div>
+        <div>
+          <label for="folder">Folder <span class="optional">optional</span></label>
+          <input
+            id="folder"
+            type="text"
+            list="folder-suggestions"
+            placeholder="clips"
+            autocomplete="off"
+          />
+          <datalist id="folder-suggestions"></datalist>
+        </div>
+      </div>
+      <p id="target-preview" class="hint"></p>
+
+      <label for="note">Why you kept this <span class="optional">optional</span></label>
+      <textarea id="note" rows="2"></textarea>
+
+      <label for="tags">Tags <span class="optional">comma separated</span></label>
+      <input id="tags" type="text" autocomplete="off" />
+
+      <details id="details">
+        <summary>Details</summary>
+        <label for="author">Author</label>
+        <input id="author" type="text" autocomplete="off" />
+        <label for="publish-date">Published</label>
+        <input id="publish-date" type="text" placeholder="YYYY-MM-DD" autocomplete="off" />
+      </details>
+
+      <button id="save-btn" type="submit" class="primary" disabled>Save</button>
+    </form>
+
+    <p id="status" role="status"></p>
+    <p id="signed-in" class="hint"></p>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
