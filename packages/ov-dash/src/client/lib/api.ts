@@ -154,7 +154,16 @@ export const api = {
   },
 
   async signOut(): Promise<void> {
-    await fetch("/auth/logout", { method: "POST", credentials: "same-origin" });
+    const response = await fetch("/auth/logout", {
+      method: "POST",
+      credentials: "same-origin",
+    });
+    // Everything cached was read as the person signing out. Left in place, the
+    // next person to sign in on this tab would be shown it.
+    invalidate();
+    if (!response.ok) {
+      throw new ApiError("could not sign out", "LOGOUT_FAILED", response.status);
+    }
   },
 
   /** The URL a download link points at. Files stream; folders arrive zipped. */

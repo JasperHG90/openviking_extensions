@@ -231,8 +231,10 @@ export function createApp(services: Services) {
 
   app.get("/api/session", async (c) => {
     const viewer = await currentViewer(c, config);
+    const cookieBacked =
+      config.AUTH_MODE === "oidc" || config.AUTH_MODE === "vault-userpass";
     const state: SessionState = viewer
-      ? { signedIn: true, viewer }
+      ? { signedIn: true, viewer, canSignOut: cookieBacked }
       : {
           signedIn: false,
           loginUrl: "/auth/login",

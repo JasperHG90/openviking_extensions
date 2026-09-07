@@ -30,7 +30,19 @@ export const sessionStateSchema = z.discriminatedUnion("signedIn", [
     /** How to sign in: a form this page posts, or a redirect to a provider. */
     mode: z.enum(["vault-userpass", "redirect"]),
   }),
-  z.object({ signedIn: z.literal(true), viewer: viewerSchema }),
+  z.object({
+    signedIn: z.literal(true),
+    viewer: viewerSchema,
+    /**
+     * Whether signing out ends anything.
+     *
+     * Only a cookie-backed session can be ended from here. Under
+     * `trusted-header` the identity arrives on every request from the proxy,
+     * and under `dev` it is fixed by configuration — clearing a cookie neither
+     * reads would be a button that lies.
+     */
+    canSignOut: z.boolean(),
+  }),
 ]);
 export type SessionState = z.infer<typeof sessionStateSchema>;
 

@@ -62,6 +62,8 @@ describe("who is calling", () => {
     const response = await appFor().request("/api/session");
     expect(await response.json()).toEqual({
       signedIn: true,
+      // Nothing here holds the session, so the page must not offer to end it.
+      canSignOut: false,
       viewer: {
         sub: "jasper",
         name: "jasper",
