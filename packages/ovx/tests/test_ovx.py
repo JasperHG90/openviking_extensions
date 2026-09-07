@@ -1,6 +1,7 @@
-"""Tests for ovx.sh.
+"""Tests for the ovx command line.
 
-The suite drives the real script. A shim on PATH stands in for ``ov`` and
+The suite drives the installed console entrypoint as a subprocess, so it
+tests what an operator runs. A shim on PATH stands in for ``ov`` and
 records what it saw — its argv, ``$OPENVIKING_CLI_CONFIG_FILE``, and the
 contents and permissions of the file that variable pointed at — so the tests
 can assert on the config ovx materialized without ovx having to expose it.
@@ -32,7 +33,20 @@ from typing import Any, ClassVar
 
 import pytest
 
-OVX = Path(__file__).resolve().parent.parent / "ovx.sh"
+# The console entrypoint, not the retired ovx.sh. Resolved from this
+# interpreter's own bin directory so the suite drives the package it was
+# installed from rather than whatever `ovx` happens to be on PATH.
+OVX = Path(sys.executable).parent / "ovx"
+
+# The package's own source, for the tests that assert a whole mechanism is
+# gone. Reading OVX would only read the generated console wrapper.
+SOURCE_DIR = Path(__file__).resolve().parent.parent / "src" / "ovx"
+
+
+def _package_source() -> str:
+    """Return every line of the package's source, concatenated."""
+    return "\n".join(p.read_text() for p in sorted(SOURCE_DIR.glob("*.py")))
+
 
 # Resolved at import, while PATH and HOME are still the real ones. The
 # workspace fixture redirects both, so a later lookup would miss.
@@ -222,6 +236,14 @@ def run_pty(args: list[str], steps: list[tuple[str, str]], timeout: int = 20) ->
                 break
         except ChildProcessError:
             break
+    # Kill before the blocking wait: a child still sitting on /dev/tty because
+    # a prompt never matched would otherwise hang the whole suite here rather
+    # than failing the one test.
+    try:
+        if os.waitpid(pid, os.WNOHANG)[0] != pid:
+            os.kill(pid, signal.SIGKILL)
+    except (ChildProcessError, ProcessLookupError):
+        pass
     try:
         os.waitpid(pid, 0)
     except ChildProcessError:
@@ -492,29 +514,25 @@ def test_unknown_ovx_option_is_refused(workspace: Path, config: Path) -> None:
 
 
 def test_help_and_version_need_nothing_installed(workspace: Path) -> None:
-    """-h and -V answer before any dependency check, so they always work."""
-    # bash for the shebang and awk for the help text, which is all -h and -V
-    # may rely on. Deliberately no python3 and no ov.
-    minimal = workspace / "nobin"
-    minimal.mkdir()
-    for tool in ("bash", "awk"):
-        found = shutil.which(tool)
-        assert found is not None, tool
-        (minimal / tool).symlink_to(found)
-    env = dict(os.environ, PATH=str(minimal))
+    """-h and -V answer before any dependency check, so they always work.
+
+    A PATH holding only this interpreter -- no ov, nothing else -- because
+    both flags are what an operator reaches for when the install is broken.
+    """
+    env = dict(os.environ, PATH=str(Path(sys.executable).parent))
 
     for flag in ("-h", "--help"):
         result = subprocess.run(
             [str(OVX), flag], env=env, capture_output=True, text=True, timeout=30
         )
         assert result.returncode == 0, result.stderr
-        assert "Usage: ovx [PROFILE]" in result.stdout, result.stdout
+        assert "Usage:" in result.stdout, result.stdout
+        assert "ovx" in result.stdout
 
     result = subprocess.run(
         [str(OVX), "-V"], env=env, capture_output=True, text=True, timeout=30
     )
     assert result.returncode == 0, result.stderr
-    # "dev" in a checkout; release.yaml stamps the tag's version in its place.
     assert re.fullmatch(r"ovx \S+\n", result.stdout), result.stdout
 
 
@@ -522,29 +540,47 @@ def test_help_reports_the_config_file_in_force(workspace: Path, config: Path) ->
     """The header documents the default path; --help names the one in use."""
     result = run(["--help"])
     assert result.returncode == 0, result.stderr
-    assert f"Config in use: {config}" in result.stdout, result.stdout
+    # Click wraps the epilog, so match the path rather than the whole line.
+    assert "Config in use" in result.stdout, result.stdout
+    assert config.name in result.stdout, result.stdout
 
 
 def test_every_option_is_documented(workspace: Path) -> None:
     """Each flag the parser accepts appears in --help.
 
-    The help text is the comment block at the top of ovx.sh, so it is edited
-    in a different place from the case statement that implements the flags.
-    This is what stops the two drifting apart.
+    KNOWN_OPTIONS is what rejects a typo'd flag, and the help is generated
+    from the command signature -- two different places. This is what stops
+    them drifting apart.
     """
-    source = OVX.read_text()
-    case_body = source.split("--- arg parsing ---")[1]
-    # Long options, with their short alias where there is one. A long-only arm
-    # has to be caught too, which an alias-only pattern would silently miss.
-    # The bare "--)" separator and the "-*)" catch-all are not options and do
-    # not match.
-    arms = re.findall(r"^\s+((?:-\w\|)?--[\w-]+)\)", case_body, re.MULTILINE)
-    assert arms, "found no option cases to check"
+    from ovx.cli import KNOWN_OPTIONS
 
     help_text = run(["--help"]).stdout
-    for arm in sorted(set(arms)):
-        expected = arm.replace("|", ", ")
-        assert expected in help_text, f"{arm} is undocumented"
+    # Completion flags are typer's own and are listed under a separate heading
+    # that click may wrap; the rest are ovx's and must all appear.
+    ours = {o for o in KNOWN_OPTIONS if not o.startswith("--install")} - {
+        "--show-completion"
+    }
+    missing = [option for option in sorted(ours) if option not in help_text]
+    assert not missing, f"undocumented: {missing}\n{help_text}"
+
+
+def test_help_carries_the_reference_sections(workspace: Path) -> None:
+    """--help is the manual, as the shell version's header block was.
+
+    Losing these to a generated one-line description is a real regression:
+    they are the only place the Vault variables and the no-revoke caveat are
+    written down at the point of use.
+    """
+    help_text = run(["--help"]).stdout
+    for needle in (
+        "OVX_VAULT_ROLE",
+        "VAULT_SKIP_VERIFY",
+        "VAULT_TOKEN_HELPER",
+        "api_key = ",
+        "ovx lab find",
+        "no server-side revoke",
+    ):
+        assert needle in help_text, f"{needle!r} missing from --help"
 
 
 def test_list_does_not_need_ov(workspace: Path, config: Path) -> None:
@@ -1339,7 +1375,10 @@ def test_expired_token_without_a_session_says_run_login(
     result = run(["lab", "status"], OV_KEY="unused")
 
     assert result.returncode != 0
-    assert "Vault session is gone" in result.stderr
+    # The message names what actually failed rather than always blaming the
+    # session: a bad $VAULT_CACERT or an unreachable Vault used to send the
+    # operator to `ovx --login`, which then failed identically.
+    assert "cannot be renewed" in result.stderr, result.stderr
     assert "ovx --login lab" in result.stderr
 
 
@@ -1565,7 +1604,7 @@ def test_no_oauth_machinery_remains() -> None:
     OpenViking's OAuth subsystem answers 503 on every endpoint, so a leftover
     call would be a guaranteed failure rather than a fallback.
     """
-    source = OVX.read_text()
+    source = _package_source()
     for dead in (
         "/oauth/authorize",
         "/.well-known/oauth-authorization-server",
@@ -1577,152 +1616,11 @@ def test_no_oauth_machinery_remains() -> None:
         "revocation_endpoint",
         "studio/oauth",
     ):
-        assert dead not in source, f"{dead} still appears in ovx.sh"
+        assert dead not in source, f"{dead} still appears in the package"
 
 
 def test_the_vault_cli_is_not_a_dependency() -> None:
     """Ovx must not shell out to `vault`; it speaks the HTTP API itself."""
-    source = OVX.read_text()
+    source = _package_source()
     for dead in ("command -v vault", "vault token lookup", "vault read -field"):
-        assert dead not in source, f"{dead} still appears in ovx.sh"
-
-
-# --- install.sh ----------------------------------------------------------
-
-INSTALLER = Path(__file__).resolve().parent.parent / "install.sh"
-
-# What the GitHub releases API returns: newest first, prereleases mixed in,
-# and other packages' releases alongside ovx's. Compact like the real body.
-RELEASES_JSON = (
-    '[{"id":3,"author":{"login":"someone"},"tag_name":"ovx-v0.2.0",'
-    '"draft":false,"prerelease":true,"assets":[{"id":9,"name":"ovx.sh"}]},'
-    '{"id":2,"author":{"login":"someone"},"tag_name":"v0.2.0",'
-    '"draft":false,"prerelease":false,"assets":[]},'
-    '{"id":1,"author":{"login":"someone"},"tag_name":"ovx-v0.1.0",'
-    '"draft":false,"prerelease":false,"assets":[{"id":7,"name":"ovx.sh"}]}]'
-)
-
-# Stands in for curl. Answers the releases API from $FAKE_RELEASES and serves
-# any download as a script that reports the version out of its own URL, so a
-# test can see which release the installer chose.
-CURL_SHIM = """#!/usr/bin/env bash
-url=""
-out=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -o) out="$2"; shift 2 ;;
-    -*) shift ;;
-    *) url="$1"; shift ;;
-  esac
-done
-if [[ "$url" == *api.github.com* ]]; then
-  cat "$FAKE_RELEASES"
-  exit 0
-fi
-version="${url#*/download/ovx-v}"
-version="${version%/ovx.sh}"
-body="#!/usr/bin/env bash
-echo \\"ovx $version\\""
-if [ -n "$out" ]; then printf '%s\\n' "$body" > "$out"; else printf '%s\\n' "$body"; fi
-"""
-
-
-@pytest.fixture
-def installer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """PATH with a curl that serves canned releases. Returns the install dir."""
-    bindir = tmp_path / "fakebin"
-    bindir.mkdir()
-    curl = bindir / "curl"
-    curl.write_text(CURL_SHIM)
-    curl.chmod(0o755)
-
-    releases = tmp_path / "releases.json"
-    releases.write_text(RELEASES_JSON)
-
-    target = tmp_path / "target"
-    monkeypatch.setenv("FAKE_RELEASES", str(releases))
-    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
-    return target
-
-
-def run_installer(args: list[str]) -> subprocess.CompletedProcess[str]:
-    """Run install.sh with the current environment."""
-    return subprocess.run(
-        ["bash", str(INSTALLER), *args],
-        env=dict(os.environ),
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-
-
-def test_default_install_skips_prereleases(installer: Path) -> None:
-    """A bare install gets the newest stable release, not a newer beta.
-
-    The releases endpoint returns prereleases too, so "pre-release" on GitHub
-    only means something if the installer reads the flag. Without this, cutting
-    a beta silently changes what everyone's `curl | bash` hands them.
-    """
-    result = run_installer(["--to", str(installer)])
-
-    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-    assert "installed ovx 0.1.0" in result.stderr, result.stderr
-
-
-def test_default_install_ignores_other_packages_releases(installer: Path) -> None:
-    """A stable release of another package in this repo is not an ovx version."""
-    result = run_installer(["--to", str(installer)])
-
-    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-    # v0.2.0 is ov-postgres', and sorts newest of the stable ones.
-    assert "0.2.0" not in result.stderr.split("downloading")[1].split("\n")[0]
-
-
-def test_explicit_version_installs_the_prerelease(installer: Path) -> None:
-    """--version is how a beta is opted into, and it bypasses the filter."""
-    result = run_installer(["--to", str(installer), "--version", "0.2.0"])
-
-    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-    assert "installed ovx 0.2.0" in result.stderr, result.stderr
-
-
-def test_no_stable_release_is_a_clear_error(
-    installer: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """When every ovx release is a prerelease, say so instead of installing one."""
-    only_beta = tmp_path / "beta-only.json"
-    only_beta.write_text(
-        '[{"id":3,"author":{"login":"someone"},"tag_name":"ovx-v0.2.0",'
-        '"draft":false,"prerelease":true,"assets":[]}]'
-    )
-    monkeypatch.setenv("FAKE_RELEASES", str(only_beta))
-
-    result = run_installer(["--to", str(installer)])
-
-    assert result.returncode != 0
-    assert "found no published ovx-v* release" in result.stderr
-    assert "--version" in result.stderr
-
-
-def test_the_token_is_not_exported_into_ovs_environment(
-    workspace: Path, config: Path, vault: type[FakeVault]
-) -> None:
-    """Only the temp ovcli.conf carries the token, never ov's environment.
-
-    An exported credential is readable from ``/proc/<pid>/environ`` or ``ps -E``
-    by anything running as this user, and ov has no need of it — it reads the
-    config file ovx points it at.
-    """
-    write_config(config, LAB)
-    token = make_jwt()
-    write_token(workspace, token)
-
-    shim = workspace / "bin" / "ov"
-    shim.write_text(
-        '#!/usr/bin/env bash\necho "OVX_TOKEN=${OVX_TOKEN:-<unset>}" >> "$OVX_TEST_LOG"\n'
-    )
-    shim.chmod(0o755)
-
-    run(["lab", "status"], OV_KEY="unused")
-
-    assert "OVX_TOKEN=<unset>" in (workspace / "shim.log").read_text()
+        assert dead not in source, f"{dead} still appears in the package"

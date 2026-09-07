@@ -25,46 +25,27 @@ and deletes the file when `ov` exits. Nothing is written to `~/.openviking`.
 
 ## Install
 
-`ovx` needs [`python3`](https://www.python.org/) 3.11+ (to read its TOML config)
-and the `ov` CLI.
-
 ```bash
-curl -fsSL https://raw.githubusercontent.com/JasperHG90/openviking_extensions/main/packages/ovx/install.sh | bash
+uv tool install ovx --from "git+https://github.com/JasperHG90/openviking_extensions@ovx-v0.3.0#subdirectory=packages/ovx"
 ```
 
-That installs the newest stable [release](https://github.com/JasperHG90/openviking_extensions/releases)
-to `~/.local/bin`. Pin a version, or pick another directory:
+Or from a checkout:
 
 ```bash
-curl -fsSL .../install.sh | bash -s -- --version 0.1.0
-curl -fsSL .../install.sh | bash -s -- --to /usr/local/bin
+uv tool install ./packages/ovx
 ```
 
-Prereleases are skipped by a bare install, so a beta is something you ask for
-by version and never something the one-liner hands you:
+`ovx` needs Python 3.11+ (for `tomllib`) and the `ov` CLI. `uv` supplies the
+interpreter, so a stock macOS with its Python 3.9 is no longer a problem.
 
-```bash
-curl -fsSL .../install.sh | bash -s -- --version 0.2.0
-```
+`ovx -V` reports the version, which comes from the git tag through hatch-vcs.
+A checkout with no tag reports a `0.0.0.dev` version rather than failing: the
+version lives in the tag, and an untagged tree has none to claim.
 
-The `install.sh` attached to a release is pinned to that release, so taking the
-pair from a release page gives you that pair.
-
-To install the unreleased tip of `main`, or work from a clone:
-
-```bash
-curl -fsSL .../install.sh | bash -s -- --main
-./packages/ovx/install.sh --local packages/ovx/ovx.sh
-```
-
-`ovx -V` reports the installed version, and the installer prints it too. Those
-last two both report **`dev`**, and that is not a bug: the version is stamped
-in at release time and lives in the git tag, so a copy taken from the
-repository has no version to claim. Install a release if you want a real one.
-
-> On a stock macOS, `python3` is 3.9 and has no `tomllib`. Install a newer one
-> (`brew install python@3.12`, or `uv python install`) and put it ahead on
-> `PATH`.
+> **Upgrading from the shell script.** `ovx` used to be a single bash file
+> installed by `curl | bash` into `~/.local/bin`. Remove that copy —
+> `rm ~/.local/bin/ovx` — or whichever comes first on `PATH` wins. Your
+> `~/.ovx/config.toml` and stored logins carry over untouched.
 
 ## Use
 
@@ -90,10 +71,11 @@ written. A `--` is only needed when no profile name comes first, as in
 option. One straight after the profile name is allowed and dropped, so
 `ovx lab -- -o json status` does the same thing as without it.
 
-`ovx --help` prints the comment block at the top of `ovx.sh`, so the help and
-the file's own header are one text rather than two that can disagree. It then
-adds the config file actually in force, which the header cannot know. A test
-checks every option the parser accepts appears there.
+`ovx --help` carries the whole reference — the behavior examples, the Vault
+variables, the config format and the `--` rules — not just a one-line summary.
+It ends with the config file actually in force, which the static text cannot
+know. Two tests keep it honest: one asserts every option `ovx` accepts appears
+there, the other that the reference sections have not been quietly dropped.
 
 Each run prints a one-line banner to stderr naming the profile, its URL, and a
 masked key, so you can see which instance you are about to hit. It is skipped
@@ -326,19 +308,20 @@ file exists. `$OPENVIKING_CLI_CONFIG_FILE` covers `ovcli.conf` only. Run
 
 ## Development
 
-The script is bash; the tests are Python. `ovx` is not a member of the root uv
-workspace — its tests drive a script needing Python 3.11+, and `ov-postgres`
-still supports 3.10 — so run them scoped to this directory:
-
 ```bash
-uv run --directory packages/ovx pytest        # unit tests, offline
-uv run --directory packages/ovx pytest -m integration   # needs the ov CLI
+uv run --directory packages/ovx pytest        # its own project, its own lock
+uv run --directory packages/ovx ovx --help    # run it in place
 ```
 
-The unit tests put a shim on `PATH` in place of `ov` that records its argv, the
-config path it was handed, and that file's contents and permissions. The
-integration test runs the real `ov` against a local HTTP server and asserts the
-expanded key arrives in the request header.
+The suite drives the installed console entrypoint as a subprocess, so it tests
+what an operator actually runs rather than the functions underneath. A shim on
+`PATH` stands in for `ov` and records the config it was handed; a fake Vault
+HTTP server stands in for Vault. Interactive paths are driven through a pty.
+
+`tests/test_units.py` covers what the subprocess tests reach only through their
+happy paths — file modes, temp-directory cleanup, `$VAR` expansion, argv
+splitting and the exit-code contract. Those were added after a review mutated
+the source and found 24 of 29 changes left the suite green.
 
 ## License
 

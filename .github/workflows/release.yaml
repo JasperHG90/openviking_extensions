@@ -58,17 +58,18 @@ jobs:
   # Two jobs, because `uses:` cannot be chosen from an expression. Exactly one
   # runs and the other skips. The shell-package list repeats ALL_SHELL in
   # ci.yaml -- there is no way to share a list between workflows, so a new
-  # shell package has to be added in both.
+  # shell package has to be added in both. ovx used to be on that list; it is
+  # a Python package now and builds a wheel like ov-postgres.
   test:
     needs: guard
-    if: ${{ !contains(fromJSON('["ovx", "ov-skills"]'), inputs.package) }}
+    if: ${{ !contains(fromJSON('["ov-skills"]'), inputs.package) }}
     uses: ./.github/workflows/template-check.yaml
     with:
       package: ${{ inputs.package }}
 
   test-shell:
     needs: guard
-    if: ${{ contains(fromJSON('["ovx", "ov-skills"]'), inputs.package) }}
+    if: ${{ contains(fromJSON('["ov-skills"]'), inputs.package) }}
     uses: ./.github/workflows/template-check-shell.yaml
     with:
       package: ${{ inputs.package }}
@@ -216,16 +217,16 @@ jobs:
           fetch-depth: 0
 
       - uses: astral-sh/setup-uv@v6
-        if: ${{ !contains(fromJSON('["ovx", "ov-skills"]'), inputs.package) }}
+        if: ${{ !contains(fromJSON('["ov-skills"]'), inputs.package) }}
         with:
           version: ${{ env.UV_VERSION }}
 
       - name: Build package
-        if: ${{ !contains(fromJSON('["ovx", "ov-skills"]'), inputs.package) }}
+        if: ${{ !contains(fromJSON('["ov-skills"]'), inputs.package) }}
         run: uv build --package ${{ inputs.package }}
 
       - name: Verify the built version matches the tag
-        if: ${{ !contains(fromJSON('["ovx", "ov-skills"]'), inputs.package) }}
+        if: ${{ !contains(fromJSON('["ov-skills"]'), inputs.package) }}
         env:
           VERSION: ${{ needs.release.outputs.version }}
           PACKAGE: ${{ inputs.package }}
@@ -235,41 +236,6 @@ jobs:
           built=$(ls dist/*.whl | sed -E "s/.*${module}-([^-]+)-py3.*/\1/")
           echo "planned=$VERSION built=$built"
           test "$VERSION" = "$built"
-
-      # A shell package has nothing to compile. hatch-vcs cannot stamp a
-      # version into it either, so do it here: the script carries
-      # <PACKAGE>_VERSION="dev" in a checkout, and the release ships a copy
-      # reporting the tag. The version still lives only in the tag.
-      - name: Package the shell script
-        if: ${{ inputs.package == 'ovx' }}
-        env:
-          VERSION: ${{ needs.release.outputs.version }}
-          PACKAGE: ${{ inputs.package }}
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          src="packages/$PACKAGE/$PACKAGE.sh"
-          var="$(printf '%s' "$PACKAGE" | tr 'a-z-' 'A-Z_')_VERSION"
-
-          sed "s/^${var}=\"dev\"\$/${var}=\"${VERSION}\"/" "$src" > "dist/$PACKAGE.sh"
-          chmod 755 "dist/$PACKAGE.sh"
-
-          # Pin the shipped installer to this release. Unstamped it would look
-          # the newest release up over the API; someone who downloaded the pair
-          # from a release page expects to get that pair, not whatever is
-          # newest by the time they run it.
-          sed "s|^PINNED_VERSION=.*|PINNED_VERSION=\"$VERSION\"|" \
-            "packages/$PACKAGE/install.sh" > dist/install.sh
-          chmod 755 dist/install.sh
-
-          # Both stamps are plain seds against lines that could be renamed at
-          # any time. Check them rather than trust them, so a tagged release
-          # can never ship a script reporting "dev" or an installer pointing
-          # at the wrong place.
-          got="$(bash "dist/$PACKAGE.sh" -V)"
-          echo "planned=$PACKAGE $VERSION got=$got"
-          test "$got" = "$PACKAGE $VERSION"
-          grep -q "^PINNED_VERSION=\"$VERSION\"\$" dist/install.sh
 
       # ov-skills is markdown, not a script, so there is nothing to stamp a
       # version into and nothing to run. It ships as a tarball whose root holds

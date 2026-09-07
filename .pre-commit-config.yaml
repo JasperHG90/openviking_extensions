@@ -13,10 +13,6 @@ repos:
     rev: v0.10.0
     hooks:
       - id: shellcheck
-        name: shellcheck (ovx)
-        files: ^packages/ovx/.*\.sh$
-
-      - id: shellcheck
         name: shellcheck (ov-skills)
         files: ^packages/ov-skills/.*\.sh$
 
@@ -34,9 +30,12 @@ repos:
 
       - id: mypy
         name: mypy (ovx)
-        files: ^packages/ovx/tests/
+        # src as well as tests: ovx is a package now, and scoping this to
+        # tests/ made the hook pass over a deliberate type error in src/.
+        files: ^packages/ovx/(src|tests)/
         additional_dependencies:
           - pytest>=8
+          - typer>=0.12
         args: [--config-file=packages/ovx/pyproject.toml]
 
       - id: mypy
@@ -59,8 +58,6 @@ repos:
         files: ^packages/ov-postgres/
         types: [python]
 
-      # No `types:` filter: ovx is a shell script, so a change to the thing
-      # under test is a .sh change, not a .py one.
       - id: pytest-unit-ovx
         name: pytest (ovx, unit)
         entry: uv run --directory packages/ovx pytest
@@ -76,3 +73,51 @@ repos:
         language: system
         pass_filenames: false
         files: ^packages/ov-skills/
+
+      # ov-dash carries its own toolchain: ruff and mypy cannot read TypeScript
+      # or Svelte, so its gates run through npm. They need `npm install` in
+      # packages/ov-dash first, which the package README says.
+      - id: check-ov-dash
+        name: tsc + svelte-check (ov-dash)
+        entry: npm --prefix packages/ov-dash run check
+        language: system
+        pass_filenames: false
+        files: ^packages/ov-dash/
+
+      - id: lint-ov-dash
+        name: biome (ov-dash)
+        entry: npm --prefix packages/ov-dash run lint
+        language: system
+        pass_filenames: false
+        files: ^packages/ov-dash/
+
+      - id: test-ov-dash
+        name: vitest (ov-dash)
+        entry: npm --prefix packages/ov-dash test
+        language: system
+        pass_filenames: false
+        files: ^packages/ov-dash/
+
+      # ov-clip is the same story: a Firefox extension in TypeScript, with its
+      # own toolchain and its own `npm install` to run first. Its lint also
+      # builds and runs `web-ext lint`, which is what checks the manifest.
+      - id: check-ov-clip
+        name: tsc (ov-clip)
+        entry: npm --prefix packages/ov-clip run check
+        language: system
+        pass_filenames: false
+        files: ^packages/ov-clip/
+
+      - id: lint-ov-clip
+        name: biome + web-ext (ov-clip)
+        entry: npm --prefix packages/ov-clip run lint
+        language: system
+        pass_filenames: false
+        files: ^packages/ov-clip/
+
+      - id: test-ov-clip
+        name: vitest (ov-clip)
+        entry: npm --prefix packages/ov-clip test
+        language: system
+        pass_filenames: false
+        files: ^packages/ov-clip/

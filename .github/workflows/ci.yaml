@@ -55,6 +55,7 @@ jobs:
     outputs:
       python_packages: ${{ steps.select.outputs.python_packages }}
       shell_packages: ${{ steps.select.outputs.shell_packages }}
+      node_packages: ${{ steps.select.outputs.node_packages }}
     steps:
       - uses: actions/checkout@v4
 
@@ -76,6 +77,12 @@ jobs:
               - packages/ov-skills/**
               - .pre-commit-config.yaml
               - .github/**
+            ov-dash:
+              - packages/ov-dash/**
+              - .github/**
+            ov-clip:
+              - packages/ov-clip/**
+              - .github/**
 
       # Split the changed set by which template can build each package: a
       # Python package gets a wheel built and imported, a shell package gets
@@ -91,13 +98,16 @@ jobs:
           CHANGED: ${{ steps.filter.outputs.changes }}
         run: |
           set -euo pipefail
-          ALL_PYTHON='["ov-postgres"]'
+          ALL_PYTHON='["ov-postgres", "ovx"]'
           # ov-skills ships markdown and bash, so it takes the shell template:
           # its installer has to work on the bash 3.2 macOS still ships.
-          ALL_SHELL='["ovx", "ov-skills"]'
+          ALL_SHELL='["ov-skills"]'
+          ALL_NODE='["ov-dash", "ov-clip"]'
 
           if [ "$EVENT" = "workflow_dispatch" ]; then
-            changed=$(jq -c -n --argjson p "$ALL_PYTHON" --argjson s "$ALL_SHELL" '$p + $s')
+            changed=$(jq -c -n \
+              --argjson p "$ALL_PYTHON" --argjson s "$ALL_SHELL" --argjson n "$ALL_NODE" \
+              '$p + $s + $n')
           else
             changed="$CHANGED"
           fi
@@ -110,13 +120,16 @@ jobs:
           }
           python_packages=$(pick "$ALL_PYTHON")
           shell_packages=$(pick "$ALL_SHELL")
+          node_packages=$(pick "$ALL_NODE")
 
           {
             echo "python_packages=$python_packages"
             echo "shell_packages=$shell_packages"
+            echo "node_packages=$node_packages"
           } >> "$GITHUB_OUTPUT"
           echo "Python: $python_packages"
           echo "Shell:  $shell_packages"
+          echo "Node:   $node_packages"
 
   test:
     needs: detect
@@ -137,5 +150,16 @@ jobs:
       matrix:
         package: ${{ fromJSON(needs.detect.outputs.shell_packages) }}
     uses: ./.github/workflows/template-check-shell.yaml
+    with:
+      package: ${{ matrix.package }}
+
+  test-node:
+    needs: detect
+    if: ${{ needs.detect.outputs.node_packages != '[]' && needs.detect.outputs.node_packages != '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJSON(needs.detect.outputs.node_packages) }}
+    uses: ./.github/workflows/template-check-node.yaml
     with:
       package: ${{ matrix.package }}
