@@ -1,0 +1,9 @@
+# Build output. esbuild writes compiled JS beside the HTML it belongs to, so
+# the loadable extension is the package root and these are the parts of it that
+# are generated.
+node_modules/
+background.js
+popup/
+options/
+dist/
+web-ext-artifacts/

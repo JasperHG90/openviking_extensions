@@ -1,0 +1,40 @@
+{
+  "name": "ov-clip",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Firefox extension that saves the page you are reading into OpenViking, using ovx's Vault login",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "compile": "node esbuild.mjs",
+    "build": "node esbuild.mjs",
+    "clean": "rm -rf build popup options background.js dist",
+    "dev": "npm run build && web-ext run",
+    "lint": "biome check . && npm run build && web-ext lint",
+    "lint:fix": "biome check --write .",
+    "package": "npm run build && web-ext build --overwrite-dest --artifacts-dir dist",
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:integration": "vitest run --config vitest.integration.config.ts"
+  },
+  "//": "readability and turndown are bundled into the shipped popup, so they are runtime dependencies even though nothing installs them at runtime. Listing them as dev would break any --omit=dev build and misstate what the artifact contains.",
+  "dependencies": {
+    "@mozilla/readability": "^0.5.0",
+    "turndown": "^7.2.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@types/turndown": "^5.0.6",
+    "@types/webextension-polyfill": "^0.12.0",
+    "esbuild": "^0.24.2",
+    "fake-indexeddb": "^6.2.5",
+    "jsdom": "^25.0.1",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8",
+    "web-ext": "^8.3.0"
+  }
+}

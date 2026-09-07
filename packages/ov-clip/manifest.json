@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "Save to OpenViking",
+  "version": "0.0.0",
+  "description": "Save the page you are reading into OpenViking, using the login ovx already holds.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "ov-clip@openviking",
+      "strict_min_version": "127.0",
+      "data_collection_permissions": {
+        "required": ["websiteContent"]
+      }
+    }
+  },
+  "permissions": ["activeTab", "storage", "scripting", "nativeMessaging"],
+  "host_permissions": ["<all_urls>"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src https: http:;"
+  },
+  "action": {
+    "default_title": "Save to OpenViking",
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "48": "icons/icon.svg",
+      "96": "icons/icon.svg"
+    }
+  },
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "options_ui": {
+    "page": "options/options.html",
+    "open_in_tab": true
+  },
+  "icons": {
+    "48": "icons/icon.svg",
+    "96": "icons/icon.svg",
+    "128": "icons/icon.svg"
+  }
+}
