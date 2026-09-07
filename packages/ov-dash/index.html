@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenViking</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600;6..72,700&family=Instrument+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap"
+    />
+    <script>
+      /*
+       * Recover from a superseded bundle.
+       *
+       * Asset filenames carry a content hash, so a browser holding an old copy
+       * of this shell asks for a script that no longer exists. The app then
+       * never boots, which looks like a page stuck loading — and the recovery
+       * cannot live in the bundle, because the bundle is the thing that failed.
+       * So it lives here, inline, and reloads once.
+       *
+       * Capture phase: resource load errors do not bubble.
+       */
+      (function () {
+        var KEY = "ovdash-stale-reload";
+        addEventListener(
+          "error",
+          function (event) {
+            var el = event.target;
+            if (!el || el.tagName !== "SCRIPT") return;
+            if (sessionStorage.getItem(KEY)) return;
+            sessionStorage.setItem(KEY, "1");
+            location.reload();
+          },
+          true,
+        );
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/client/main.ts"></script>
+  </body>
+</html>

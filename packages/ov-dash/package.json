@@ -1,0 +1,49 @@
+{
+  "name": "ov-dash",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A dashboard over OpenViking that logs people in with OIDC and holds their API key server-side",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "concurrently -k -n server,client -c cyan,magenta \"npm:dev:server\" \"npm:dev:client\"",
+    "dev:server": "tsx watch src/server/main.ts",
+    "dev:client": "vite",
+    "build": "npm run build:client && npm run build:server",
+    "build:client": "vite build",
+    "build:server": "esbuild src/server/main.ts --bundle --platform=node --format=esm --target=node22 --outfile=dist/server/main.js",
+    "start": "node dist/server/main.js",
+    "check": "tsc --noEmit && svelte-check --tsconfig ./tsconfig.json --fail-on-warnings",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.7",
+    "@openviking/sdk": "^0.1.0",
+    "dompurify": "^3.4.15",
+    "fflate": "^0.8.3",
+    "hono": "^4.6.14",
+    "jose": "^5.9.6",
+    "marked": "^18.0.11",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@playwright/test": "^1.63.0",
+    "@sveltejs/vite-plugin-svelte": "^5.0.3",
+    "@types/node": "^26.4.1",
+    "concurrently": "^9.1.0",
+    "esbuild": "^0.24.2",
+    "svelte": "^5.16.0",
+    "svelte-check": "^4.1.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7",
+    "vitest": "^2.1.8"
+  }
+}

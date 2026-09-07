@@ -1,0 +1,26 @@
+# Run the dashboard against an OpenViking you already have.
+#
+# Copy .env.example to .env, fill it in, then `docker compose up --build`.
+# Nothing here starts OpenViking or Vault — this composes the dashboard alone
+# and points it at whatever you are already running.
+
+services:
+  ov-dash:
+    build: .
+    image: ov-dash:local
+    ports:
+      - "${PORT:-8080}:8080"
+    env_file:
+      - .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8080
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      # Uploads land in a private temp file before OpenViking imports them.
+      - /tmp:mode=1777,size=256m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
