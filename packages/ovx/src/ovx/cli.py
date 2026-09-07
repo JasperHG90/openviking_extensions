@@ -12,10 +12,12 @@ import os
 import shutil
 import sys
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 import typer
 
 from ovx import __version__, tokens, vault
+from ovx import bind as bind_module
 from ovx import login as login_module
 from ovx.config import load_profile, profile_names
 from ovx.errors import OvxError
@@ -94,6 +96,8 @@ KNOWN_OPTIONS = frozenset(
         "-L",
         "--login",
         "--logout",
+        "--bind",
+        "--unbind",
         "--install-firefox-host",
         "--uninstall-firefox-host",
         "-V",
@@ -199,6 +203,34 @@ def _login(locations: Locations, name: str) -> None:
     ensure_private_dir(locations.token_dir)
     tokens.save(locations.token_dir, name, token, chosen)
     print(f"ovx: logged in. Token stored for profile {name!r}.", file=sys.stderr)
+
+
+def _bind(locations: Locations, name: str) -> None:
+    """Write a profile to ov's config file, and say what that costs.
+
+    The credential stops being ephemeral, which is the whole point of ovx --
+    so this is loud about it rather than quietly succeeding.
+    """
+    token, _ = _current_token(locations, name)
+    stored = tokens.load(locations.token_dir, name)
+    binding = bind_module.bind(
+        locations,
+        load_profile(locations.config_file, name),
+        token=token,
+        expires_at=stored.expires_at if stored else 0.0,
+    )
+    print(f"ovx: bound profile {name!r} to {binding.target}", file=sys.stderr)
+    if binding.expires_at:
+        when = datetime.fromtimestamp(binding.expires_at, tz=UTC)
+        print(
+            f"     The token it wrote expires {when:%Y-%m-%d %H:%M} UTC; "
+            "run --bind again after that.",
+            file=sys.stderr,
+        )
+    print(
+        "     That credential now stays on disk until you run 'ovx --unbind'.",
+        file=sys.stderr,
+    )
 
 
 def _vault_username(locations: Locations, name: str) -> str:
@@ -335,6 +367,14 @@ def main(
     logout: bool = typer.Option(
         False, "--logout", help="Remove a profile's stored login."
     ),
+    bind_profile: bool = typer.Option(
+        False,
+        "--bind",
+        help="Write a profile to ov's own config so other tools can use it.",
+    ),
+    unbind_profile: bool = typer.Option(
+        False, "--unbind", help="Remove the config --bind wrote."
+    ),
     install_firefox_host: bool = typer.Option(
         False,
         "--install-firefox-host",
@@ -373,6 +413,8 @@ def main(
       ovx -d lab             Delete profile 'lab', after confirmation
       ovx -L lab             Log in to 'lab' through Vault, token is stored
       ovx --logout lab       Forget 'lab's stored login
+      ovx --bind lab         Write 'lab' to ov's own config, for other tools
+      ovx --unbind           Take that config back off disk
       ovx -- -o json status  Pick a profile, forward '-o json status' to ov
 
     \b
@@ -413,6 +455,14 @@ def main(
       ovx's copy; a token that leaked before that stays good until it expires.
 
     \b
+    Binding:
+      ovx runs ov against a private temporary config and deletes it after, so
+      the credential is never at rest. That also means nothing else can reach
+      a profile. '--bind' writes one to ov's own config file and leaves it
+      there, so a bare 'ov' or an agent can use it; '--unbind' removes it.
+      That credential is then persistent, which is the whole trade.
+
+    \b
     Config: ~/.ovx/config.toml  (override with $OVX_CONFIG_FILE or $OVX_DIR)
     Format: TOML, one [profile] table per OpenViking instance. Keys are the
     keys of ovcli.conf:
@@ -442,6 +492,16 @@ def main(
 
     if install_firefox_host or uninstall_firefox_host:
         _firefox_host(install=install_firefox_host)
+        raise typer.Exit
+
+    if unbind_profile:
+        removed = bind_module.unbind(locations)
+        print(f"ovx: unbound; removed {removed}.", file=sys.stderr)
+        raise typer.Exit
+
+    if bind_profile:
+        name = _resolve_profile(locations, profile, "bind")
+        _bind(locations, name)
         raise typer.Exit
 
     if login or logout:

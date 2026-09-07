@@ -664,9 +664,10 @@ def test_create_then_run(
         [
             ("Profile name", "lab\n"),
             ("url [", "https://new.example.com\n"),
-            ("api_key", "$OV_KEY\n"),
-            ("account [", "acme\n"),
-            ("user [", "jasper\n"),
+            # Not "api_key": the Tip line above contains that word too.
+            ("blank for none", "$OV_KEY\n"),
+            ("account", "acme\n"),
+            ("user", "jasper\n"),
         ],
     )
     assert "not found" not in out, f"the launch saw a corrupted name:\n{out}"
@@ -685,9 +686,10 @@ def test_config_file_is_private(workspace: Path, config: Path) -> None:
         [
             ("Profile name", "lab\n"),
             ("url [", "https://x\n"),
-            ("api_key", "sk-literal\n"),
-            ("account [", "\n"),
-            ("user [", "\n"),
+            # Not "api_key": the Tip line above contains that word too.
+            ("blank for none", "sk-literal\n"),
+            ("account", "\n"),
+            ("user", "\n"),
         ],
     )
     assert config.exists(), out
@@ -715,9 +717,9 @@ def test_edit_preserves_comments_and_hand_added_fields(
         ["-e", "lab"],
         [
             ("url [", "https://new.example.com\n"),
-            ("api_key", "\n"),  # keep current
-            ("account [", "\n"),
-            ("user [", "\n"),
+            ("Enter to keep current", "\n"),  # keep the existing key
+            ("account", "\n"),
+            ("user", "\n"),
         ],
     )
     after = config.read_text()
@@ -765,10 +767,11 @@ def test_edit_refuses_a_profile_it_cannot_locate(config: Path) -> None:
     out = run_pty(
         ["-e", "prod"],
         [
-            ("url [", "https://new.example.com\n"),
-            ("api_key", "\n"),
-            ("account [", "\n"),
-            ("user [", "\n"),
+            # No default shown: a dotted ["prod".eu] table yields no fields.
+            ("url", "https://new.example.com\n"),
+            ("literal or $VAR", "\n"),
+            ("account", "\n"),
+            ("user", "\n"),
         ],
     )
     assert "not a plain [prod] section" in out, out

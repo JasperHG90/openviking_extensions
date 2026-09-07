@@ -86,22 +86,24 @@ def require_tty() -> None:
 def list_profiles(config_file: Path) -> None:
     """Print every configured profile with its URL.
 
-    The name is shown in its ``[brackets]`` table form, and the path is
-    announced first. Both are load-bearing: this output is what people grep,
-    and dropping either silently broke their scripts.
+    In file order, not sorted, and with the name in its ``[brackets]`` table
+    form. This output is what people grep and what they diff against their
+    config, so both were load-bearing. "No config" and "no profiles in it" are
+    also different situations and say so separately.
     """
+    if not config_file.is_file():
+        print(f"ovx: no config at {config_file}")
+        return
     document = load_document(config_file)
-    names = profile_names(config_file)
+    names = [name for name, value in document.items() if isinstance(value, dict)]
     if not names:
-        print(f"ovx: no profiles found at {config_file}")
+        print(f"ovx: no profiles defined in {config_file}")
         return
     print(f"Profiles in {config_file}:")
-    bracketed = {name: f"[{name}]" for name in names}
-    width = max(len(shown) for shown in bracketed.values())
     for name in names:
         section = document[name]
         url = section.get("url", "") if isinstance(section, dict) else ""
-        print(f"  {bracketed[name]:<{width}}  {url}")
+        print(f"  [{name}]  {url}")
 
 
 def pick_existing(names: list[str], action: str) -> str:
@@ -184,25 +186,69 @@ def choose_or_create(
             file=sys.stderr,
         )
         return create_profile(config_file, None)
-    return choose_profile(names)
+    return choose_profile(config_file)
 
 
-def choose_profile(names: list[str]) -> str:
+def choose_profile(config_file: Path) -> str:
     """Show the profile menu and return the chosen name.
 
-    Separate from :func:`pick_existing` because this is the no-arguments
-    entry point, where the prompt is a bare "Choose: " rather than a verb.
+    The menu is not just a list: it also offers create, edit and delete, which
+    is the only way to reach those without knowing the flags. ``--help`` says
+    "Interactive: pick a profile, create one, or edit", so dropping them made
+    the help a lie.
+
+    Parameters
+    ----------
+    config_file :
+        The ovx config, re-read after a delete so a removed profile does not
+        linger in the menu.
+
+    Returns
+    -------
+    str
+        The profile to run against.
     """
     require_tty()
-    print("ovx: profiles", file=sys.stderr)
-    for index, name in enumerate(names, start=1):
-        print(f"  {index}) [{name}]", file=sys.stderr)
     while True:
+        names = profile_names(config_file)
+        if not names:
+            return create_profile(config_file, None)
+
+        print("", file=sys.stderr)
+        print("Available profiles:", file=sys.stderr)
+        for index, name in enumerate(names, start=1):
+            print(f"  {index:2d}) {name}", file=sys.stderr)
+        create_at = len(names) + 1
+        edit_at = create_at + 1
+        delete_at = create_at + 2
+        print(f"  {create_at:2d}) create a new profile", file=sys.stderr)
+        print(f"  {edit_at:2d}) edit an existing profile", file=sys.stderr)
+        print(f"  {delete_at:2d}) delete an existing profile", file=sys.stderr)
+
         answer = ask("Choose")
+        if not answer:
+            print("  empty input", file=sys.stderr)
+            continue
+
+        if answer.isdigit():
+            # Leading zeros stripped so "08" reads as 8 rather than octal.
+            index = int(answer.lstrip("0") or "0")
+            if index == create_at:
+                return create_profile(config_file, None)
+            if index == edit_at:
+                target = pick_existing(names, "edit")
+                edit_profile(config_file, target)
+                return target
+            if index == delete_at:
+                delete_profile(config_file, pick_existing(names, "delete"))
+                continue
+            if 1 <= index <= len(names):
+                return names[index - 1]
+            print("  out of range", file=sys.stderr)
+            continue
+
         if answer in names:
             return answer
-        if answer.isdigit() and 1 <= int(answer) <= len(names):
-            return names[int(answer) - 1]
         print(f"  no profile named {answer!r}", file=sys.stderr)
 
 
@@ -221,11 +267,42 @@ def _prompt_fields(defaults: dict[str, str]) -> dict[str, str]:
                 else f"{name} (literal or $VAR, blank for none)"
             )
             answers[name] = ask(prompt, secret=True, default=current)
+        elif name == "url":
+            # The one required field, so keep asking rather than writing a
+            # profile that load_profile would then refuse.
+            while True:
+                answers[name] = ask(name, default=current)
+                if answers[name]:
+                    break
+                print("  url required", file=sys.stderr)
         else:
-            answers[name] = ask(f"{name} [{current}]", default=current)
-    if not answers.get("url"):
-        raise OvxError("a profile needs a url")
+            answers[name] = ask(name, default=current)
     return answers
+
+
+NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
+# ovx's own default, for a server started with no arguments.
+DEFAULT_URL = "https://127.0.0.1:1933"
+
+
+def _validate_name(name: str, existing: list[str]) -> str | None:
+    """Return why ``name`` is unusable, or ``None`` when it is fine.
+
+    The rules are not decoration. A name with a path separator cannot have a
+    token file (``tokens.token_path`` refuses it), so ovx would advise
+    ``ovx --login <name>`` and then refuse that very command. A purely numeric
+    name shadows a menu index, making the profile unselectable by number.
+    """
+    if not name:
+        return "name required"
+    if not NAME_PATTERN.match(name):
+        return "use only letters, digits, underscore, dash"
+    if name.isdigit():
+        return "a purely-numeric name clashes with menu indices — add a letter"
+    if name in existing:
+        return f"'{name}' already exists — choose another"
+    return None
 
 
 def create_profile(config_file: Path, name: str | None) -> str:
@@ -238,19 +315,26 @@ def create_profile(config_file: Path, name: str | None) -> str:
     """
     require_tty()
     existing = profile_names(config_file)
-    # A name on the command line is the *default*, not the answer: `ovx -n lab`
-    # offers "lab" and still lets you type something else, which is what the
-    # shell version did.
-    suffix = f" [{name}]" if name else ""
-    chosen = ask(f"Profile name{suffix}", default=name or "")
-    if not chosen:
-        raise OvxError("a profile needs a name")
-    if chosen in existing:
-        raise OvxError(f"profile {chosen!r} already exists")
+    print("", file=sys.stderr)
+    print("Create a new profile.", file=sys.stderr)
 
-    answers = _prompt_fields({})
+    while True:
+        # A name on the command line is the *default*, not the answer:
+        # `ovx -n lab` offers "lab" and still lets you type something else.
+        chosen = ask("Profile name", default=name or "")
+        complaint = _validate_name(chosen, existing)
+        if complaint is None:
+            break
+        print(f"  {complaint}", file=sys.stderr)
+
+    print(
+        "  Tip: give api_key as $VAR to keep the secret out of the file.",
+        file=sys.stderr,
+    )
+    answers = _prompt_fields({"url": DEFAULT_URL})
     ensure_private_dir(config_file.parent)
     _append_profile(config_file, chosen, answers)
+    print(f"ovx: wrote profile '{chosen}' to {config_file}", file=sys.stderr)
     return chosen
 
 
@@ -263,6 +347,7 @@ def edit_profile(config_file: Path, name: str) -> None:
     defaults = {k: str(section.get(k, "")) for k in WIZARD_FIELDS}
     answers = _prompt_fields(defaults)
     _rewrite_profile(config_file, name, answers)
+    print(f"ovx: updated profile '{name}' in {config_file}", file=sys.stderr)
 
 
 def delete_profile(config_file: Path, name: str) -> None:

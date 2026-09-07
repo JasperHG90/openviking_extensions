@@ -60,6 +60,8 @@ ovx -d lab             # delete `lab`, after confirmation
 ovx -l                 # list profiles
 ovx -L lab             # log in to `lab` through Vault, store the token
 ovx --logout lab       # forget `lab`'s stored login
+ovx --bind lab         # write `lab` to ov's own config, for other tools
+ovx --unbind           # take that config back off disk
 ovx -V                 # show the ovx version
 ovx -- -o json status  # pick a profile, forward `-o json status` to ov
 ```
@@ -80,6 +82,36 @@ there, the other that the reference sections have not been quietly dropped.
 Each run prints a one-line banner to stderr naming the profile, its URL, and a
 masked key, so you can see which instance you are about to hit. It is skipped
 when stderr is not a terminal, so it never lands in a pipeline.
+
+## Binding a profile for other tools
+
+The temp-file mechanism is the point of `ovx`, but it has a cost: the
+credential exists only while one command runs, so nothing else can reach it.
+A bare `ov`, an editor plugin, or an agent has no way to use a profile.
+
+`ovx --bind` trades that away, deliberately:
+
+```bash
+ovx --bind lab     # write the profile to ov's own config
+ov status          # now works on its own
+ovx --unbind       # take it back off disk
+```
+
+It writes to `$OPENVIKING_CLI_CONFIG_FILE`, or `~/.openviking/ovcli.conf` when
+that is unset — the same file `ov` reads normally. `$VAR` is expanded, because
+a bare `ov` does not know what `$OV_LAB_API_KEY` means, and a stored Vault
+login wins over the profile's `api_key` exactly as it does for a normal run.
+The file is `600`.
+
+Everything this tool exists to avoid is then true again: the credential sits
+on disk indefinitely, lands in backups, and shows up in anything that walks
+your home directory. `ovx` says so when you bind, and if it wrote a Vault
+token it tells you when that expires — a bound token goes stale and needs
+`--bind` again.
+
+`ovx --unbind` removes it. It will only remove a file `ovx` itself wrote:
+`ov`'s config path may well have been set up by hand long before `ovx`
+existed, and deleting that on your behalf would be an unpleasant surprise.
 
 ## Logging in
 
@@ -198,6 +230,39 @@ so it has to match what the server was configured against.
 `ovx` does not check the token's `iss`. It must match the server's
 configuration exactly, and it is set on the Vault side — validating it here
 would only add a second place to get it wrong.
+
+### Lending the token to Firefox
+
+[`ov-clip`](../ov-clip/) saves web pages into OpenViking, and it needs the same
+token. It cannot read `~/.ovx/tokens/<profile>.json`: a Firefox extension has
+no filesystem access — no read API, and unlike Chrome it cannot be granted host
+permissions for `file://`. So `ovx` answers over native messaging instead.
+
+```bash
+ovx --install-firefox-host    # register the host with Firefox
+ovx --uninstall-firefox-host  # take it away again
+```
+
+The first writes a small manifest —
+`~/Library/Application Support/Mozilla/NativeMessagingHosts/ovx.json` on macOS,
+`~/.mozilla/native-messaging-hosts/ovx.json` on Linux — pointing at the
+`ovx-firefox-host` console script. Restart Firefox for it to be noticed.
+Windows keeps these in the registry rather than on disk, so it is not supported
+and says so rather than pretending.
+
+`allowed_extensions` in that manifest names `ov-clip@openviking` and nothing
+else, which is the boundary: no other add-on on the machine can start the host,
+so none can ask for your token.
+
+The host answers three things — `ping`, `profiles`, and `token` — and hands
+back a minted identity token with the profile's `url`. It never hands back a
+profile's `api_key`, even when there is no login to serve: falling back to the
+static key would be exactly the silent downgrade to a longer-lived credential
+that `ovx` exists to stop. A profile with no login gets an error saying to run
+`ovx --login` instead.
+
+Renewal is shared with the CLI rather than reimplemented, so the browser and
+`ov` cannot drift into treating an expiring token differently.
 
 ## Config
 

@@ -601,3 +601,120 @@ def test_an_empty_secret_keeps_the_current_value(
 
     monkeypatch.setattr(wizard.getpass, "getpass", lambda _prompt: "")
     assert wizard.ask("api_key", secret=True, default="$OLD") == "$OLD"
+
+
+# --- bind: the deliberate exception to the temp-file rule ----------------
+
+
+def _bind_workspace(tmp_path: Path) -> dict[str, str]:
+    """Build an ovx home with one profile and an ov config path of its own."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "ov").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (bindir / "ov").chmod(0o755)
+    config = tmp_path / "config.toml"
+    config.write_text('["lab"]\nurl = "https://ov.example.com"\napi_key = "$K"\n')
+    return {
+        **os.environ,
+        "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}",
+        "OVX_DIR": str(tmp_path / "ovx"),
+        "OVX_CONFIG_FILE": str(config),
+        "OPENVIKING_CLI_CONFIG_FILE": str(tmp_path / "ovhome" / "ovcli.conf"),
+        "K": "secret-from-env",
+    }
+
+
+def _run_ovx(env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
+    """Run the installed entrypoint with ``env``."""
+    return subprocess.run(
+        [str(Path(sys.executable).parent / "ovx"), *args],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+
+def test_bind_writes_a_config_ov_can_use_alone(tmp_path: Path) -> None:
+    """The point of bind: something other than ovx can now reach the profile.
+
+    $VAR is expanded, because a bare ov has no idea what $K means.
+    """
+    env = _bind_workspace(tmp_path)
+    target = Path(env["OPENVIKING_CLI_CONFIG_FILE"])
+
+    result = _run_ovx(env, "--bind", "lab")
+
+    assert result.returncode == 0, result.stderr
+    written = json.loads(target.read_text())
+    assert written["api_key"] == "secret-from-env"
+    assert written["url"] == "https://ov.example.com"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+def test_bind_honours_the_ov_config_env_var(tmp_path: Path) -> None:
+    """It writes where ov actually looks, not always ~/.openviking."""
+    env = _bind_workspace(tmp_path)
+    elsewhere = tmp_path / "somewhere" / "else.conf"
+    env["OPENVIKING_CLI_CONFIG_FILE"] = str(elsewhere)
+
+    _run_ovx(env, "--bind", "lab")
+
+    assert elsewhere.is_file()
+
+
+def test_bind_says_the_credential_is_now_persistent(tmp_path: Path) -> None:
+    """Quietly undoing the tool's one guarantee would be the wrong default."""
+    env = _bind_workspace(tmp_path)
+    result = _run_ovx(env, "--bind", "lab")
+    assert "stays on disk" in result.stderr, result.stderr
+
+
+def test_unbind_removes_what_bind_wrote(tmp_path: Path) -> None:
+    """The loop closes: the credential can be taken off disk again."""
+    env = _bind_workspace(tmp_path)
+    target = Path(env["OPENVIKING_CLI_CONFIG_FILE"])
+    _run_ovx(env, "--bind", "lab")
+    assert target.is_file()
+
+    result = _run_ovx(env, "--unbind")
+
+    assert result.returncode == 0, result.stderr
+    assert not target.exists()
+
+
+def test_unbind_refuses_a_config_ovx_did_not_write(tmp_path: Path) -> None:
+    """Ov's config path may predate ovx by years; deleting it would be rude."""
+    env = _bind_workspace(tmp_path)
+    target = Path(env["OPENVIKING_CLI_CONFIG_FILE"])
+    target.parent.mkdir(parents=True)
+    target.write_text('{"url": "https://hand.written", "api_key": "mine"}')
+
+    result = _run_ovx(env, "--unbind")
+
+    assert result.returncode != 0
+    assert "nothing is bound" in result.stderr
+    assert target.read_text().startswith('{"url": "https://hand.written"')
+
+
+def test_bind_prefers_a_stored_login_over_the_api_key(tmp_path: Path) -> None:
+    """Same precedence as a normal run, or bind would write a stale key."""
+    import base64
+
+    env = _bind_workspace(tmp_path)
+    token_dir = Path(env["OVX_DIR"]) / "tokens"
+    token_dir.mkdir(parents=True)
+
+    def segment(payload: dict[str, object]) -> str:
+        return (
+            base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=").decode()
+        )
+
+    jwt = f"{segment({'alg': 'RS256'})}.{segment({'exp': int(time.time()) + 3600})}.sig"
+    tokens.save(token_dir, "lab", jwt, "openviking")
+
+    _run_ovx(env, "--bind", "lab")
+
+    written = json.loads(Path(env["OPENVIKING_CLI_CONFIG_FILE"]).read_text())
+    assert written["api_key"] == jwt, "bind wrote the static key over the login"
