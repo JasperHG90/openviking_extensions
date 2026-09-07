@@ -1,0 +1,53 @@
+manifest_version = 18
+agents = []
+mcp_servers = []
+rules = []
+plugins = []
+targets = []
+managed_files = []
+symlinks = []
+
+[[skill]]
+qualified_name = "82a901da1b9bedec/frontend-design"
+repo_alias = "82a901da1b9bedec"
+source_path = "skills/frontend-design"
+target_dir = ".claude/skills/frontend-design"
+history = []
+content_hash = "665c585455decbcb02116bc928adf5148b9cd0f67b7eb4908c8c0d647c00f68a"
+risk_acknowledged = false
+
+[skill.current]
+sha = "2235be7c60b551f5de82ade908fd3816455afcda"
+installed_at = "2026-09-07T17:01:04.978441Z"
+
+[[skill]]
+qualified_name = "f2002c53d5747ac5/typography"
+repo_alias = "f2002c53d5747ac5"
+source_path = "typography/skills/typography"
+target_dir = ".claude/skills/typography"
+history = []
+content_hash = "f77a95514c45c55bb0d9bad72b3f0e6cee36aa3f436fff1f43b24c92b7d81746"
+risk_acknowledged = false
+
+[skill.current]
+sha = "a5d02a417dba380071f57cb18fb5e65bc5f7df5f"
+installed_at = "2026-09-07T17:01:21.137721Z"
+
+[[skill]]
+qualified_name = "f2002c53d5747ac5/bencium-innovative-ux-designer"
+repo_alias = "f2002c53d5747ac5"
+source_path = "bencium-innovative-ux-designer/skills/bencium-innovative-ux-designer"
+target_dir = ".claude/skills/bencium-innovative-ux-designer"
+history = []
+content_hash = "cdb94d63366530bbf3882b432fc7a44a2750ec21416ceafc17108d39f16c913a"
+risk_acknowledged = false
+
+[skill.current]
+sha = "a5d02a417dba380071f57cb18fb5e65bc5f7df5f"
+installed_at = "2026-09-07T17:01:59.950717Z"
+
+[managed_region_hashes]
+
+[repos]
+82a901da1b9bedec = "https://github.com/anthropics/skills"
+f2002c53d5747ac5 = "https://github.com/bencium/bencium-marketplace"

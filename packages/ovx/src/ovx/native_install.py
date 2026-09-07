@@ -94,7 +94,7 @@ def host_path() -> Path:
     if not found:
         raise OvxError(
             f"{HOST_COMMAND} is not next to {sys.executable} and not on $PATH",
-            "Reinstall ovx so its console scripts are created, e.g. `uv tool install ovx`.",
+            "Reinstall ovx so its console scripts are created: `uv tool install ovx`.",
         )
     return Path(found).resolve()
 

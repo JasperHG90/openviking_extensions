@@ -1,0 +1,38 @@
+manifest_version = 11
+symlinks = []
+rules = []
+agents = []
+mcp_servers = []
+plugins = []
+targets = []
+
+[archetype]
+qualified_name = "default"
+risk_acknowledged = false
+
+[policy]
+
+[repos]
+82a901da1b9bedec = "https://github.com/anthropics/skills"
+f2002c53d5747ac5 = "https://github.com/bencium/bencium-marketplace"
+
+[[skill]]
+qualified_name = "82a901da1b9bedec/frontend-design"
+repo_alias = "82a901da1b9bedec"
+source_path = "skills/frontend-design"
+target_dir = ".claude/skills/frontend-design"
+risk_acknowledged = false
+
+[[skill]]
+qualified_name = "f2002c53d5747ac5/typography"
+repo_alias = "f2002c53d5747ac5"
+source_path = "typography/skills/typography"
+target_dir = ".claude/skills/typography"
+risk_acknowledged = false
+
+[[skill]]
+qualified_name = "f2002c53d5747ac5/bencium-innovative-ux-designer"
+repo_alias = "f2002c53d5747ac5"
+source_path = "bencium-innovative-ux-designer/skills/bencium-innovative-ux-designer"
+target_dir = ".claude/skills/bencium-innovative-ux-designer"
+risk_acknowledged = false

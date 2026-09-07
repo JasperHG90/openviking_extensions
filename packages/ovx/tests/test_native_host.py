@@ -52,7 +52,7 @@ def jwt_expiring(seconds_from_now: float) -> str:
 
 @pytest.fixture
 def workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Locations:
-    """An ovx home with one profile, and no ambient Vault to reach."""
+    """Build an ovx home with one profile, and no ambient Vault to reach."""
     monkeypatch.setenv("OVX_DIR", str(tmp_path / ".ovx"))
     monkeypatch.delenv("VAULT_ADDR", raising=False)
     monkeypatch.delenv("VAULT_TOKEN", raising=False)
@@ -79,33 +79,40 @@ class TestWireFormat:
     """Reading and writing Firefox's length-prefixed frames."""
 
     def test_round_trips_a_message(self) -> None:
+        """A message written and read back is unchanged."""
         stream = io.BytesIO()
         native_host.write_message(stream, {"ok": True, "token": "abc"})
         assert unframe(stream.getvalue()) == {"ok": True, "token": "abc"}
 
     def test_reads_what_was_framed(self) -> None:
+        """The reader accepts exactly what Firefox's framing produces."""
         stream = io.BytesIO(framed({"action": "ping"}))
         assert native_host.read_message(stream) == {"action": "ping"}
 
     def test_end_of_stream_is_not_an_error(self) -> None:
+        """Firefox closing the pipe is how a session ends, not a failure."""
         assert native_host.read_message(io.BytesIO(b"")) is None
         # A truncated header is the same thing: the browser went away.
         assert native_host.read_message(io.BytesIO(b"\x01\x02")) is None
 
     def test_refuses_a_length_beyond_the_cap(self) -> None:
-        # Refused on the declared length, before anything is allocated, so a
-        # stream claiming 4 GB cannot make ovx try to hold it.
+        """A declared length over the cap is refused before it is allocated.
+
+        A stream claiming 4 GB must not make ovx try to hold it.
+        """
         stream = io.BytesIO(struct.pack("@I", native_host.MAX_MESSAGE_BYTES + 1))
         with pytest.raises(OvxError, match="larger than"):
             native_host.read_message(stream)
 
     def test_refuses_a_body_that_ended_early(self) -> None:
+        """A truncated body is refused rather than parsed as whatever arrived."""
         stream = io.BytesIO(struct.pack("@I", 100) + b"{}")
         with pytest.raises(OvxError, match="ended early"):
             native_host.read_message(stream)
 
     @pytest.mark.parametrize("body", [b"not json", b'"a string"', b"[1, 2]"])
     def test_refuses_anything_that_is_not_a_json_object(self, body: bytes) -> None:
+        """Valid JSON that is not an object still has no action to dispatch on."""
         stream = io.BytesIO(struct.pack("@I", len(body)) + body)
         with pytest.raises(OvxError):
             native_host.read_message(stream)
@@ -115,17 +122,20 @@ class TestHandling:
     """What the host answers."""
 
     def test_ping_reports_the_version(self, workspace: Locations) -> None:
+        """The extension checks compatibility before asking for a credential."""
         reply = native_host.handle(workspace, {"action": "ping"})
         assert reply["ok"] is True
         assert reply["version"]
 
     def test_lists_the_profiles(self, workspace: Locations) -> None:
+        """The extension's profile picker is populated from here."""
         reply = native_host.handle(workspace, {"action": "profiles"})
         assert reply == {"ok": True, "profiles": ["lab", "other"]}
 
     def test_hands_over_a_live_token_and_where_to_spend_it(
         self, workspace: Locations
     ) -> None:
+        """The happy path: a stored login is returned with its instance URL."""
         token = jwt_expiring(3600)
         store_login(workspace, "lab", token)
 
@@ -139,9 +149,12 @@ class TestHandling:
     def test_expands_a_var_in_the_profile_url(
         self, workspace: Locations, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # `url = "$OV_URL"` is the whole point of ovx — the value lives in the
-        # environment. Handing that string over unexpanded would have the
-        # extension fetch from a URL called "$OV_URL".
+        """A $VAR in the profile url is expanded before it is handed over.
+
+        That reference is the whole point of ovx: the value lives in the
+        environment. Passing the string through unexpanded would have the
+        extension fetch from a URL literally called "$OV_URL".
+        """
         workspace.config_file.write_text('[env]\nurl = "$OV_TEST_TARGET"\n')
         store_login(workspace, "env", jwt_expiring(3600))
         monkeypatch.setenv("OV_TEST_TARGET", "https://from-the-env.example")
@@ -152,10 +165,14 @@ class TestHandling:
     def test_leaves_the_url_out_when_its_var_is_unset(
         self, workspace: Locations, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # This process is started by Firefox, which does not inherit a shell's
-        # exports, so an unresolvable reference is ordinary. The token is still
-        # good and the extension has its own address field, so the field is
-        # omitted rather than sent wrong or the whole request failed.
+        """An unresolvable url reference omits the field rather than failing.
+
+        Firefox starts this process, and it does not inherit a shell's
+        exports, so an unset variable is ordinary rather than exceptional.
+        The token is still good and the extension has its own address field,
+        so the url is left out instead of sent wrong or the whole request
+        refused.
+        """
         workspace.config_file.write_text('[env]\nurl = "$OV_TEST_TARGET"\n')
         store_login(workspace, "env", jwt_expiring(3600))
         monkeypatch.delenv("OV_TEST_TARGET", raising=False)
@@ -166,29 +183,36 @@ class TestHandling:
         assert "url" not in reply
 
     def test_sends_no_identity_fields_across(self, workspace: Locations) -> None:
-        # OpenViking reads identity from the token's claims, and the extension
-        # sends no identity headers, so `account` and `user` would be payload
-        # nobody reads crossing a credential boundary.
+        """Only the token, the profile and the url cross the boundary.
+
+        OpenViking reads identity from the token's claims and the extension
+        sends no identity headers, so `account` and `user` would be payload
+        nobody reads crossing a credential boundary.
+        """
         store_login(workspace, "lab", jwt_expiring(3600))
         reply = native_host.handle(workspace, {"action": "token", "profile": "lab"})
         assert set(reply) == {"ok", "token", "profile", "url"}
 
     def test_never_hands_over_the_profile_api_key(self, workspace: Locations) -> None:
-        # The whole point of the login is to stop using the static key. Handing
-        # it to a browser because the login happened to be missing would be a
-        # silent downgrade to a longer-lived credential.
+        """The whole point of the login is to stop using the static key.
+
+        Handing it to a browser because the login happened to be missing
+        would be a silent downgrade to a longer-lived credential.
+        """
         store_login(workspace, "lab", jwt_expiring(3600))
         reply = native_host.handle(workspace, {"action": "token", "profile": "lab"})
         assert "static-key-do-not-leak" not in json.dumps(reply)
         assert "api_key" not in reply
 
     def test_refuses_a_profile_that_never_logged_in(self, workspace: Locations) -> None:
+        """The extension shows the error, so it must say what to do about it."""
         reply = native_host.handle(workspace, {"action": "token", "profile": "other"})
         assert reply["ok"] is False
         assert "no stored login" in str(reply["error"])
         assert "ovx --login other" in str(reply["hint"])
 
     def test_names_the_profiles_it_does_know(self, workspace: Locations) -> None:
+        """A typo'd profile is worth more than 'not found' when the list is short."""
         reply = native_host.handle(workspace, {"action": "token", "profile": "nope"})
         assert reply["ok"] is False
         assert "lab" in str(reply["hint"])
@@ -197,14 +221,21 @@ class TestHandling:
     def test_refuses_a_request_naming_no_profile(
         self, workspace: Locations, request_body: dict[str, object]
     ) -> None:
+        """A missing.
+
+        Empty or non-string profile is a malformed request, not a default.
+        """
         reply = native_host.handle(workspace, {"action": "token", **request_body})
         assert reply["ok"] is False
 
     def test_says_so_when_an_expired_login_cannot_be_renewed(
         self, workspace: Locations
     ) -> None:
-        # Expired, and no $VAULT_ADDR to renew from. The extension has no
-        # terminal, so the reply has to say what to run.
+        """Expired, and no $VAULT_ADDR to renew from.
+
+        The extension has no terminal, so the reply has to say what to
+        run.
+        """
         store_login(workspace, "lab", jwt_expiring(-10))
         reply = native_host.handle(workspace, {"action": "token", "profile": "lab"})
         assert reply["ok"] is False
@@ -213,6 +244,7 @@ class TestHandling:
     def test_an_unknown_action_is_answered_not_ignored(
         self, workspace: Locations
     ) -> None:
+        """Silence would leave the extension waiting on a reply that never comes."""
         reply = native_host.handle(workspace, {"action": "rm -rf"})
         assert reply["ok"] is False
         assert "unknown action" in str(reply["error"])
@@ -220,8 +252,11 @@ class TestHandling:
     def test_an_unexpected_failure_still_comes_back_as_a_message(
         self, workspace: Locations, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # A host that dies is reported to the user as "native application
-        # unavailable", which says nothing about what to fix.
+        """A host that dies is reported to the user as "native application unavailable".
+
+        Which says nothing about what to fix.
+        """
+
         def explode(*args: object, **kwargs: object) -> None:
             raise RuntimeError("something unforeseen")
 
@@ -237,6 +272,7 @@ class TestMain:
     def test_answers_one_message_and_stops(
         self, workspace: Locations, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Firefox starts one host per exchange, so the loop must not outlive it."""
         store_login(workspace, "lab", jwt_expiring(3600))
 
         stdin = io.BytesIO(framed({"action": "token", "profile": "lab"}))
@@ -250,8 +286,14 @@ class TestMain:
     def test_keeps_stray_output_off_the_protocol_stream(
         self, workspace: Locations, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # A print anywhere in the call path would be read as a message length
-        # and break the exchange, so the real stdout is taken away first.
+        """Nothing may write to stdout but the framed reply.
+
+        A stray print anywhere in the call path is read as a message length
+        and breaks the exchange.
+
+        So the real stdout is taken away first.
+        """
+
         def chatty(*args: object, **kwargs: object) -> dict[str, object]:
             print("this must not reach the browser")
             return {"ok": True, "profiles": []}
@@ -268,12 +310,16 @@ class TestMain:
     def test_a_body_that_blows_the_parser_still_gets_a_reply(
         self, workspace: Locations, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Deep nesting makes json raise RecursionError, not OvxError, and it
-        # happens in read_message — outside `handle`'s catch-all. Escaping
-        # would kill the process with nothing on stdout, which Firefox reports
-        # as "native application unavailable": exactly the silent death this
-        # design exists to avoid. Well under the 1 MB cap, so the size check
-        # does not cover it.
+        """Deeply nested JSON is refused rather than crashing the host.
+
+        json raises RecursionError, not OvxError, and it does so in
+        read_message -- outside `handle`'s catch-all.
+
+        Escaping would kill the process with nothing on stdout, which
+        Firefox reports as "native application unavailable": exactly the
+        silent death this design exists to avoid. Well under the 1 MB
+        cap, so the size check does not cover it.
+        """
         body = (b'{"a":' * 60_000) + b"1" + (b"}" * 60_000)
         raw = struct.pack("@I", len(body)) + body
 
@@ -287,6 +333,7 @@ class TestMain:
         assert str(reply["error"])
 
     def test_an_empty_stream_exits_quietly(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Being started and immediately closed is ordinary, not an error to log."""
         monkeypatch.setattr("sys.stdin", io.TextIOWrapper(io.BytesIO(b"")))
         monkeypatch.setattr("sys.stdout", io.TextIOWrapper(io.BytesIO()))
         assert native_host.main() == 0
@@ -298,6 +345,7 @@ class TestInstall:
     def test_writes_the_manifest_where_firefox_looks_on_macos(
         self, tmp_path: Path
     ) -> None:
+        """Firefox only finds a native host at the platform's own path."""
         written = native_install.install(
             platform="darwin", home=tmp_path, executable=Path("/usr/local/bin/x")
         )
@@ -309,14 +357,17 @@ class TestInstall:
     def test_writes_the_manifest_where_firefox_looks_on_linux(
         self, tmp_path: Path
     ) -> None:
+        """The same, at the other path Firefox searches."""
         written = native_install.install(
             platform="linux", home=tmp_path, executable=Path("/usr/bin/x")
         )
         assert written == tmp_path / ".mozilla/native-messaging-hosts/ovx.json"
 
     def test_allows_only_the_clipper(self, tmp_path: Path) -> None:
-        # This list is the security boundary: an extension not on it cannot
-        # start the host, so no other add-on can ask ovx for the token.
+        """List is the security boundary: an extension not on it cannot start the host.
+
+        So no other add-on can ask ovx for the token.
+        """
         written = native_install.install(
             platform="linux", home=tmp_path, executable=Path("/usr/bin/x")
         )
@@ -328,12 +379,14 @@ class TestInstall:
         assert "allowed_origins" not in body
 
     def test_refuses_a_platform_it_cannot_place_the_manifest_on(self) -> None:
+        """Better to say so than to write a manifest nothing will ever read."""
         with pytest.raises(OvxError, match="no known Firefox"):
             native_install.manifest_dir("win32", Path("/tmp"))
 
     def test_uninstall_reports_whether_there_was_anything_to_remove(
         self, tmp_path: Path
     ) -> None:
+        """Removing nothing and removing something are different outcomes."""
         assert native_install.uninstall(platform="linux", home=tmp_path) is False
         native_install.install(
             platform="linux", home=tmp_path, executable=Path("/usr/bin/x")
@@ -344,11 +397,16 @@ class TestInstall:
     def test_prefers_the_ovx_being_asked_over_whatever_is_on_path(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # `uv run ovx --install-firefox-host` from a checkout puts an ephemeral
-        # environment first on $PATH. Baking that into the manifest gives one
-        # that works until the environment is rebuilt, then points at nothing
-        # — and Firefox reports that as "no such native application", which
-        # looks identical to never having installed it.
+        """Installing from a checkout must not record a throwaway path.
+
+        `uv run ovx --install-firefox-host` puts an ephemeral environment
+        first on $PATH.
+
+        Baking that into the manifest gives one that works until the
+        environment is rebuilt, then points at nothing — and Firefox
+        reports that as "no such native application", which looks
+        identical to never having installed it.
+        """
         beside = tmp_path / "venv" / "bin"
         beside.mkdir(parents=True)
         (beside / native_install.HOST_COMMAND).write_text("#!/bin/sh\n")
@@ -363,6 +421,7 @@ class TestInstall:
     def test_falls_back_to_path_when_it_is_not_beside_the_interpreter(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """A uv tool install puts ovx on PATH but not next to sys.executable."""
         elsewhere = tmp_path / "bin"
         elsewhere.mkdir()
         script = elsewhere / native_install.HOST_COMMAND
@@ -376,23 +435,34 @@ class TestInstall:
     def test_says_so_when_the_host_cannot_be_found_at_all(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """The manifest names an absolute path, so a wrong one fails silently later."""
         monkeypatch.setattr("sys.executable", str(tmp_path / "nowhere" / "python"))
         monkeypatch.setenv("PATH", str(tmp_path / "empty"))
         with pytest.raises(OvxError, match="not on \\$PATH"):
             native_install.host_path()
 
     def test_the_allowed_extension_is_the_id_ov_clip_declares(self) -> None:
-        # The most fragile join in the design, and it spans two packages: this
-        # literal has to equal `browser_specific_settings.gecko.id` in
-        # ov-clip's manifest.json. If they drift, Firefox refuses to start the
-        # host and the extension reports "ovx is not installed", which is not
-        # the cause. ov-clip's own suite pins the other side to the same
-        # string, so either side moving alone fails a test.
+        """The extension id must match the one ov-clip declares.
+
+        The most fragile join in the design, and it spans two packages: this
+        literal has to equal `browser_specific_settings.gecko.id` in
+        ov-clip's manifest.json.
+
+        If they drift, Firefox refuses to start the host and the
+        extension reports "ovx is not installed", which is not the
+        cause. ov- clip's own suite pins the other side to the same
+        string, so either side moving alone fails a test.
+        """
         assert native_install.OV_CLIP_ID == "ov-clip@openviking"
 
     def test_the_host_command_is_the_one_pyproject_ships(self) -> None:
-        # A manifest cannot carry arguments, so the host has to be its own
-        # console script. If this name and pyproject's disagree, Firefox
-        # executes something that does not exist.
+        """The host is its own console script.
+
+        A native-messaging manifest cannot carry arguments, so the entry
+        point has to be directly executable.
+
+        If this name and pyproject's disagree, Firefox executes
+        something that does not exist.
+        """
         pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
         assert f"{native_install.HOST_COMMAND} = " in pyproject
