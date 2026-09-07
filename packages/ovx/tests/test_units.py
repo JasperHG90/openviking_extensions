@@ -531,10 +531,12 @@ def test_help_shows_no_click_escape_markers() -> None:
     """
     from ovx.cli import main
 
-    assert "\\x08" in main.__doc__ or "\b" in main.__doc__, (
+    doc = main.__doc__
+    assert doc is not None, "main lost its docstring, which is ovx's whole manual"
+    assert "\\x08" in doc or "\b" in doc, (
         "the docstring lost click's marker -- is it a raw string again?"
     )
-    assert "\\\\b" not in repr(main.__doc__), "the marker is literal, not an escape"
+    assert "\\\\b" not in repr(doc), "the marker is literal, not an escape"
 
 
 def test_help_keeps_its_line_breaks(tmp_path: Path) -> None:
@@ -589,7 +591,7 @@ def test_a_secret_is_passed_exactly_as_typed(monkeypatch: pytest.MonkeyPatch) ->
     """
     from ovx import wizard
 
-    monkeypatch.setattr(wizard.getpass, "getpass", lambda _prompt: "  pa ss  ")
+    monkeypatch.setattr("getpass.getpass", lambda _prompt: "  pa ss  ")
     assert wizard.ask("api_key", secret=True) == "  pa ss  "
 
 
@@ -599,7 +601,7 @@ def test_an_empty_secret_keeps_the_current_value(
     """Enter on an api_key prompt means "leave it alone", not "blank it"."""
     from ovx import wizard
 
-    monkeypatch.setattr(wizard.getpass, "getpass", lambda _prompt: "")
+    monkeypatch.setattr("getpass.getpass", lambda _prompt: "")
     assert wizard.ask("api_key", secret=True, default="$OLD") == "$OLD"
 
 
