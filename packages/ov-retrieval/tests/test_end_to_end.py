@@ -346,3 +346,38 @@ async def test_diversity_demotes_a_near_duplicate_end_to_end(backend: Any) -> No
     assert diverse[1].uri.endswith("other"), "MMR must break the pair up"
 
     await backend.close()
+
+
+async def test_diversity_reaches_level_0_results(backend: Any) -> None:
+    """MMR looks similarity up by the stored URI, not the displayed one.
+
+    The database holds no row whose `uri` ends in `/.abstract.md`, so a
+    diversity pass querying the display URI finds nothing and silently stops
+    working for every directory-level result -- the mirror of the keyword-leg
+    bug, and the half of that fix with no end-to-end cover until now.
+    """
+    ctx = request_context()
+    assert await backend.create_collection(COLLECTION, schema())
+    await backend.upsert_many(
+        [
+            record("first", uri="viking://resources/first", vector=NEAR_A, level=0),
+            record("twin", uri="viking://resources/twin", vector=NEAR_A, level=0),
+            record("other", uri="viking://resources/other", vector=NEAR_B, level=0),
+        ],
+        ctx=ctx,
+    )
+
+    plain = await retrieve(
+        backend, ctx, query="", limit=3, keyword_enabled=False, mmr_enabled=False
+    )
+    diverse = await retrieve(
+        backend, ctx, query="", limit=3, keyword_enabled=False, mmr_lambda=0.5
+    )
+
+    assert [m.uri for m in plain][:2] == [
+        "viking://resources/first/.abstract.md",
+        "viking://resources/twin/.abstract.md",
+    ], "without MMR the twins hold both top slots"
+    assert diverse[1].uri.endswith("other/.abstract.md"), "MMR must fire for L0 too"
+
+    await backend.close()

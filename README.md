@@ -7,6 +7,7 @@ Packages that extend [OpenViking](https://github.com/volcengine/OpenViking), col
 | Package | Language | Description |
 | --- | --- | --- |
 | [`ov-postgres`](packages/ov-postgres/) | Python | PostgreSQL + pgvector backend for OpenViking's vector store |
+| [`ov-retrieval`](packages/ov-retrieval/) | Python | Adds a keyword leg and a diversity pass to OpenViking's retrieval |
 | [`ovx`](packages/ovx/) | Python | Run `ov` against a named profile, without leaving an API key on disk |
 | [`ov-skills`](packages/ov-skills/) | Markdown + Bash | `/handoff`, `/continue`, `/learnings`, `/ingest` for Claude Code, opencode, and Hermes |
 | [`ov-dash`](packages/ov-dash/) | TypeScript | A dashboard over OpenViking that logs people in with OIDC and holds their API key server-side |
@@ -19,6 +20,7 @@ Each package has its own README with install and usage instructions.
 ```
 packages/
   ov-postgres/     Python package (uv workspace member)
+  ov-retrieval/    Python package (uv workspace member)
   ovx/             Python package with a Typer CLI (standalone uv project)
   ov-skills/       Agent skills with a Python test suite (standalone uv project)
   ov-dash/         Node service and Svelte client (npm, its own toolchain)
@@ -49,7 +51,7 @@ uv run --directory packages/ovx pytest        # its own project, its own lock
 
 One workflow, [`ci.yaml`](.github/workflows/ci.yaml), covers the repo: repo-wide checks run once, then each package whose files changed is tested by the template that fits it. [`template-check.yaml`](.github/workflows/template-check.yaml) tests a Python package across its supported interpreters and builds and imports its wheel; [`template-check-shell.yaml`](.github/workflows/template-check-shell.yaml) runs a shell package's suite on both Ubuntu and macOS, since macOS still ships bash 3.2 and rejects syntax every other bash accepts.
 
-Adding a package means adding one filter block to `ci.yaml` and its name to whichever of the two fallback lists matches its template. It also needs an entry in `release.yaml`'s `package` choice, and — for a shell package — its name in the `'["ov-skills"]'` literal that `release.yaml` tests against to pick a template. GitHub Actions cannot share a list between workflows or choose a reusable workflow from an expression, so that list is repeated rather than defined once. A Python package also goes in the workspace members in [`pyproject.toml`](pyproject.toml); a standalone one goes in that file's `exclude` list instead.
+Adding a package means adding one filter block to `ci.yaml` and its name to whichever of the three fallback lists matches its template. It also needs an entry in `release.yaml`'s `package` choice, and — for a shell package — its name in the `'["ov-skills"]'` literal that `release.yaml` tests against to pick a template. GitHub Actions cannot share a list between workflows or choose a reusable workflow from an expression, so that list is repeated rather than defined once. A Python package also goes in the workspace members in [`pyproject.toml`](pyproject.toml); a standalone one goes in that file's `exclude` list instead.
 
 ## Releases
 

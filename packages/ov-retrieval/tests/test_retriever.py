@@ -379,3 +379,41 @@ async def test_the_real_retrieve_is_the_one_under_test() -> None:
     assert (
         type(make_retriever(FakeStore(), [ctx("a")])).retrieve is HybridRetriever.retrieve
     )
+
+
+async def test_the_legs_agree_when_they_meet_a_document_at_different_levels() -> None:
+    """The seam the first suffix fix left open.
+
+    Reconstructing the display suffix from the *keyword* row's level looks
+    right and is not: the two legs can meet the same document at different
+    levels -- the vector leg holding its L0 row, the keyword phrase sitting in
+    its L2 body. The reconstructed URIs then differ and the hit is dropped,
+    silently, which is the very failure the suffix fix was meant to end.
+
+    Fusing on the stored URI makes the levels irrelevant.
+    """
+    store = FakeStore(keyword_uris=["viking://docs/target"], levels=[2])
+    contexts = [
+        ctx("viking://docs/decoy/.abstract.md", level=0),
+        ctx("viking://docs/target/.abstract.md", level=0),
+    ]
+    retriever = make_retriever(store, contexts, mmr_enabled=False)
+
+    result = await retriever.retrieve(FakeQuery(), ctx=None, limit=2)
+
+    assert result.matched_contexts[0].uri == "viking://docs/target/.abstract.md"
+
+
+async def test_a_missing_upstream_suffix_table_degrades_rather_than_raising() -> None:
+    """The module promises to degrade when an OpenViking internal moves."""
+    store = FakeStore(keyword_uris=["viking://docs/b"])
+    retriever = make_retriever(store, [ctx("viking://docs/a"), ctx("viking://docs/b")])
+    saved = HierarchicalRetriever.LEVEL_URI_SUFFIX
+    try:
+        del HierarchicalRetriever.LEVEL_URI_SUFFIX
+
+        result = await retriever.retrieve(FakeQuery(), ctx=None, limit=2)
+
+        assert len(result.matched_contexts) == 2
+    finally:
+        HierarchicalRetriever.LEVEL_URI_SUFFIX = saved

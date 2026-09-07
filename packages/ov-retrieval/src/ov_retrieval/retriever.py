@@ -39,22 +39,6 @@ logger = logging.getLogger(__name__)
 _VECTOR = "vector"
 _KEYWORD = "keyword"
 
-# What a record is when its row does not say: L2, the detail level.
-_DEFAULT_LEVEL = 2
-
-
-def _level_of(row: dict[str, Any]) -> int:
-    """Return a backend row's level, treating a missing or unusable one as L2.
-
-    Written out rather than inlined as ``row.get("level", 2) or 2`` because
-    level 0 is falsy, and L0 is precisely the level whose URI needs a suffix.
-    """
-    value = row.get("level", _DEFAULT_LEVEL)
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return _DEFAULT_LEVEL
-
 
 class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is untyped
     """Hierarchical retrieval plus a lexical leg and a diversity pass.
@@ -107,8 +91,14 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
         # `limit` is not merely a truncation knob upstream -- it sizes the
         # global search, sizes child searches, and gates recursion -- so
         # inflating it with both features off would change which results come
-        # back, and over-report `result_count` in the retrieval stats, for a
-        # pass that never runs.
+        # back for a pass that never runs.
+        #
+        # When a pass *is* active the over-fetch is the point, and the cost is
+        # that the base records `result_count` and `scores` for the whole pool
+        # rather than the answer: retrieval stats read high by up to
+        # `pool_factor`. The telemetry call happens inside `super().retrieve`,
+        # so correcting it would mean reimplementing the method this class
+        # exists to avoid reimplementing.
         pool = max(limit * settings.pool_factor, limit) if active else limit
 
         result = await super().retrieve(query, ctx, limit=pool, **kwargs)
@@ -142,8 +132,15 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
         ``/.overview.md`` for L1, so a context's URI is not what the ``uri``
         column contains. The suffix table is the base class's own, which keeps
         this in step if upstream adds a level.
+
+        Read through ``getattr`` rather than as an attribute: this module
+        promises to degrade to plain vector retrieval when an OpenViking
+        internal moves, and a bare access here would raise instead. Without the
+        table every URI is returned as-is, which costs the L0/L1 candidates
+        their fusion and diversity but keeps the search answering.
         """
-        suffix = cls.LEVEL_URI_SUFFIX.get(context.level)
+        table: dict[int, str] = getattr(cls, "LEVEL_URI_SUFFIX", {})
+        suffix = table.get(context.level)
         if suffix and context.uri.endswith(f"/{suffix}"):
             return str(context.uri[: -(len(suffix) + 1)])
         return str(context.uri)
@@ -163,6 +160,15 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
         replaced with RRF sums: that keeps the distribution the caller's
         thresholds were tuned against, while making the number agree with the
         position.
+
+        The cost is that a score now means "rank within this answer" and not
+        "similarity to this query", so comparing one across two separate calls
+        is no longer meaningful. Two places do:
+        ``context_assembler/gather.py``'s ``dedupe_keep_best`` and
+        ``server/routers/skills.py``'s merge of two ``find`` results. Both were
+        already comparing numbers a reranker had rewritten, so this narrows an
+        existing looseness rather than introducing one -- but it is the reason
+        to prefer redistributing the caller's own values over inventing new.
         """
         ranked = contexts[:limit]
         descending = sorted((context.score for context in ranked), reverse=True)
@@ -208,10 +214,17 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
         if not keyword_uris:
             return contexts
 
-        by_uri = {context.uri: context for context in contexts}
+        # Fuse on the *stored* URI, which both legs agree on. A context's own
+        # URI carries a level suffix and the keyword row's does not, and the
+        # two legs can meet the same document at different levels -- the vector
+        # leg at L0, the keyword hit on that URI's L2 row. Reconstructing the
+        # suffix from the keyword row's level looks right and is not: it makes
+        # the two disagree in exactly that case, and the hit is dropped.
+        # Upstream keeps one candidate per stored URI, so this key is unique.
+        by_uri = {self._stored_uri(context): context for context in contexts}
         fused = rrf_fuse(
             {
-                _VECTOR: [context.uri for context in contexts],
+                _VECTOR: [self._stored_uri(context) for context in contexts],
                 # Restricted to what the vector leg found, so the fusion ranks
                 # one candidate set rather than stitching two together.
                 _KEYWORD: [uri for uri in keyword_uris if uri in by_uri],
@@ -284,18 +297,9 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
             logger.warning("hybrid: keyword leg failed; vector only", exc_info=True)
             return []
 
-        # The backend returns the *stored* URI; a MatchedContext carries the
-        # *display* one, which for L0 and L1 has `/.abstract.md` or
-        # `/.overview.md` appended by `_convert_to_matched_contexts`. Matching
-        # the two raw would silently never line up for those levels, and the
-        # keyword leg would do nothing for them while still logging hits.
-        # `or 2` would be wrong here: level 0 is falsy and is exactly the case
-        # that needs a suffix.
-        return [
-            self._append_level_suffix(str(row["uri"]), _level_of(row))
-            for row in rows or []
-            if row.get("uri")
-        ]
+        # Returned as stored, with no level suffix reconstructed. The caller
+        # keys the fusion on the stored URI for the same reason.
+        return [str(row["uri"]) for row in rows or [] if row.get("uri")]
 
     async def _diversify(
         self, contexts: list[MatchedContext], *, limit: int
