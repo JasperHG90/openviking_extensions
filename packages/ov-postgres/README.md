@@ -280,6 +280,8 @@ Every option this package accepts, set explicitly, in a complete file. Values sh
         "distance": "cosine",
         "keyword_fields": ["name", "description", "abstract", "tags", "search_tags"],
         "store_content": false,
+        "keyword_query_mode": "any",
+        "keyword_rank": "ts_rank_cd",
         "text_search_config": "english",
         "tz_policy": "local",
         "min_pool_size": 2,
@@ -311,21 +313,9 @@ Three of those deserve a note:
 By default this backend stores metadata — name, description, abstract, tags —
 but not the body of each document.
 
-**Read this first: turning it on changes nothing about how OpenViking searches
-today.** The only code path that calls `search_by_keywords` is OpenViking's
-grep, and grep never routes to this backend (see [What this does not
-do](#what-this-does-not-do)). No server route, MCP endpoint, or retrieval
-pipeline performs a keyword search. So bodies land in the column and nothing
-reads them.
-
-Turn it on when you want one of these:
-
-- You call `PgVectorCollection.search_by_keywords` yourself.
-- You query the `content` column directly with SQL.
-- You are preparing for one of the above and want the data accumulating now,
-  since existing rows do not backfill.
-
-With that understood, storing bodies is one key:
+Turning it on both stores bodies and searches them — `content` joins the
+default keyword fields, since filling a column nobody reads would be paying for
+it twice:
 
 ```json
 "custom_params": {
@@ -333,24 +323,43 @@ With that understood, storing bodies is one key:
 }
 ```
 
-That fills the `content` column and leaves the full-text index alone. It is the
-recommended starting point: you accumulate bodies from now on — which you
-cannot get retroactively, since existing rows do not backfill — without paying
-to index them or changing how anything ranks.
-
-**Indexing them is a second, separate key.** `store_content` decides whether
-bodies are *written*; `keyword_fields` decides whether they are *searched*:
+An explicit `keyword_fields` still wins outright, so storing bodies without
+indexing them stays expressible:
 
 ```json
 "custom_params": {
   "store_content": true,
-  "keyword_fields": ["name", "description", "abstract", "tags", "search_tags", "content"]
+  "keyword_fields": ["name", "description", "abstract", "tags", "search_tags"]
 }
 ```
 
-Setting only `keyword_fields` indexes an empty column. Before adding `content`
-there, read the duplication note below — for memories and directories the body
-repeats the abstract, so indexing it skews ranking rather than improving it.
+**Note what does *not* change.** OpenViking itself never issues a keyword
+query. Its only caller of `search_by_keywords` is grep, and grep never routes
+here (see [What this does not do](#what-this-does-not-do)). Bodies become
+searchable through this backend's own API, or through
+[`ov-retrieval`](../ov-retrieval), which adds a keyword leg to OpenViking's
+retrieval and fuses it with the vector ranking. Without one of those, the index
+is built and nothing queries it.
+
+#### How a query matches
+
+`plainto_tsquery` requires **every** word it parses. That is right for a
+deliberate phrase and wrong for a question: "how did we configure the vault
+policy" demands all six words and matches nothing. So the words of a `query`
+are ORed by default — `keyword_query_mode` is `any`.
+
+Entries of the `keywords` list are unaffected: each still requires its own
+words, and separate entries remain alternatives. The two parameters mean
+different things, and now behave accordingly.
+
+Set `keyword_query_mode` to `all` for the previous behavior. Punctuation and
+keywords are literal in both modes — `-fox` searches for the word "fox" rather
+than excluding it, and `OR` is a word, not an operator.
+
+Ranking is `ts_rank_cd`, which also rewards query words appearing near each
+other; `keyword_rank` selects `ts_rank` instead. Neither uses inverse document
+frequency, so a rare word and a common one count alike — PostgreSQL's built-in
+ranking is not BM25 and this backend does not pretend otherwise.
 
 #### Why a flag rather than always-on
 
@@ -370,11 +379,15 @@ Bodies come from OpenViking, and it materializes two different things:
   gets the text that was embedded, falling back to the abstract.
 
 So every record gets a body; a memory's is its own text rather than a file on
-disk. For a memory or a directory that text is usually the same string already
-stored in `abstract`, so adding `content` to `keyword_fields` double-counts
-those terms in the tsvector and ranks those records above files whose body
-genuinely differs from their abstract. The bodies worth searching are the leaf
-resources and skills.
+disk.
+
+One consequence worth knowing: for a memory or a directory, that text is
+usually the same string already stored in `abstract`. Indexing both counts
+those terms twice in the tsvector, which lifts those records slightly against
+files whose body genuinely differs from their abstract. The bodies that carry
+new information are the leaf resources and skills. If that skew matters more to
+you than searching prose, name `keyword_fields` explicitly and leave `content`
+out.
 
 OpenViking caps a body at 1 MiB of *characters* before this backend sees it —
 up to 4 MiB of UTF-8. This package then truncates `content` and `abstract` to
@@ -426,6 +439,8 @@ Every key goes under `custom_params`. Unknown keys are **rejected at startup**, 
 | `distance` | from `distance_metric` | `cosine`, `l2`, or `ip` |
 | `keyword_fields` | name, description, abstract, tags, search_tags | Columns in the full-text index |
 | `store_content` | `false` | Persist each record's body text in `content` |
+| `keyword_query_mode` | `any` | Whether a query needs `any` of its words or `all` |
+| `keyword_rank` | `ts_rank_cd` | `ts_rank_cd` or `ts_rank` |
 | `text_search_config` | `simple` | Text search configuration |
 | `tz_policy` | `local` | Timezone for naive timestamps |
 | `min_pool_size` / `max_pool_size` | `1` / `8` | Connection pool bounds |

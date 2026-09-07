@@ -75,6 +75,25 @@ _MAX_KEYWORD_TERMS = 16384
 # so a query this wide is worth saying something about.
 _KEYWORD_TERMS_WARN = 1024
 
+# Ranking functions by config name, as `sql.SQL` literals so nothing derived
+# from user configuration is ever spliced into SQL as raw text.
+_KEYWORD_RANK_FNS: dict[str, sql.SQL] = {
+    "ts_rank": sql.SQL("ts_rank"),
+    "ts_rank_cd": sql.SQL("ts_rank_cd"),
+}
+
+# Validated like the rank function: a typo silently falling through to `any`
+# would change what every query matches.
+_KEYWORD_QUERY_MODES = frozenset({"all", "any"})
+
+# Words allowed in one `any`-mode term. The rewrite re-parses a flat `a | b |
+# c ...` chain, which PostgreSQL's parser recurses through once per level, so a
+# long enough term reaches `stack depth limit exceeded` -- around 12000 words
+# at the default 2MB. `all` mode has no such ceiling, since `plainto_tsquery`
+# builds the tree itself. Set well below the limit so the failure is this
+# message rather than a driver error, and far above any real query.
+_MAX_ANY_MODE_WORDS = 2048
+
 # Validators for a primary key value, by declared OpenViking type. These are
 # the same pydantic types the native engine validates every record against, so
 # they accept and reject exactly what it does: `3` is refused for a string key,
@@ -140,6 +159,12 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         Extra settings for the ANN index's ``WITH`` clause.
     keyword_fields :
         Text columns included in the full-text index.
+    keyword_query_mode :
+        Whether a natural-language ``query`` requires ``all`` of its words or
+        matches on ``any``. Entries of the ``keywords`` list always require
+        all of their own words, whatever this says.
+    keyword_rank :
+        Ranking function for keyword search: ``ts_rank`` or ``ts_rank_cd``.
     text_search_config :
         PostgreSQL text search configuration for tsvectors.
     tz_policy :
@@ -176,6 +201,8 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         index_method: str = "flat",
         index_options: dict[str, Any] | None = None,
         keyword_fields: Sequence[str] = DEFAULT_KEYWORD_FIELDS,
+        keyword_query_mode: str = "any",
+        keyword_rank: str = "ts_rank_cd",
         text_search_config: str = "simple",
         tz_policy: str = "local",
         iterative_scan: str = "relaxed_order",
@@ -200,6 +227,18 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         self._index_method = index_method
         self._index_options = dict(index_options or {})
         self._keyword_fields = list(keyword_fields)
+        if keyword_rank not in _KEYWORD_RANK_FNS:
+            raise ValueError(
+                f"Unsupported keyword rank function: {keyword_rank!r}. "
+                f"Expected one of: {', '.join(sorted(_KEYWORD_RANK_FNS))}"
+            )
+        if keyword_query_mode not in _KEYWORD_QUERY_MODES:
+            raise ValueError(
+                f"Unsupported keyword query mode: {keyword_query_mode!r}. "
+                f"Expected one of: {', '.join(sorted(_KEYWORD_QUERY_MODES))}"
+            )
+        self._keyword_query_mode = keyword_query_mode
+        self._keyword_rank = keyword_rank
         self._text_search_config = text_search_config
         self._tz_policy = tz_policy
         self._iterative_scan = iterative_scan
@@ -1253,15 +1292,26 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         cannot vectorise text itself.  Postgres can rank lexically without an
         embedding model, so this is implemented rather than refused.
         """
+        # Each term carries how its own words combine. A `keywords` entry is a
+        # deliberate phrase, so its words are ANDed; a `query` is natural
+        # language, where requiring every word matches almost nothing -- the
+        # words are ORed unless `keyword_query_mode` says otherwise. Separate
+        # terms are alternatives either way.
         terms: list[str] = []
+        modes: list[str] = []
         seen_terms: set[str] = set()
         # Deduplicated: each term costs two bound parameters and its own
         # planning time, and repeating one changes nothing -- `a || a` is `a`.
-        for raw in [*(keywords or []), query or ""]:
+        sources: list[tuple[str, str]] = [
+            *((raw, "all") for raw in (keywords or [])),
+            (query or "", self._keyword_query_mode),
+        ]
+        for raw, mode in sources:
             text = str(raw).strip()
             if text and text not in seen_terms:
                 seen_terms.add(text)
                 terms.append(text)
+                modes.append(mode)
         if not terms:
             return SearchResult(data=[])
         if len(terms) > _MAX_KEYWORD_TERMS:
@@ -1276,6 +1326,16 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 "with the term count, roughly a millisecond each",
                 len(terms),
             )
+
+        for text, mode in zip(terms, modes, strict=True):
+            if mode == "any" and text.count(" ") + 1 > _MAX_ANY_MODE_WORDS:
+                raise ValueError(
+                    f"A single 'any'-mode term accepts at most "
+                    f"{_MAX_ANY_MODE_WORDS} words; got about {text.count(' ') + 1}. "
+                    "Rewriting the conjunction produces a flat disjunction that "
+                    "PostgreSQL's parser recurses through. Split the query, or "
+                    "set keyword_query_mode='all', which has no such ceiling."
+                )
 
         specs = self._fulltext_specs()
         if not specs:
@@ -1300,12 +1360,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         # 4223 keywords hit `stack depth limit exceeded`. Halving keeps the
         # depth logarithmic, which no realistic query can exhaust.
         tsquery = _balanced_or(
-            [
-                sql.SQL("plainto_tsquery({}::regconfig, %s)").format(
-                    sql.Literal(self._text_search_config)
-                )
-                for _ in terms
-            ]
+            [_term_tsquery(mode, self._text_search_config) for mode in modes]
         )
 
         predicate, filter_params = self._compiler.compile(filters)
@@ -1313,11 +1368,12 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         include_extra = not output_fields
 
         statement = sql.SQL(
-            "SELECT {cols}, ts_rank({tsv}, {tsq}) AS _score FROM {table} "
+            "SELECT {cols}, {rank}({tsv}, {tsq}) AS _score FROM {table} "
             "WHERE {pred} AND {tsv} @@ {tsq} "
             "ORDER BY _score DESC, {pk} LIMIT %s OFFSET %s"
         ).format(
             cols=self._select_list(columns, include_extra=include_extra),
+            rank=_KEYWORD_RANK_FNS[self._keyword_rank],
             tsv=tsvector,
             tsq=tsquery,
             table=self._qualified,
@@ -1329,6 +1385,98 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         params = [*terms, *filter_params, *terms, limit, offset]
         rows = self._execute(statement, params, fetch="all")
         return self._rows_to_search_result(rows, columns)
+
+    def pairwise_similarity(
+        self, values: Sequence[object], *, field: str | None = None
+    ) -> dict[tuple[object, object], float]:
+        """Return cosine similarity between every pair of the given rows.
+
+        Exists so a diversity pass such as MMR can compare candidates without
+        anybody shipping embeddings out of the database: the vectors are large,
+        they are excluded from search output on purpose, and a round trip per
+        candidate would cost more than the ranking it feeds. One query does the
+        whole matrix.
+
+        Cosine is used whatever the collection's configured distance metric is.
+        MMR compares candidates to each other rather than to the query, and
+        wants an angle-only measure with a fixed ``0..1`` range; an inner
+        product would let a long vector look similar to everything.
+
+        Rows whose vector is NULL are skipped rather than treated as identical
+        to one another, which is what a zero distance would have claimed.
+
+        Parameters
+        ----------
+        values :
+            Values identifying the candidate rows. Fewer than two makes every
+            pair vacuous, so the result is empty.
+        field :
+            Column the values name. ``None`` means the primary key. A caller
+            ranking by ``uri`` passes that instead, since a retrieval result
+            carries the URI and not the row id. A non-unique field is reduced
+            to one representative row per value, so the matrix has exactly one
+            entry per pair.
+
+        Returns
+        -------
+        dict[tuple[object, object], float]
+            Similarity by value pair, holding both orderings of each pair so a
+            caller can look one up without canonicalising. Absent pairs mean
+            one of the rows had no embedding.
+
+        Raises
+        ------
+        ValueError
+            If ``field`` is not a column of this collection. Never interpolate
+            an unchecked name into SQL.
+        """
+        vector_field = self._schema.vector_field
+        if vector_field is None or len(values) < 2:
+            return {}
+
+        name = field or self._schema.primary_key.name
+        spec = self._schema.by_name(name)
+        if spec is None:
+            raise ValueError(
+                f"Cannot rank by unknown field {name!r} on collection {self._name!r}"
+            )
+        # Only the primary key gets the engine's key validation; another column
+        # takes its values as given.
+        keys = (
+            [self._coerce_key(value) for value in values]
+            if name == self._schema.primary_key.name
+            else list(values)
+        )
+
+        column = sql.Identifier(name)
+        vec = sql.Identifier(vector_field.name)
+        pk = sql.Identifier(self._schema.primary_key.name)
+
+        # DISTINCT ON keeps one row per value: a URI can carry a row per level,
+        # and without this the cross join would emit a pair per combination and
+        # the last one written would silently win. Ordering by the primary key
+        # makes which row represents a value deterministic.
+        #
+        # Upper triangle only: similarity is symmetric, so comparing `a < b`
+        # halves the work and Python mirrors it below.
+        statement = sql.SQL(
+            "WITH reps AS ("
+            "SELECT DISTINCT ON ({col}) {col} AS ref, {vec} AS vec FROM {table} "
+            "WHERE {col} = ANY(%s) AND {vec} IS NOT NULL "
+            "ORDER BY {col}, {pk}"
+            ") "
+            "SELECT a.ref AS ref_a, b.ref AS ref_b, "
+            "1 - (a.vec <=> b.vec) AS similarity "
+            "FROM reps a JOIN reps b ON a.ref < b.ref"
+        ).format(col=column, vec=vec, table=self._qualified, pk=pk)
+
+        rows = self._execute(statement, [keys], fetch="all")
+        matrix: dict[tuple[object, object], float] = {}
+        for row in rows:
+            similarity = float(row["similarity"])
+            matrix[(row["ref_a"], row["ref_b"])] = similarity
+            matrix[(row["ref_b"], row["ref_a"])] = similarity
+        return matrix
 
     def search_by_multimodal(
         self,
@@ -2536,6 +2684,54 @@ def _balanced_or(parts: list[sql.Composable]) -> sql.Composable:
     return sql.SQL("({} || {})").format(
         _balanced_or(parts[:middle]), _balanced_or(parts[middle:])
     )
+
+
+def _term_tsquery(mode: str, regconfig: str) -> sql.Composable:
+    """Build the tsquery fragment for one search term.
+
+    ``plainto_tsquery`` ANDs every word it parses, which is right for a
+    deliberate phrase and wrong for natural language: a nine-word question
+    requires all nine words and matches nothing. ``any`` mode rewrites the
+    conjunction into a disjunction by rendering the parsed query as text,
+    swapping ``&`` for ``|``, and re-parsing -- the trick memex's
+    ``KeywordStrategy`` uses. Rewriting the *parsed* query rather than the raw
+    string keeps stemming and stopword removal.
+
+    The rewrite is textual, so it is approximate in one known way: a lexeme can
+    itself contain ``&``. A URL such as ``a.com/x?y=1&z=2`` parses to lexemes
+    holding literal ampersands, and replacing those splits the lexeme and can
+    emit a ``<->`` phrase operator. The host lexeme survives as an alternative,
+    so recall is not lost, but ranking on URL-bearing queries is affected. Use
+    ``all`` mode where queries carry URLs and precision matters.
+
+    An all-stopword term parses to the empty string, and ``to_tsquery('')``
+    raises. ``NULLIF`` turns that into NULL and the ``coalesce`` into an empty
+    tsquery, which contributes nothing to the surrounding ``||`` instead of
+    making the whole disjunction NULL and matching no rows at all.
+
+    Parameters
+    ----------
+    mode :
+        ``all`` to require every word, ``any`` to accept any of them.
+    regconfig :
+        PostgreSQL text search configuration.
+
+    Returns
+    -------
+    sql.Composable
+        A tsquery expression binding exactly one parameter, so the caller's
+        placeholder ordering is the same in both modes.
+    """
+    cfg = sql.Literal(regconfig)
+    if mode == "all":
+        return sql.SQL("plainto_tsquery({}::regconfig, %s)").format(cfg)
+    return sql.SQL(
+        "coalesce("
+        "to_tsquery({cfg}::regconfig, "
+        "nullif(regexp_replace("
+        "plainto_tsquery({cfg}::regconfig, %s)::text, '&', '|', 'g'), '')"
+        "), ''::tsquery)"
+    ).format(cfg=cfg)
 
 
 def _stamp(cur: Cursor[Any], db_schema: str, entry: ddl.IndexStatement) -> None:

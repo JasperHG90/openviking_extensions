@@ -20,6 +20,7 @@ import json
 import logging
 import re
 import threading
+from collections.abc import Sequence
 from typing import Any
 
 from openviking.storage.vectordb.collection.collection import Collection
@@ -73,6 +74,10 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
     # infer the attribute it sets in __init__.
     _collection: Collection | None
 
+    # The same collection as `_collection`, before OpenViking's facade wraps
+    # it. Kept so this backend's own methods stay reachable.
+    _pg_collection: PgVectorCollection | None
+
     # PostgreSQL has no per-statement row cap; batching uses executemany.
     _DATA_BATCH_SIZE: int | None = None
 
@@ -120,6 +125,7 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
         # another does not. Set before anything can read it.
         self.USE_CONTENT_FIELD = params.store_content
         self._sparse_weight = sparse_weight
+        self._pg_collection = None
         self._pool: ConnectionPool | None = None
         self._bootstrapped = False
         self._pgvector_version: tuple[int, ...] = ()
@@ -353,6 +359,53 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
         distance = (meta.get("VectorIndex") or {}).get("Distance")
         return str(distance) if distance else None
 
+    def pairwise_similarity(
+        self, values: Sequence[object], *, field: str | None = None
+    ) -> dict[tuple[object, object], float]:
+        """Return cosine similarity between every pair of the given rows.
+
+        Reaches past OpenViking's ``Collection`` facade, which forwards only
+        the methods of the backend interface and so cannot see this one. A
+        diversity pass such as MMR calls it to compare candidates without
+        pulling their embeddings across the wire.
+
+        Parameters
+        ----------
+        values :
+            Values identifying the candidate rows.
+        field :
+            Column those values name; ``None`` means the primary key. Callers
+            working in URIs pass ``"uri"``.
+
+        Returns
+        -------
+        dict[tuple[object, object], float]
+            Similarity by value pair, in both orderings. Empty when the adapter
+            has no open collection, so a caller can treat "cannot" and
+            "nothing similar" alike and skip the diversity pass.
+        """
+        inner = self._pg_collection
+        if inner is None:
+            return {}
+
+        # A URI is stored with its `viking://` scheme stripped -- see
+        # `_encode_uri_field_value` -- and handed back with it restored. A
+        # caller passing what a search returned would therefore match no row
+        # at all, and the diversity pass this feeds would quietly do nothing
+        # rather than fail. Encode on the way in and decode on the way out, so
+        # the caller works in the URIs it was given.
+        if field in self._URI_FIELD_NAMES:
+            lookup = [self._encode_uri_field_value(value) for value in values]
+            matrix = inner.pairwise_similarity(lookup, field=field)
+            return {
+                (
+                    self._decode_uri_field_value(left),
+                    self._decode_uri_field_value(right),
+                ): score
+                for (left, right), score in matrix.items()
+            }
+        return inner.pairwise_similarity(values, field=field)
+
     def _build_collection(
         self, coll_schema: CollectionSchema, table_name: str
     ) -> Collection:
@@ -362,26 +415,30 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
         # unusable and rank by something other than what was asked for, so the
         # stored metric wins over the configured default.
         distance = self._stored_index_distance() or self._params.distance or "cosine"
-        return Collection(
-            PgVectorCollection(
-                pool=self._get_pool(),
-                db_schema=self._params.db_schema,
-                collection_name=self._collection_name,
-                table_name=table_name,
-                coll_schema=coll_schema,
-                distance=distance,
-                sparse_weight=self._sparse_weight,
-                index_method=self._params.index_method,
-                index_options=self._params.index_options,
-                keyword_fields=self._params.resolved_keyword_fields(),
-                text_search_config=self._params.text_search_config,
-                tz_policy=self._params.tz_policy,
-                iterative_scan=self._params.iterative_scan,
-                pgvector_version=self._pgvector_version,
-                index_name=self._index_name,
-                owns_pool=False,
-            )
+        # Held directly as well as inside the facade: the facade forwards only
+        # the backend interface, so anything extra this backend offers would
+        # otherwise be unreachable.
+        self._pg_collection = PgVectorCollection(
+            pool=self._get_pool(),
+            db_schema=self._params.db_schema,
+            collection_name=self._collection_name,
+            table_name=table_name,
+            coll_schema=coll_schema,
+            distance=distance,
+            sparse_weight=self._sparse_weight,
+            index_method=self._params.index_method,
+            index_options=self._params.index_options,
+            keyword_fields=self._params.resolved_keyword_fields(),
+            keyword_query_mode=self._params.keyword_query_mode,
+            keyword_rank=self._params.keyword_rank,
+            text_search_config=self._params.text_search_config,
+            tz_policy=self._params.tz_policy,
+            iterative_scan=self._params.iterative_scan,
+            pgvector_version=self._pgvector_version,
+            index_name=self._index_name,
+            owns_pool=False,
         )
+        return Collection(self._pg_collection)
 
     def update_data(self, data_list: list[dict[str, Any]]) -> list[str]:
         """Apply partial updates, matching ``LocalCollectionAdapter``.

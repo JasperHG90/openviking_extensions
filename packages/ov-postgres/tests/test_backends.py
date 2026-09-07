@@ -1898,25 +1898,35 @@ def test_an_upgraded_database_recovers_index_behaviour(
 
 
 @pytest.mark.parametrize(
-    "query,expect",
+    "mode,query,expect",
     [
-        ("quick fox", {"d1"}),
-        ("fox", {"d1"}),
-        ("-fox", {"d1"}),
-        ("quick OR bear", set()),
+        # `all` keeps the original semantics: every word required, and no
+        # punctuation or keyword acts as an operator.
+        ("all", "quick fox", {"d1"}),
+        ("all", "fox", {"d1"}),
+        ("all", "-fox", {"d1"}),
+        ("all", "quick OR bear", set()),
+        # `any`, the default, requires only one word. `OR` and `-` are still
+        # ordinary words -- `-fox` matching d1 rather than d2 is what proves
+        # the leading dash is not negation.
+        ("any", "quick fox", {"d1"}),
+        ("any", "fox", {"d1"}),
+        ("any", "-fox", {"d1"}),
+        ("any", "quick OR bear", {"d1", "d2"}),
     ],
 )
 def test_keyword_search_is_literal_and_not_a_phrase(
-    dsn: str, test_schema: str, query: str, expect: set[str]
+    dsn: str, test_schema: str, mode: str, query: str, expect: set[str]
 ) -> None:
-    """Multi-word search must AND its terms, not require adjacency.
+    """Multi-word search must not require adjacency, nor honour operators.
 
     Quoting each term stopped ``-fox`` acting as negation but turned every
     multi-word query into a phrase query, so ``"quick fox"`` no longer matched
-    "the quick brown fox". ``plainto_tsquery`` ANDs terms and treats
-    punctuation as text.
+    "the quick brown fox". ``plainto_tsquery`` treats punctuation as text,
+    which both modes inherit -- they differ only in whether its conjunction is
+    rewritten into a disjunction.
     """
-    adapter = build(dsn, test_schema)
+    adapter = build(dsn, test_schema, keyword_query_mode=mode)
     try:
         adapter.upsert(
             [

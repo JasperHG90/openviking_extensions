@@ -17,6 +17,8 @@ DistanceMetric = Literal["cosine", "l2", "ip"]
 IndexMethod = Literal["flat", "hnsw", "ivfflat", "auto"]
 IterativeScan = Literal["off", "strict_order", "relaxed_order"]
 TimezonePolicy = Literal["local", "utc"]
+KeywordQueryMode = Literal["all", "any"]
+KeywordRank = Literal["ts_rank", "ts_rank_cd"]
 
 DSN_ENV_VARS: tuple[str, ...] = (
     "OPENVIKING_POSTGRES_DSN",
@@ -31,6 +33,10 @@ DEFAULT_KEYWORD_FIELDS: tuple[str, ...] = (
     "tags",
     "search_tags",
 )
+
+# The schema's body-text field. Absent from the defaults above because it is
+# empty unless ``store_content`` is on.
+CONTENT_FIELD = "content"
 
 
 class VectorDBConfigLike(Protocol):
@@ -100,7 +106,13 @@ class PgVectorParams(BaseModel):
         :data:`DEFAULT_KEYWORD_FIELDS`.
     store_content : bool
         Whether to persist each record's ``content`` (its body text). Off by
-        default, matching every non-VikingDB backend.
+        default, matching every non-VikingDB backend. When on, ``content``
+        also joins the default keyword fields.
+    keyword_query_mode : KeywordQueryMode
+        Whether a natural-language query matches documents holding ``any`` of
+        its words or ``all`` of them.
+    keyword_rank : KeywordRank
+        Which PostgreSQL ranking function scores keyword search.
     text_search_config : str
         PostgreSQL text search configuration used to build tsvectors.
     tz_policy : TimezonePolicy
@@ -166,6 +178,22 @@ class PgVectorParams(BaseModel):
             "adapter asks for it, and only VikingDB-backed backends do."
         ),
     )
+    keyword_query_mode: KeywordQueryMode = Field(
+        default="any",
+        description=(
+            "How the words of a natural-language `query` combine. 'any' matches "
+            "documents holding any word, 'all' requires every one. Does not "
+            "affect the `keywords` list, whose entries are always alternatives."
+        ),
+    )
+    keyword_rank: KeywordRank = Field(
+        default="ts_rank_cd",
+        description=(
+            "Ranking function for keyword search. 'ts_rank_cd' also rewards "
+            "query words appearing close together; 'ts_rank' counts frequency "
+            "alone. Neither uses inverse document frequency."
+        ),
+    )
     text_search_config: str = Field(
         default="simple",
         min_length=1,
@@ -200,14 +228,23 @@ class PgVectorParams(BaseModel):
     def resolved_keyword_fields(self) -> list[str]:
         """Return the configured keyword fields, or the defaults.
 
+        With ``store_content`` on and no explicit list, ``content`` joins the
+        defaults: storing bodies and then ranking only titles and tags would
+        pay for the column without searching it. An explicit ``keyword_fields``
+        wins outright, so a caller who stores bodies but deliberately does not
+        want them indexed can say so.
+
         Returns
         -------
         list[str]
             Field names to include in the full-text index.
         """
-        if self.keyword_fields is None:
-            return list(DEFAULT_KEYWORD_FIELDS)
-        return list(self.keyword_fields)
+        if self.keyword_fields is not None:
+            return list(self.keyword_fields)
+        fields = list(DEFAULT_KEYWORD_FIELDS)
+        if self.store_content:
+            fields.append(CONTENT_FIELD)
+        return fields
 
 
 def resolve_dsn(params: PgVectorParams, url: str | None) -> str:

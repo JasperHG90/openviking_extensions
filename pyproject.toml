@@ -7,7 +7,7 @@
 # without a pyproject.toml, so a `packages/*` glob would break the moment a
 # non-Python package lands.
 [tool.uv.workspace]
-members = ["packages/ov-postgres"]
+members = ["packages/ov-postgres", "packages/ov-retrieval"]
 # ovx and ov-skills carry a pyproject.toml for their test suites but must not
 # join the workspace: a workspace resolves one Python floor for every member,
 # and their tests need 3.11+ while ov-postgres still supports 3.10. Listing

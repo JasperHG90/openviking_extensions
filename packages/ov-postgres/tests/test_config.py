@@ -14,7 +14,8 @@ from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
 from pydantic import ValidationError
 
 from ov_postgres.adapter import PgVectorCollectionAdapter
-from ov_postgres.config import PgVectorParams
+from ov_postgres.collection import _term_tsquery
+from ov_postgres.config import DEFAULT_KEYWORD_FIELDS, PgVectorParams
 
 DSN = "postgresql://user:pw@localhost:5432/openviking"
 
@@ -114,3 +115,61 @@ def test_truncation_applies_without_store_content() -> None:
     )
 
     assert len(record["abstract"].encode("utf-8")) <= limit
+
+
+def test_store_content_puts_bodies_in_the_keyword_fields() -> None:
+    """Storing bodies and not searching them would pay for the column twice."""
+    params = PgVectorParams(dsn=DSN, store_content=True)
+
+    fields = params.resolved_keyword_fields()
+
+    assert "content" in fields
+    assert fields[: len(DEFAULT_KEYWORD_FIELDS)] == list(DEFAULT_KEYWORD_FIELDS)
+
+
+def test_bodies_stay_out_of_the_index_when_not_stored() -> None:
+    """An unpopulated column in the tsvector is index maintenance for nothing."""
+    assert "content" not in PgVectorParams(dsn=DSN).resolved_keyword_fields()
+
+
+def test_explicit_keyword_fields_win_over_the_content_default() -> None:
+    """Storing bodies without indexing them has to remain expressible."""
+    params = PgVectorParams(
+        dsn=DSN, store_content=True, keyword_fields=["name", "abstract"]
+    )
+
+    assert params.resolved_keyword_fields() == ["name", "abstract"]
+
+
+def test_any_mode_turns_the_conjunction_into_a_disjunction() -> None:
+    """`plainto_tsquery` ANDs every word, which no long query survives."""
+    rendered = _term_tsquery("any", "english").as_string(None)
+
+    assert "regexp_replace" in rendered
+    assert "'&', '|'" in rendered
+    # An all-stopword term parses to '', and to_tsquery('') raises.
+    assert "nullif" in rendered
+    assert rendered.count("%s") == 1, "placeholder count must not vary by mode"
+
+
+def test_all_mode_keeps_every_word_required() -> None:
+    """A deliberate keyword phrase should still match as a phrase."""
+    rendered = _term_tsquery("all", "english").as_string(None)
+
+    assert "plainto_tsquery" in rendered
+    assert "regexp_replace" not in rendered
+    assert rendered.count("%s") == 1
+
+
+def test_keyword_defaults_follow_memex() -> None:
+    """OR matching and cover-density ranking are the useful defaults."""
+    params = PgVectorParams(dsn=DSN)
+
+    assert params.keyword_query_mode == "any"
+    assert params.keyword_rank == "ts_rank_cd"
+
+
+def test_unknown_rank_function_is_rejected() -> None:
+    """Never let a config string reach SQL unchecked."""
+    with pytest.raises(ValidationError):
+        PgVectorParams(dsn=DSN, keyword_rank="ts_rank_bm25")

@@ -29,6 +29,15 @@ repos:
         args: [--config-file=packages/ov-postgres/pyproject.toml]
 
       - id: mypy
+        name: mypy (ov-retrieval)
+        files: ^packages/ov-retrieval/(src|tests)/
+        additional_dependencies:
+          - pydantic>=2
+          - pydantic-settings>=2
+          - pytest>=7
+        args: [--config-file=packages/ov-retrieval/pyproject.toml]
+
+      - id: mypy
         name: mypy (ovx)
         # src as well as tests: ovx is a package now, and scoping this to
         # tests/ made the hook pass over a deliberate type error in src/.
@@ -56,6 +65,14 @@ repos:
         language: system
         pass_filenames: false
         files: ^packages/ov-postgres/
+        types: [python]
+
+      - id: pytest-unit-ov-retrieval
+        name: pytest (ov-retrieval, unit)
+        entry: uv run --directory packages/ov-retrieval pytest
+        language: system
+        pass_filenames: false
+        files: ^packages/ov-retrieval/
         types: [python]
 
       - id: pytest-unit-ovx
