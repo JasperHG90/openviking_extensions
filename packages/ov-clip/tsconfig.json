@@ -11,5 +11,6 @@
     "noEmit": true,
     "types": ["vitest/globals"]
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts", "esbuild.mjs", "vitest.config.ts"]
+  "//": "Root-level *.ts by glob, not by name: listing vitest.config.ts by hand left vitest.integration.config.ts unchecked, and CI runs it. .mjs is not listed because without allowJs tsc ignores it, so naming esbuild.mjs here only looked like coverage.",
+  "include": ["src/**/*.ts", "tests/**/*.ts", "*.ts"]
 }
