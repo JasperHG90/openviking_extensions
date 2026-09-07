@@ -77,8 +77,8 @@ ovx -n                 # create a profile, then run ov
 ovx -e lab             # edit `lab`, then run ov
 ovx -d lab             # delete `lab`, after confirmation
 ovx -l                 # list profiles
-ovx -L lab             # log in to `lab` through Studio, store the token
-ovx --logout lab       # revoke and forget `lab`'s stored login
+ovx -L lab             # log in to `lab` through Vault, store the token
+ovx --logout lab       # forget `lab`'s stored login
 ovx -V                 # show the ovx version
 ovx -- -o json status  # pick a profile, forward `-o json status` to ov
 ```
@@ -101,47 +101,116 @@ when stderr is not a terminal, so it never lands in a pipeline.
 
 ## Logging in
 
-`ovx -L lab` runs OpenViking's own OAuth 2.1 flow, so a profile can work with
-no API key at all:
+`ovx -L lab` mints a [Vault](https://developer.hashicorp.com/vault) identity
+token, so a profile can work with no API key at all:
 
 ```
 $ ovx -L lab
-
-ovx: approve this login in OpenViking Studio.
-
-  1. Open  https://openviking.example.com/studio/oauth/verify
-  2. Enter  K7MPQ2
-
-Waiting for approval (Ctrl-C to abort)…
+ovx: no Vault session; logging in as 'jasper'.
+Password for jasper:
 ovx: logged in. Token stored for profile 'lab'.
 ```
 
-Open that URL wherever you are already signed in to Studio, type the code, and
-`ovx` stores the resulting token at `~/.ovx/tokens/lab.json`, mode `600`. Later
-runs use it and refresh it when it expires, so you log in again only when the
-refresh token itself runs out. `ovx --logout lab` revokes it server-side and
-deletes the file.
+**All it needs is `$VAULT_ADDR`.** `ovx` talks to Vault's HTTP API itself, so the
+`vault` CLI is not a dependency — installing a second CLI to run this one would
+be a poor trade for the JSON parsing it saves. If you already have a session, it
+skips straight to minting and asks nothing:
+
+```
+$ ovx -L lab
+ovx: logged in. Token stored for profile 'lab'.
+```
+
+"Already have a session" means `$VAULT_TOKEN` is set, or `~/.vault-token` holds
+a live token — the same file the `vault` CLI caches its own session in, so the
+two share one login in either direction. `ovx` writes it there after a
+password login, mode `600`.
+
+These are read with their usual meanings:
+
+| | |
+| --- | --- |
+| `VAULT_ADDR` | required — the Vault to call |
+| `VAULT_TOKEN` | session token; wins over the cached file, and suppresses writing it |
+| `VAULT_NAMESPACE` | sent as `X-Vault-Namespace` |
+| `VAULT_CACERT` | CA bundle for a private CA |
+| `VAULT_SKIP_VERIFY` | disable TLS verification |
+
+A custom `$VAULT_TOKEN_HELPER` is **not** supported; set `$VAULT_TOKEN` instead.
+
+The password is read straight from `/dev/tty` with echo off and sent in the
+request body, so it never reaches `argv`, the environment, your shell history,
+or a log. It cannot be piped in, deliberately.
+
+The token lands at `~/.ovx/tokens/lab.json`, mode `600`. It is an RS256 JWT
+carrying an `ov_account` claim, which is how the server works out who you are.
+
+> The profile's `user` field doubles as your **Vault** username when `ovx` has
+> to log in. Its `account` and `user` are no longer consulted for OpenViking
+> identity — that comes from the token's claims — but `user` still picks the
+> Vault account, and `ovx` prints which one it is using before asking.
 
 A stored token outranks the profile's own `api_key`, so a profile can carry
-both — the key stays as a fallback for when you have not logged in.
+both; the key stays as a fallback for when you have not logged in.
 
-### Why it polls instead of listening
+`ovx --logout lab` deletes the local file. There is nothing to revoke — see
+below.
 
-Most CLI logins open a browser and catch the redirect on `127.0.0.1`. This one
-does not, because OpenViking mints the authorization code inside the status
-endpoint, and that read *deletes* the pending row — the code is single-use
-across readers, not just across exchanges. Studio's consent page polls that
-same endpoint in a loop, so pointing you there would race `ovx` and win.
+### Renewal, and why there is no refresh token
 
-Studio's *verify* page has no pending id and cannot poll, so sending you there
-with a code to type leaves `ovx` the only reader. No listener, no port to pick,
-no redirect URI that has to be reachable — and it works when the browser is on
-a different machine from the terminal.
+An identity token cannot be refreshed: it is a signed assertion, not a session,
+so there is no grant to exchange. `ovx` re-mints instead. Every run checks the
+stored token, and within five minutes of expiry asks Vault for a new one before
+handing it to `ov`.
 
-The six-character code is only rendered into the authorize page's HTML; the
-JSON endpoint withholds it deliberately. `ovx` reads it from that page, which
-needs no credential and already shows the code to anyone holding the pending
-id. That is a seam an upstream redesign could move.
+How long a token lasts is set on the Vault role, currently a week:
+
+```bash
+vault write identity/oidc/role/openviking ttl=168h
+```
+
+`ovx` never assumes that number. It reads the `exp` the token itself carries,
+so changing the role's `ttl` takes effect on the next mint with no change here.
+
+Re-minting needs a live Vault session rather than a stored secret — which is
+the point. The renewable thing is your Vault login, which lives in Vault's own
+token helper, not a refresh token sitting in `~/.ovx`. At a week-long `ttl` the
+token will usually outlive the Vault session that minted it; that is fine,
+since the token stands on its own. You only need Vault again when the token
+nears expiry, and if the session has lapsed by then `ovx` says to run `vault
+login` rather than failing with a bare 401.
+
+### Why no revoke
+
+`ovx --logout` deletes the local copy and stops there. Nothing tracks an
+identity token server-side, so there is no revocation endpoint to call, and
+`vault token revoke -self` would destroy your whole Vault session — taking
+every other tool on the machine with it.
+
+So the token stays valid until it expires — a week, at the current role `ttl`.
+If you need one dead sooner, the only lever is the Vault side: rotate or revoke
+the entity's access. Worth knowing before you raise the `ttl` further.
+
+### How it reaches the server
+
+`ov` has no field for a bearer token and needs none. OpenViking's
+`_extract_token` treats an `api_key` containing exactly two dots as a JWT, and
+a Vault identity token has exactly two dots — so it travels in the same
+`api_key` slot `ovx` already writes, and the transport is unchanged.
+
+`ov` also copies anything with two or more dots into an `Authorization: Bearer`
+header. Both carry the same token and the server reads either, so the
+duplication is harmless.
+
+### The role
+
+Tokens are minted from `identity/oidc/token/openviking`. Override the role name
+with `$OVX_VAULT_ROLE`. The role fixes the audience and the `ov_account` claim,
+so it has to match what the server was configured against.
+
+`ovx` does not check the token's `iss`. It must match the server's
+configuration exactly, and it is set on the Vault side — validating it here
+would only add a second place to get it wrong.
 
 ## Config
 
@@ -220,13 +289,20 @@ indefinitely. It is not erasure: `rm` unlinks the file, and on an SSD the blocks
 may persist until they are reused. If your threat model includes someone
 imaging the disk, this is the wrong tool.
 
-A stored OAuth token is the one thing `ovx` does leave on disk, at
+A stored identity token is the one thing `ovx` does leave on disk, at
 `~/.ovx/tokens/<profile>.json`, mode `600`. That is a real trade and worth
-naming: a `$VAR` reference keeps nothing, a token keeps something. What you get
-back is that the something expires, can be refreshed without you, and can be
-revoked from the server — none of which is true of the static key it replaces.
-If you would rather keep nothing at all, do not log in; `$VAR` profiles still
-work exactly as before.
+naming plainly: a `$VAR` reference keeps nothing, a token keeps something.
+
+What you get back is that the something expires on its own, which a static key
+never does. What you do *not* get back is revocation — there is none for an
+identity token. At the current week-long `ttl` that means a leaked token is
+usable by whoever holds it for up to a week, and deleting your copy with
+`--logout` does nothing about it.
+
+That is a weaker position than the hour-long token this replaced, and worth
+weighing against the `api_key` it removes: the key is worse (it never expires),
+but the gap has narrowed. If you would rather keep nothing at all, do not log
+in; `$VAR` profiles still work exactly as before.
 
 `ovx` also does not hide the key from the machine while it runs. It is in the
 environment you exported it from, and any process running as you can read it.

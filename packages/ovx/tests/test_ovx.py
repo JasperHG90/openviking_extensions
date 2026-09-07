@@ -12,7 +12,6 @@ tests drive the script through a pty.
 from __future__ import annotations
 
 import base64
-import hashlib
 import http.server
 import json
 import os
@@ -27,7 +26,6 @@ import sys
 import threading
 import time
 import tomllib
-import urllib.parse
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, ClassVar
@@ -741,9 +739,6 @@ def test_menu_picks_a_profile_and_runs(workspace: Path, config: Path) -> None:
 @pytest.fixture
 def echo_server() -> Iterator[tuple[str, list[dict[str, str]]]]:
     """Serve a fake OpenViking /health and collect the headers it is sent."""
-    import http.server
-    import threading
-
     seen: list[dict[str, str]] = []
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -821,130 +816,55 @@ def test_real_ov_reads_the_materialized_config(
     assert json.loads((ov_home / "ovcli.conf").read_text())["api_key"] == "key-from-home"
 
 
-# --- OAuth login ---------------------------------------------------------
+# --- Vault identity-token login ------------------------------------------
 #
-# These drive the real flow against a real HTTP server standing in for
-# OpenViking, rather than mocking urllib inside the script's heredocs. The
-# script's HTTP calls are the thing under test, so faking them out would leave
-# the interesting half unexercised.
+# ovx no longer speaks OAuth. OpenViking's oidc auth mode never builds an
+# api_key manager, and its oauth_verify refuses to mint without one, so DCR,
+# PKCE and the ovat_ flow are not degraded there but refused outright. Logging
+# in is now: ask Vault for an identity token, put it in the api_key slot.
+#
+# These drive the real script against a shim `vault` on PATH that records its
+# argv, the same way the suite stands in for `ov`. The shim is the boundary
+# ovx actually depends on, so faking anything nearer would leave the
+# interesting half unexercised.
 
 
-class FakeOpenViking(http.server.BaseHTTPRequestHandler):
-    """The five OAuth endpoints ovx talks to, plus a record of what arrived."""
+def make_jwt(expires_in: int = 3600, account: str = "jasper") -> str:
+    """Build a token shaped like Vault's, with a real ``exp``.
 
-    seen: ClassVar[dict[str, Any]] = {}
-    approve_after: int = 0
-    # When set, the approved redirect carries a state ovx never sent, which is
-    # what a cross-session or forged response would look like.
-    corrupt_state: bool = False
+    Only the shape matters here: ovx never verifies the signature, and must
+    not — the server does that. What it does read is ``exp``, and that it has
+    exactly two dots, which is how OpenViking recognizes a JWT in the api_key
+    slot.
 
-    def _send(self, status: int, body: bytes, ctype: str = "application/json") -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+    Parameters
+    ----------
+    expires_in :
+        Seconds from now until the token expires. Negative for an expired one.
+    account :
+        Value of the ``ov_account`` claim the server maps identity from.
 
-    def _json(self, status: int, payload: dict[str, Any]) -> None:
-        self._send(status, json.dumps(payload).encode())
+    Returns
+    -------
+    str
+        A three-segment JWT.
+    """
 
-    def do_GET(self) -> None:
-        """Serve metadata, the authorize redirect, the page, and the status poll."""
-        parsed = urllib.parse.urlparse(self.path)
-        query = urllib.parse.parse_qs(parsed.query)
-        base = f"http://{self.headers['Host']}"
+    def segment(payload: dict[str, Any]) -> str:
+        raw = json.dumps(payload).encode()
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
-        if parsed.path == "/.well-known/oauth-authorization-server":
-            self._json(
-                200,
-                {
-                    "issuer": base,
-                    "authorization_endpoint": f"{base}/authorize",
-                    "token_endpoint": f"{base}/token",
-                    "registration_endpoint": f"{base}/register",
-                    "revocation_endpoint": f"{base}/revoke",
-                },
-            )
-        elif parsed.path == "/authorize":
-            self.seen["authorize"] = {k: v[0] for k, v in query.items()}
-            self.send_response(302)
-            self.send_header("Location", f"{base}/oauth/authorize/page?pending=PEND123")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-        elif parsed.path == "/oauth/authorize/page":
-            self.seen["page_pending"] = query.get("pending", [""])[0]
-            self._send(
-                200,
-                b'<div class="code" id="displayCode">K7MPQ2</div>',
-                "text/html",
-            )
-        elif parsed.path == "/oauth/authorize/page/status":
-            polls = self.seen.get("polls", 0) + 1
-            self.seen["polls"] = polls
-            if polls <= type(self).approve_after:
-                self._json(200, {"status": "pending"})
-                return
-            state = self.seen.get("authorize", {}).get("state", "")
-            if type(self).corrupt_state:
-                state = "not-the-state-ovx-sent"
-            redirect = self.seen.get("authorize", {}).get("redirect_uri", "")
-            self._json(
-                200,
-                {
-                    "status": "approved",
-                    "redirect_url": f"{redirect}?code=AUTHCODE&state={state}",
-                },
-            )
-        else:
-            self._json(404, {"error": "not_found"})
-
-    def do_POST(self) -> None:
-        """Serve client registration, token exchange, and revocation."""
-        length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(length).decode()
-        parsed = urllib.parse.urlparse(self.path)
-
-        if parsed.path == "/register":
-            self.seen["register"] = json.loads(raw)
-            self._json(201, {"client_id": "client-abc"})
-        elif parsed.path == "/token":
-            form = {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
-            self.seen.setdefault("token", []).append(form)
-            grant = form.get("grant_type")
-            suffix = "refreshed" if grant == "refresh_token" else "first"
-            self._json(
-                200,
-                {
-                    "access_token": f"ovat_{suffix}",
-                    "refresh_token": f"ovrt_{suffix}",
-                    "expires_in": 3600,
-                    "token_type": "Bearer",
-                },
-            )
-        elif parsed.path == "/revoke":
-            self.seen["revoke"] = {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
-            self._json(200, {})
-        else:
-            self._json(404, {"error": "not_found"})
-
-    def log_message(self, *args: object) -> None:
-        """Keep the server quiet; pytest captures enough already."""
-
-
-@pytest.fixture
-def oauth_server() -> Iterator[tuple[str, dict[str, Any]]]:
-    """Serve a stand-in OpenViking OAuth server; yield its base URL and record."""
-    FakeOpenViking.seen = {}
-    FakeOpenViking.approve_after = 0
-    FakeOpenViking.corrupt_state = False
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeOpenViking)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f"http://127.0.0.1:{server.server_address[1]}", FakeOpenViking.seen
-    finally:
-        server.shutdown()
-        server.server_close()
+    header = segment({"alg": "RS256", "typ": "JWT"})
+    body = segment(
+        {
+            "iss": "https://vault.example.com/v1/identity/oidc",
+            "aud": "openviking",
+            "sub": "351f302a-0000-0000-0000-000000000000",
+            "ov_account": account,
+            "exp": int(time.time()) + expires_in,
+        }
+    )
+    return f"{header}.{body}.signaturenotchecked"
 
 
 def token_path(workspace: Path, name: str = "lab") -> Path:
@@ -952,240 +872,719 @@ def token_path(workspace: Path, name: str = "lab") -> Path:
     return workspace / "ovx" / "tokens" / f"{name}.json"
 
 
-def test_login_stores_a_token(
-    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+def write_token(workspace: Path, token: str, name: str = "lab") -> Path:
+    """Place a stored login on disk, as a previous run would have left it."""
+    path = token_path(workspace, name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = json.loads(base64.urlsafe_b64decode(token.split(".")[1] + "==").decode())
+    path.write_text(
+        json.dumps(
+            {
+                "profile": name,
+                "kind": "vault-identity",
+                "role": "openviking",
+                "token": token,
+                "expires_at": body["exp"],
+            }
+        )
+    )
+    path.chmod(0o600)
+    return path
+
+
+class FakeVault(http.server.BaseHTTPRequestHandler):
+    """The three Vault endpoints ovx talks to, plus a record of what arrived.
+
+    ovx speaks to Vault over HTTP rather than shelling out to the ``vault``
+    CLI, so the HTTP calls are the thing under test. Standing up a real server
+    exercises the headers, the JSON shapes and the status handling; mocking
+    urllib inside the heredocs would leave all of that unchecked.
+    """
+
+    seen: ClassVar[dict[str, Any]] = {}
+    valid_session: ClassVar[bool] = False
+    password: ClassVar[str] = "hunter2"
+    token: ClassVar[str] = ""
+    mint_status: ClassVar[int] = 200
+
+    def _send(self, status: int, body: dict[str, Any]) -> None:
+        raw = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _record(self, name: str) -> None:
+        self.seen.setdefault(name, []).append(
+            {
+                "path": self.path,
+                "token": self.headers.get("X-Vault-Token"),
+                "namespace": self.headers.get("X-Vault-Namespace"),
+            }
+        )
+
+    def do_GET(self) -> None:
+        """Serve token lookup and identity-token minting."""
+        if self.path == "/v1/auth/token/lookup-self":
+            self._record("lookup")
+            if type(self).valid_session and self.headers.get("X-Vault-Token"):
+                self._send(200, {"data": {"id": "s.session"}})
+            else:
+                self._send(403, {"errors": ["permission denied"]})
+        elif self.path.startswith("/v1/identity/oidc/token/"):
+            self._record("mint")
+            if not type(self).valid_session:
+                self._send(403, {"errors": ["permission denied"]})
+            elif type(self).mint_status != 200:
+                self._send(type(self).mint_status, {"errors": ["no such role"]})
+            else:
+                self._send(200, {"data": {"token": type(self).token}})
+        else:
+            self._send(404, {"errors": ["unsupported path"]})
+
+    def do_POST(self) -> None:
+        """Serve userpass login."""
+        if not self.path.startswith("/v1/auth/userpass/login/"):
+            self._send(404, {"errors": ["unsupported path"]})
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        body = json.loads(self.rfile.read(length) or b"{}")
+        self.seen.setdefault("login", []).append(
+            {"path": self.path, "password": body.get("password")}
+        )
+        if body.get("password") != type(self).password:
+            self._send(400, {"errors": ["invalid username or password"]})
+            return
+        type(self).valid_session = True
+        self._send(200, {"auth": {"client_token": "s.session"}})
+
+    def log_message(self, *args: object) -> None:
+        """Keep the server quiet; the tests assert on ovx's output."""
+
+
+@pytest.fixture
+def vault(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[type[FakeVault]]:
+    """Run a fake Vault and point $VAULT_ADDR at it.
+
+    Starts with no session, and with the token helper redirected into the
+    workspace so no test can read or write the real ``~/.vault-token``.
+    """
+    FakeVault.seen = {}
+    FakeVault.valid_session = False
+    FakeVault.password = "hunter2"
+    FakeVault.token = make_jwt()
+    FakeVault.mint_status = 200
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), FakeVault)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    monkeypatch.setenv("VAULT_ADDR", f"http://127.0.0.1:{server.server_port}")
+    monkeypatch.setenv("VAULT_TOKEN_FILE", str(workspace / "vault-token"))
+    monkeypatch.delenv("VAULT_TOKEN", raising=False)
+    monkeypatch.delenv("VAULT_NAMESPACE", raising=False)
+    try:
+        yield FakeVault
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def give_session(workspace: Path, vault: type[FakeVault]) -> None:
+    """Pretend the operator already has a live Vault session."""
+    vault.valid_session = True
+    helper = workspace / "vault-token"
+    helper.write_text("s.session")
+    helper.chmod(0o600)
+
+
+def test_login_mints_and_stores_a_token(
+    workspace: Path, config: Path, vault: type[FakeVault]
 ) -> None:
-    """A full login writes the access and refresh tokens to a private file."""
-    url, _seen = oauth_server
-    write_config(config, f'["lab"]\nurl = "{url}"\n')
+    """With a live Vault session, login mints and stores without asking anything."""
+    write_config(config, LAB)
+    give_session(workspace, vault)
 
     result = run(["--login", "lab"])
 
-    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert result.returncode == 0, result.stderr
     stored = json.loads(token_path(workspace).read_text())
-    assert stored["access_token"] == "ovat_first"
-    assert stored["refresh_token"] == "ovrt_first"
-    assert stored["client_id"] == "client-abc"
-    assert stored["expires_at"] > time.time()
+    assert stored["token"] == vault.token
+    assert stored["kind"] == "vault-identity"
+    assert stored["role"] == "openviking"
+    # The expiry comes out of the JWT, not from a TTL ovx assumed.
+    payload = json.loads(base64.urlsafe_b64decode(vault.token.split(".")[1] + "=="))
+    assert stored["expires_at"] == payload["exp"]
+
+
+def test_login_reads_the_identity_token_role(
+    workspace: Path, config: Path, vault: type[FakeVault]
+) -> None:
+    """The mint is a read of the role's identity-token path, with the session."""
+    write_config(config, LAB)
+    give_session(workspace, vault)
+
+    run(["--login", "lab"])
+
+    assert vault.seen["mint"][0]["path"] == "/v1/identity/oidc/token/openviking"
+    assert vault.seen["mint"][0]["token"] == "s.session"
+
+
+def test_login_honors_a_custom_role(
+    workspace: Path, config: Path, vault: type[FakeVault]
+) -> None:
+    """$OVX_VAULT_ROLE picks the role, since the role fixes aud and ov_account."""
+    write_config(config, LAB)
+    give_session(workspace, vault)
+
+    run(["--login", "lab"], OVX_VAULT_ROLE="openviking-staging")
+
+    assert vault.seen["mint"][0]["path"].endswith("/openviking-staging")
+
+
+def test_login_sends_the_vault_namespace_when_set(
+    workspace: Path, config: Path, vault: type[FakeVault]
+) -> None:
+    """$VAULT_NAMESPACE reaches Vault, so a namespaced lab works unchanged."""
+    write_config(config, LAB)
+    give_session(workspace, vault)
+
+    run(["--login", "lab"], VAULT_NAMESPACE="team-a")
+
+    assert vault.seen["mint"][0]["namespace"] == "team-a"
 
 
 def test_login_token_file_is_private(
-    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+    workspace: Path, config: Path, vault: type[FakeVault]
 ) -> None:
     """The stored token is readable only by its owner."""
-    url, _seen = oauth_server
-    write_config(config, f'["lab"]\nurl = "{url}"\n')
+    write_config(config, LAB)
+    give_session(workspace, vault)
 
     run(["--login", "lab"])
 
-    mode = stat.S_IMODE(token_path(workspace).stat().st_mode)
-    assert mode == 0o600, oct(mode)
+    assert stat.S_IMODE(token_path(workspace).stat().st_mode) == 0o600
+    assert stat.S_IMODE(token_path(workspace).parent.stat().st_mode) == 0o700
 
 
-def test_login_prints_the_code_and_where_to_enter_it(
-    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+def test_login_without_vault_addr_says_so(
+    workspace: Path, config: Path, vault: type[FakeVault]
 ) -> None:
-    """The operator is told the six-character code and the Studio URL."""
-    url, _seen = oauth_server
-    write_config(config, f'["lab"]\nurl = "{url}"\n')
+    """Without $VAULT_ADDR ovx has no Vault to call, so it refuses before trying."""
+    write_config(config, LAB)
 
-    result = run(["--login", "lab"])
+    result = run(["--login", "lab"], VAULT_ADDR="")
 
-    assert "K7MPQ2" in result.stderr, result.stderr
-    assert f"{url}/studio/oauth/verify" in result.stderr, result.stderr
+    assert result.returncode == 1
+    assert "VAULT_ADDR" in result.stderr
+    assert not token_path(workspace).exists()
 
 
-def test_login_uses_pkce_s256(
-    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+def test_login_needs_no_vault_cli(
+    workspace: Path, config: Path, vault: type[FakeVault]
 ) -> None:
-    """The challenge is the S256 digest of the verifier sent at token exchange.
+    """Ovx speaks to Vault itself; the vault binary is not a dependency.
 
-    OAuth 2.1 forbids ``plain``, and a challenge that does not match its
-    verifier would be accepted by a server that never checks — so the test
-    recomputes it rather than trusting the method parameter alone.
+    PATH here holds only the ov shim, so if ovx shelled out to `vault` this
+    would fail rather than mint.
     """
-    url, seen = oauth_server
-    write_config(config, f'["lab"]\nurl = "{url}"\n')
+    write_config(config, LAB)
+    give_session(workspace, vault)
 
-    run(["--login", "lab"])
+    # A PATH holding the ov shim, a python3 new enough for tomllib, and the
+    # system directories the script needs for bash and coreutils — but no
+    # `vault`. If ovx shelled out to it, this would fail. The interpreter comes
+    # before /usr/bin so python3 is 3.12 rather than the 3.9 macOS ships.
+    interpreter = str(Path(sys.executable).parent)
+    path = os.pathsep.join([str(workspace / "bin"), interpreter, "/usr/bin", "/bin"])
+    assert shutil.which("vault", path=path) is None
 
-    assert seen["authorize"]["code_challenge_method"] == "S256"
-    verifier = seen["token"][0]["code_verifier"]
-    expected = (
-        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
-        .rstrip(b"=")
-        .decode()
-    )
-    assert seen["authorize"]["code_challenge"] == expected
+    result = run(["--login", "lab"], PATH=path)
 
-
-def test_login_polls_until_approved(
-    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
-) -> None:
-    """A status that is not yet approved is polled again, not treated as failure."""
-    url, seen = oauth_server
-    FakeOpenViking.approve_after = 1
-    write_config(config, f'["lab"]\nurl = "{url}"\n')
-
-    result = run(["--login", "lab"])
-
-    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-    assert seen["polls"] >= 2, seen
+    assert result.returncode == 0, result.stderr
     assert token_path(workspace).exists()
 
 
-def test_stored_token_becomes_the_api_key(
-    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+def test_login_without_a_session_or_terminal_says_so(
+    workspace: Path, config: Path, vault: type[FakeVault]
 ) -> None:
-    """After login, ov is handed the OAuth token in the api_key field."""
-    url, _seen = oauth_server
-    write_config(config, f'["lab"]\nurl = "{url}"\n')
-    run(["--login", "lab"])
+    """Logging in needs a password prompt, which needs a terminal.
 
-    result = run(["lab", "health"])
+    Minting with an existing session does not, so the check belongs on this
+    branch rather than around the whole command.
+    """
+    write_config(config, LAB)
 
-    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-    assert shim_log(workspace).config["api_key"] == "ovat_first"
+    result = run(["--login", "lab"])
+
+    assert result.returncode == 1
+    assert "no terminal to log in from" in result.stderr
+
+
+def test_login_through_a_terminal_authenticates_then_mints(
+    workspace: Path, config: Path, vault: type[FakeVault]
+) -> None:
+    """With no session, ovx posts the password to Vault and then mints."""
+    write_config(config, '["lab"]\nurl = "https://ov.example.com"\nuser = "jasper"\n')
+
+    out = run_pty(["--login", "lab"], [("Password", "hunter2\n")])
+
+    assert "logged in" in out, out
+    assert vault.seen["login"][0]["path"] == "/v1/auth/userpass/login/jasper"
+    assert "mint" in vault.seen
+    assert token_path(workspace).exists()
+
+
+def test_login_caches_the_session_token_privately(
+    workspace: Path, config: Path, vault: type[FakeVault]
+) -> None:
+    """The Vault session is cached where the CLI keeps its own, at 0600."""
+    write_config(config, '["lab"]\nurl = "https://ov.example.com"\nuser = "jasper"\n')
+
+    run_pty(["--login", "lab"], [("Password", "hunter2\n")])
+
+    helper = workspace / "vault-token"
+    assert helper.read_text().strip() == "s.session"
+    assert stat.S_IMODE(helper.stat().st_mode) == 0o600
+
+
+def test_password_never_reaches_the_command_line(
+    workspace: Path, config: Path, vault: type[FakeVault]
+) -> None:
+    """The password goes in the request body, never argv or the environment."""
+    write_config(config, '["lab"]\nurl = "https://ov.example.com"\nuser = "jasper"\n')
+
+    out = run_pty(["--login", "lab"], [("Password", "hunter2\n")])
+
+    assert vault.seen["login"][0]["password"] == "hunter2"
+    # And it is not echoed back to the terminal.
+    assert "hunter2" not in out, out
+
+
+def test_failed_vault_login_stores_nothing(
+    workspace: Path, config: Path, vault: type[FakeVault]
+) -> None:
+    """Bad credentials leave no token behind."""
+    write_config(config, '["lab"]\nurl = "https://ov.example.com"\nuser = "jasper"\n')
+
+    out = run_pty(["--login", "lab"], [("Password", "wrong\n")])
+
+    assert "Vault login failed" in out, out
+    assert not token_path(workspace).exists()
+    assert not (workspace / "vault-token").exists()
+
+
+def test_mint_failure_is_reported_and_stores_nothing(
+    workspace: Path, config: Path, vault: type[FakeVault]
+) -> None:
+    """A role the entity cannot read is named rather than silently skipped."""
+    write_config(config, LAB)
+    give_session(workspace, vault)
+    vault.mint_status = 500
+
+    result = run(["--login", "lab"])
+
+    assert result.returncode == 1
+    assert "could not mint" in result.stderr
+    assert not token_path(workspace).exists()
+
+
+def test_empty_mint_is_refused(
+    workspace: Path, config: Path, vault: type[FakeVault]
+) -> None:
+    """Vault answering 200 with no token must not store an empty credential."""
+    write_config(config, LAB)
+    give_session(workspace, vault)
+    vault.token = ""
+
+    result = run(["--login", "lab"])
+
+    assert result.returncode == 1
+    assert not token_path(workspace).exists()
+
+
+def test_token_without_an_exp_is_refused(
+    workspace: Path, config: Path, vault: type[FakeVault]
+) -> None:
+    """Without exp ovx cannot re-mint ahead of time, so it will not store it."""
+    write_config(config, LAB)
+    give_session(workspace, vault)
+    header = base64.urlsafe_b64encode(b'{"alg":"RS256"}').rstrip(b"=").decode()
+    body = base64.urlsafe_b64encode(b'{"aud":"openviking"}').rstrip(b"=").decode()
+    vault.token = f"{header}.{body}.sig"
+
+    result = run(["--login", "lab"])
+
+    assert result.returncode == 1
+    assert "exp" in result.stderr
+    assert not token_path(workspace).exists()
+
+
+# --- using a stored token -------------------------------------------------
+
+
+def test_stored_token_becomes_the_api_key(
+    workspace: Path, config: Path, vault: type[FakeVault]
+) -> None:
+    """The JWT travels in api_key: ov has no bearer field and needs none.
+
+    OpenViking's _extract_token treats a two-dot api_key as a JWT, so the
+    transport is unchanged from the api-key case.
+    """
+    write_config(config, LAB)
+    token = make_jwt()
+    write_token(workspace, token)
+
+    run(["lab", "status"], OV_KEY="from-the-profile")
+
+    assert shim_log(workspace).config["api_key"] == token
+    assert token.count(".") == 2
 
 
 def test_stored_token_outranks_the_profile_api_key(
-    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+    workspace: Path, config: Path, vault: type[FakeVault]
 ) -> None:
     """A logged-in profile ignores its own api_key rather than sending a stale one."""
-    url, _seen = oauth_server
-    write_config(config, f'["lab"]\nurl = "{url}"\napi_key = "static-key"\n')
-    run(["--login", "lab"])
+    write_config(config, LAB)
+    write_token(workspace, make_jwt())
 
-    run(["lab", "health"])
+    run(["lab", "status"], OV_KEY="static-key")
 
-    assert shim_log(workspace).config["api_key"] == "ovat_first"
+    assert shim_log(workspace).config["api_key"] != "static-key"
 
 
-def test_expired_token_is_refreshed_before_use(
-    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+def test_live_token_is_not_reminted(
+    workspace: Path, config: Path, vault: type[FakeVault]
 ) -> None:
-    """An expired access token is exchanged for a fresh one, and the file updated."""
-    url, seen = oauth_server
-    write_config(config, f'["lab"]\nurl = "{url}"\n')
-    run(["--login", "lab"])
+    """A token with time left is used as-is; no Vault round trip per command."""
+    write_config(config, LAB)
+    write_token(workspace, make_jwt(expires_in=3600))
 
-    stored = token_path(workspace)
-    record = json.loads(stored.read_text())
-    record["expires_at"] = int(time.time()) - 10
-    stored.write_text(json.dumps(record))
+    run(["lab", "status"], OV_KEY="unused")
 
-    result = run(["lab", "health"])
-
-    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-    assert shim_log(workspace).config["api_key"] == "ovat_refreshed"
-    grants = [form["grant_type"] for form in seen["token"]]
-    assert "refresh_token" in grants, grants
-    # The rotated refresh token replaces the old one, or the next refresh fails.
-    assert json.loads(stored.read_text())["refresh_token"] == "ovrt_refreshed"
+    assert "mint" not in vault.seen
 
 
-def test_unexpired_token_is_not_refreshed(
-    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+@pytest.mark.parametrize(
+    ("expires_in", "reminted"),
+    [
+        (3600, False),  # comfortably live
+        (600, False),  # outside the 300s window
+        (120, True),  # inside it
+        (-10, True),  # already gone
+    ],
+)
+def test_the_renewal_window_is_five_minutes(
+    expires_in: int,
+    reminted: bool,
+    workspace: Path,
+    config: Path,
+    vault: type[FakeVault],
 ) -> None:
-    """A live token is used as-is; ovx does not spend a round trip per command."""
-    url, seen = oauth_server
-    write_config(config, f'["lab"]\nurl = "{url}"\n')
-    run(["--login", "lab"])
+    """Pin the skew both sides, so narrowing or widening it is a test failure.
 
-    run(["lab", "health"])
+    Too narrow and a long ov command outlives its token; too wide and every
+    run pays for a mint it did not need.
+    """
+    write_config(config, LAB)
+    write_token(workspace, make_jwt(expires_in=expires_in))
+    give_session(workspace, vault)
 
-    assert [form["grant_type"] for form in seen["token"]] == ["authorization_code"]
+    run(["lab", "status"], OV_KEY="unused")
+
+    assert ("mint" in vault.seen) is reminted
 
 
-def test_logout_revokes_and_removes_the_token(
-    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+def test_expiring_token_is_reminted_before_use(
+    workspace: Path, config: Path, vault: type[FakeVault]
 ) -> None:
-    """Logout tells the server to revoke, then deletes the local file."""
-    url, seen = oauth_server
-    write_config(config, f'["lab"]\nurl = "{url}"\n')
-    run(["--login", "lab"])
+    """A token near expiry is replaced silently, and the file updated.
 
-    result = run(["--logout", "lab"])
+    Identity tokens cannot be refreshed — there is no grant to exchange — so
+    renewal is a fresh mint against the live Vault session.
+    """
+    write_config(config, LAB)
+    write_token(workspace, make_jwt(expires_in=30))
+    give_session(workspace, vault)
+    vault.token = make_jwt(expires_in=3600, account="jasper")
+    fresh = vault.token
 
-    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-    assert not token_path(workspace).exists()
-    assert seen["revoke"]["token"] == "ovrt_first"
-    assert seen["revoke"]["token_type_hint"] == "refresh_token"
+    result = run(["lab", "status"], OV_KEY="unused")
+
+    assert result.returncode == 0, result.stderr
+    assert shim_log(workspace).config["api_key"] == fresh
+    assert json.loads(token_path(workspace).read_text())["token"] == fresh
 
 
-def test_logout_removes_the_token_when_the_server_is_gone(
-    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+def test_remint_is_silent(workspace: Path, config: Path, vault: type[FakeVault]) -> None:
+    """Renewal must be invisible while the Vault session is alive."""
+    write_config(config, LAB)
+    write_token(workspace, make_jwt(expires_in=30))
+    give_session(workspace, vault)
+
+    result = run(["lab", "status"], OV_KEY="unused")
+
+    assert result.stderr.strip() == "", result.stderr
+
+
+def test_expired_token_without_a_session_says_run_login(
+    workspace: Path, config: Path, vault: type[FakeVault]
 ) -> None:
-    """A server that cannot be reached must not leave a token undeletable."""
-    url, _seen = oauth_server
-    write_config(config, f'["lab"]\nurl = "{url}"\n')
-    run(["--login", "lab"])
+    """A lapsed Vault session gets an instruction, not an obscure failure."""
+    write_config(config, LAB)
+    write_token(workspace, make_jwt(expires_in=-10))
 
-    stored = token_path(workspace)
-    record = json.loads(stored.read_text())
-    # Port 9 is discard: it refuses or blackholes, so the revoke cannot succeed.
-    record["revocation_endpoint"] = "http://127.0.0.1:9/revoke"
-    stored.write_text(json.dumps(record))
+    result = run(["lab", "status"], OV_KEY="unused")
 
-    result = run(["--logout", "lab"])
-
-    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-    assert not stored.exists()
+    assert result.returncode != 0
+    assert "Vault session is gone" in result.stderr
+    assert "ovx --login lab" in result.stderr
 
 
-def test_logout_without_a_login_is_not_an_error(
-    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+def test_expired_token_without_vault_addr_is_explained(
+    workspace: Path, config: Path, vault: type[FakeVault]
 ) -> None:
-    """Logging out twice is the same as logging out once."""
-    url, _seen = oauth_server
-    write_config(config, f'["lab"]\nurl = "{url}"\n')
+    """Losing $VAULT_ADDR after logging in explains it rather than 401ing."""
+    write_config(config, LAB)
+    write_token(workspace, make_jwt(expires_in=-10))
+
+    result = run(["lab", "status"], OV_KEY="unused", VAULT_ADDR="")
+
+    assert result.returncode != 0
+    assert "VAULT_ADDR is not set" in result.stderr
+
+
+# --- a login that exists but cannot be used -------------------------------
+#
+# Every case here must ABORT, never fall back to the profile's api_key.
+# Falling back would quietly swap a short-lived identity token for a
+# long-lived static key resolving to a different caller, and the only visible
+# sign would be a different identity on the server.
+
+
+@pytest.mark.parametrize(
+    ("name", "body"),
+    [
+        ("corrupt json", "{ broken"),
+        ("empty file", ""),
+        ("a list, not an object", "[]"),
+        ("a bare string", '"hello"'),
+        ("token is not a string", '{"token": 123, "expires_at": 99999999999}'),
+        ("no token at all", '{"expires_at": 99999999999}'),
+        ("expiry is not a number", '{"token": "a.b.c", "expires_at": "soon"}'),
+        ("no expiry", '{"token": "a.b.c"}'),
+    ],
+)
+def test_an_unusable_token_file_aborts_and_never_downgrades(
+    name: str,
+    body: str,
+    workspace: Path,
+    config: Path,
+    vault: type[FakeVault],
+) -> None:
+    """A broken login is refused, with a message and no traceback."""
+    write_config(config, LAB)
+    path = token_path(workspace)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+
+    result = run(["lab", "status"], OV_KEY="static-fallback-key")
+
+    assert result.returncode != 0, f"{name}: should not have succeeded"
+    assert not shim_log(workspace).ran, f"{name}: ov ran with the fallback key"
+    assert "Traceback" not in result.stderr, f"{name}: {result.stderr}"
+    assert "ovx --login" in result.stderr, f"{name}: {result.stderr}"
+
+
+def test_oauth_era_token_file_is_rejected_with_advice(
+    workspace: Path, config: Path, vault: type[FakeVault]
+) -> None:
+    """A token stored by the OAuth build cannot work and says what to do.
+
+    Its ovat_ token is not a JWT and OpenViking's OAuth now answers 503, so
+    carrying on would fail later with a bare error.
+    """
+    write_config(config, LAB)
+    path = token_path(workspace)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "profile": "lab",
+                "access_token": "ovat_old",
+                "refresh_token": "ovrt_old",
+                "expires_at": int(time.time()) + 3600,
+            }
+        )
+    )
+
+    result = run(["lab", "status"], OV_KEY="static-fallback-key")
+
+    assert result.returncode != 0
+    assert "predates Vault identity tokens" in result.stderr
+    assert not shim_log(workspace).ran
+
+
+# --- logout ---------------------------------------------------------------
+
+
+def test_logout_removes_the_token_and_calls_nothing(
+    workspace: Path, config: Path, vault: type[FakeVault]
+) -> None:
+    """There is nothing to revoke, so logout is a local delete and no more.
+
+    Revoking the Vault session would destroy it for every other tool on the
+    machine, and an identity token has no server-side revoke of its own.
+    """
+    write_config(config, LAB)
+    write_token(workspace, make_jwt())
+    give_session(workspace, vault)
 
     result = run(["--logout", "lab"])
 
     assert result.returncode == 0, result.stderr
+    assert not token_path(workspace).exists()
+    assert vault.seen == {}
+    # The Vault session itself survives.
+    assert (workspace / "vault-token").exists()
+
+
+def test_logout_without_a_login_is_not_an_error(
+    workspace: Path, config: Path, vault: type[FakeVault]
+) -> None:
+    """Logging out twice is the same as logging out once."""
+    write_config(config, LAB)
+
+    result = run(["--logout", "lab"])
+
+    assert result.returncode == 0
     assert "no stored login" in result.stderr
 
 
+def test_logout_leaves_other_profiles_alone(
+    workspace: Path, config: Path, vault: type[FakeVault]
+) -> None:
+    """One profile's logout does not touch another's stored token."""
+    write_config(
+        config,
+        '["lab"]\nurl = "https://ov.example.com"\n'
+        '["prod"]\nurl = "https://ov.example.org"\n',
+    )
+    write_token(workspace, make_jwt(), name="lab")
+    write_token(workspace, make_jwt(), name="prod")
+
+    run(["--logout", "lab"])
+
+    assert not token_path(workspace, "lab").exists()
+    assert token_path(workspace, "prod").exists()
+
+
+@pytest.mark.parametrize("evil", ["../../pwned", "a/b", ".", ".."])
+def test_a_profile_name_that_is_a_path_is_refused(
+    evil: str, workspace: Path, config: Path, vault: type[FakeVault]
+) -> None:
+    """A profile name is a TOML key, so it can be anything the operator types.
+
+    Interpolated straight into the token path, ``ovx --logout '../../x'``
+    would rm -f outside the token directory.
+    """
+    write_config(config, f'["{evil}"]\nurl = "https://ov.example.com"\n')
+    canary = workspace / "pwned.json"
+    canary.write_text("do not delete")
+
+    result = run(["--logout", evil], OVX_DIR=str(workspace / "ovx"))
+
+    assert result.returncode != 0
+    assert "must not contain a path" in result.stderr
+    assert canary.exists()
+
+
+def test_after_logout_a_keyless_profile_says_how_to_log_back_in(
+    workspace: Path, config: Path, vault: type[FakeVault]
+) -> None:
+    """Ov's own 401 does not mention logging in, so ovx does.
+
+    This is the state right after --logout on an oidc server: no token, and no
+    api_key to fall back to.
+    """
+    write_config(config, '["lab"]\nurl = "https://ov.example.com"\n')
+    write_token(workspace, make_jwt())
+    run(["--logout", "lab"])
+
+    result = run(["lab", "status"])
+
+    assert "no stored login" in result.stderr
+    assert "ovx --login lab" in result.stderr
+
+
+def test_a_profile_with_a_key_and_no_login_stays_quiet(
+    workspace: Path, config: Path, vault: type[FakeVault]
+) -> None:
+    """The hint is for the keyless case; a $VAR profile is working as designed."""
+    write_config(config, LAB)
+
+    result = run(["lab", "status"], OV_KEY="a-real-key")
+
+    assert "no stored login" not in result.stderr
+
+
+# --- shape of the command ------------------------------------------------
+
+
 def test_login_and_logout_do_not_need_ov(
-    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+    workspace: Path, config: Path, vault: type[FakeVault]
 ) -> None:
     """Neither runs ov, so neither should require it to be installed."""
-    url, _seen = oauth_server
-    write_config(config, f'["lab"]\nurl = "{url}"\n')
+    write_config(config, LAB)
+    give_session(workspace, vault)
     (workspace / "bin" / "ov").unlink()
 
     assert run(["--login", "lab"]).returncode == 0
     assert run(["--logout", "lab"]).returncode == 0
 
 
-def test_login_rejects_a_mismatched_state(
-    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
-) -> None:
-    """A redirect carrying someone else's state is refused, not exchanged."""
-    url, seen = oauth_server
-    write_config(config, f'["lab"]\nurl = "{url}"\n')
-    FakeOpenViking.corrupt_state = True
-
-    result = run(["--login", "lab"])
-
-    assert result.returncode != 0
-    assert "state mismatch" in result.stderr, result.stderr
-    assert not token_path(workspace).exists()
-    # And it stopped before spending the code, rather than exchanging first.
-    assert "token" not in seen, seen
-
-
 def test_login_on_unknown_profile_is_rejected(
-    workspace: Path, config: Path, oauth_server: tuple[str, dict[str, Any]]
+    workspace: Path, config: Path, vault: type[FakeVault]
 ) -> None:
-    """A typo names a profile that does not exist rather than starting a flow."""
-    url, _seen = oauth_server
-    write_config(config, f'["lab"]\nurl = "{url}"\n')
+    """A typo names a profile that does not exist rather than reaching Vault."""
+    write_config(config, LAB)
+    give_session(workspace, vault)
 
     result = run(["--login", "nope"])
 
-    assert result.returncode != 0
-    assert "not found" in result.stderr
+    assert result.returncode == 1
+    assert "profile 'nope' not found" in result.stderr
+    assert vault.seen == {}
+
+
+def test_no_oauth_machinery_remains() -> None:
+    """The OAuth flow is gone, not merely unused.
+
+    OpenViking's OAuth subsystem answers 503 on every endpoint, so a leftover
+    call would be a guaranteed failure rather than a fallback.
+    """
+    source = OVX.read_text()
+    for dead in (
+        "/oauth/authorize",
+        "/.well-known/oauth-authorization-server",
+        "registration_endpoint",
+        "code_challenge",
+        "code_verifier",
+        "refresh_token",
+        "token_endpoint",
+        "revocation_endpoint",
+        "studio/oauth",
+    ):
+        assert dead not in source, f"{dead} still appears in ovx.sh"
+
+
+def test_the_vault_cli_is_not_a_dependency() -> None:
+    """Ovx must not shell out to `vault`; it speaks the HTTP API itself."""
+    source = OVX.read_text()
+    for dead in ("command -v vault", "vault token lookup", "vault read -field"):
+        assert dead not in source, f"{dead} still appears in ovx.sh"
 
 
 # --- install.sh ----------------------------------------------------------
@@ -1303,3 +1702,27 @@ def test_no_stable_release_is_a_clear_error(
     assert result.returncode != 0
     assert "found no published ovx-v* release" in result.stderr
     assert "--version" in result.stderr
+
+
+def test_the_token_is_not_exported_into_ovs_environment(
+    workspace: Path, config: Path, vault: type[FakeVault]
+) -> None:
+    """Only the temp ovcli.conf carries the token, never ov's environment.
+
+    An exported credential is readable from ``/proc/<pid>/environ`` or ``ps -E``
+    by anything running as this user, and ov has no need of it — it reads the
+    config file ovx points it at.
+    """
+    write_config(config, LAB)
+    token = make_jwt()
+    write_token(workspace, token)
+
+    shim = workspace / "bin" / "ov"
+    shim.write_text(
+        '#!/usr/bin/env bash\necho "OVX_TOKEN=${OVX_TOKEN:-<unset>}" >> "$OVX_TEST_LOG"\n'
+    )
+    shim.chmod(0o755)
+
+    run(["lab", "status"], OV_KEY="unused")
+
+    assert "OVX_TOKEN=<unset>" in (workspace / "shim.log").read_text()
