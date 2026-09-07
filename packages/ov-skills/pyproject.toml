@@ -1,0 +1,71 @@
+# ov-skills ships markdown skills and a bash installer, not a Python package.
+# This file exists so its test suite has an environment and a lint/type config;
+# nothing is built or installed.
+#
+# Like ovx, ov-skills is deliberately NOT a member of the root uv workspace
+# (the root pyproject excludes it). A workspace resolves to one Python floor
+# across all members, and ov-postgres still supports 3.10 while these tests use
+# 3.11+. Standing alone, ov-skills keeps its own lock and its own floor.
+[project]
+name = "ov-skills"
+# Inert placeholder, not the released version. uv rejects a [project] table
+# without one, but nothing is built from this file: ov-skills releases as a
+# tarball of skills/ and its version lives in the git tag. A real number here
+# would be a second version string, free to disagree with the tag and never
+# noticed.
+version = "0"
+description = "OpenViking session-workflow skills for Claude Code, opencode, and Hermes."
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "mypy>=1.11",
+    "pytest>=8",
+    "pyyaml>=6",
+    "ruff>=0.6",
+    "types-pyyaml>=6",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# One test installs from GitHub to prove the download path works. It needs the
+# network, so it stays out of the default run; ask for it with
+# `uv run pytest -m integration`.
+addopts = "-m 'not integration'"
+markers = [
+    "integration: needs network access to GitHub",
+]
+
+[tool.ruff]
+line-length = 90
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade -- enforces modern union/generic syntax
+    "B",    # bugbear
+    "D",    # pydocstyle -- enforces the docstring rule
+    "ANN",  # flake8-annotations -- enforces the type-hint rule
+    "RUF",
+]
+ignore = [
+    "D107",    # __init__ docstring; numpy documents params on the class
+    "D203",    # incompatible with D211
+    "D213",    # incompatible with D212
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+files = ["tests"]

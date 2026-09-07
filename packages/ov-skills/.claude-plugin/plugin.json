@@ -1,0 +1,15 @@
+{
+  "name": "ov-skills",
+  "description": "Session-workflow skills for OpenViking: /handoff and /continue to carry work across sessions, /learnings to keep what a session taught, /ingest to import a source. Skills only — it uses whatever OpenViking MCP connection the harness already has.",
+  "version": "0.0.0",
+  "repository": "https://github.com/JasperHG90/openviking_extensions",
+  "license": "AGPL-3.0-only",
+  "keywords": [
+    "openviking",
+    "memory",
+    "handoff",
+    "session",
+    "skills"
+  ],
+  "skills": "./skills/"
+}

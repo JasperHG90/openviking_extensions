@@ -72,6 +72,10 @@ jobs:
               - packages/ovx/**
               - .pre-commit-config.yaml
               - .github/**
+            ov-skills:
+              - packages/ov-skills/**
+              - .pre-commit-config.yaml
+              - .github/**
 
       # Split the changed set by which template can build each package: a
       # Python package gets a wheel built and imported, a shell package gets
@@ -88,7 +92,9 @@ jobs:
         run: |
           set -euo pipefail
           ALL_PYTHON='["ov-postgres"]'
-          ALL_SHELL='["ovx"]'
+          # ov-skills ships markdown and bash, so it takes the shell template:
+          # its installer has to work on the bash 3.2 macOS still ships.
+          ALL_SHELL='["ovx", "ov-skills"]'
 
           if [ "$EVENT" = "workflow_dispatch" ]; then
             changed=$(jq -c -n --argjson p "$ALL_PYTHON" --argjson s "$ALL_SHELL" '$p + $s')

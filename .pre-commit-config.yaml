@@ -16,6 +16,10 @@ repos:
         name: shellcheck (ovx)
         files: ^packages/ovx/.*\.sh$
 
+      - id: shellcheck
+        name: shellcheck (ov-skills)
+        files: ^packages/ov-skills/.*\.sh$
+
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.18.2
     hooks:
@@ -34,6 +38,14 @@ repos:
         additional_dependencies:
           - pytest>=8
         args: [--config-file=packages/ovx/pyproject.toml]
+
+      - id: mypy
+        name: mypy (ov-skills)
+        files: ^packages/ov-skills/tests/
+        additional_dependencies:
+          - pytest>=8
+          - types-pyyaml>=6
+        args: [--config-file=packages/ov-skills/pyproject.toml]
 
   - repo: local
     hooks:
@@ -55,3 +67,12 @@ repos:
         language: system
         pass_filenames: false
         files: ^packages/ovx/
+
+      # Same again: what ov-skills tests is markdown and shell, so the trigger
+      # cannot be limited to Python files either.
+      - id: pytest-unit-ov-skills
+        name: pytest (ov-skills, unit)
+        entry: uv run --directory packages/ov-skills pytest
+        language: system
+        pass_filenames: false
+        files: ^packages/ov-skills/

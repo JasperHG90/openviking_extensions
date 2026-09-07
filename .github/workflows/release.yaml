@@ -11,6 +11,7 @@ on:
         options:
           - ov-postgres
           - ovx
+          - ov-skills
       increment:
         description: "Bump of the package's newest tag; ignored when version is set."
         type: choice
@@ -60,14 +61,14 @@ jobs:
   # shell package has to be added in both.
   test:
     needs: guard
-    if: ${{ !contains(fromJSON('["ovx"]'), inputs.package) }}
+    if: ${{ !contains(fromJSON('["ovx", "ov-skills"]'), inputs.package) }}
     uses: ./.github/workflows/template-check.yaml
     with:
       package: ${{ inputs.package }}
 
   test-shell:
     needs: guard
-    if: ${{ contains(fromJSON('["ovx"]'), inputs.package) }}
+    if: ${{ contains(fromJSON('["ovx", "ov-skills"]'), inputs.package) }}
     uses: ./.github/workflows/template-check-shell.yaml
     with:
       package: ${{ inputs.package }}
@@ -215,16 +216,16 @@ jobs:
           fetch-depth: 0
 
       - uses: astral-sh/setup-uv@v6
-        if: ${{ !contains(fromJSON('["ovx"]'), inputs.package) }}
+        if: ${{ !contains(fromJSON('["ovx", "ov-skills"]'), inputs.package) }}
         with:
           version: ${{ env.UV_VERSION }}
 
       - name: Build package
-        if: ${{ !contains(fromJSON('["ovx"]'), inputs.package) }}
+        if: ${{ !contains(fromJSON('["ovx", "ov-skills"]'), inputs.package) }}
         run: uv build --package ${{ inputs.package }}
 
       - name: Verify the built version matches the tag
-        if: ${{ !contains(fromJSON('["ovx"]'), inputs.package) }}
+        if: ${{ !contains(fromJSON('["ovx", "ov-skills"]'), inputs.package) }}
         env:
           VERSION: ${{ needs.release.outputs.version }}
           PACKAGE: ${{ inputs.package }}
@@ -240,7 +241,7 @@ jobs:
       # <PACKAGE>_VERSION="dev" in a checkout, and the release ships a copy
       # reporting the tag. The version still lives only in the tag.
       - name: Package the shell script
-        if: ${{ contains(fromJSON('["ovx"]'), inputs.package) }}
+        if: ${{ inputs.package == 'ovx' }}
         env:
           VERSION: ${{ needs.release.outputs.version }}
           PACKAGE: ${{ inputs.package }}
@@ -269,6 +270,62 @@ jobs:
           echo "planned=$PACKAGE $VERSION got=$got"
           test "$got" = "$PACKAGE $VERSION"
           grep -q "^PINNED_VERSION=\"$VERSION\"\$" dist/install.sh
+
+      # ov-skills is markdown, not a script, so there is nothing to stamp a
+      # version into and nothing to run. It ships as a tarball whose root holds
+      # skills/ and the Claude Code manifest -- the shape install.sh unpacks,
+      # and a drop-in plugin directory for anyone who would rather unpack it by
+      # hand.
+      - name: Package the skills
+        if: ${{ inputs.package == 'ov-skills' }}
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist stage
+          cp -R packages/ov-skills/skills stage/skills
+          cp -R packages/ov-skills/.claude-plugin stage/.claude-plugin
+
+          # The manifest carries 0.0.0 in the repository for the same reason
+          # ovx.sh carries "dev": the version lives in the git tag, and a real
+          # number committed to the file would be free to disagree with it.
+          python3 - "$VERSION" <<'PY'
+          import json, pathlib, sys
+          path = pathlib.Path("stage/.claude-plugin/plugin.json")
+          manifest = json.loads(path.read_text())
+          manifest["version"] = sys.argv[1]
+          path.write_text(json.dumps(manifest, indent=2) + "\n")
+          PY
+
+          # Pin the shipped installer to this release. Unstamped it would look
+          # the newest release up over the API; someone who downloaded the pair
+          # from a release page expects to get that pair, not whatever is
+          # newest by the time they run it.
+          sed "s|^PINNED_VERSION=.*|PINNED_VERSION=\"$VERSION\"|" \
+            packages/ov-skills/install.sh > dist/install.sh
+          chmod 755 dist/install.sh
+
+          tar -czf dist/ov-skills.tar.gz -C stage skills .claude-plugin
+
+          # Check the stamps rather than trust them: both are edits against
+          # lines that could be renamed at any time, so a tagged release must
+          # never ship a manifest saying 0.0.0 or an installer pointing at the
+          # wrong release.
+          grep -q "^PINNED_VERSION=\"$VERSION\"\$" dist/install.sh
+          test "$(python3 -c 'import json;print(json.load(open("stage/.claude-plugin/plugin.json"))["version"])')" = "$VERSION"
+
+          # Unpack the tarball exactly as install.sh does. This is the one
+          # check that the archive's root really is skills/ -- the shape the
+          # installer's `tar -xz -C "$tmp"` relies on. A --local install would
+          # take the cp path instead and prove nothing about the archive.
+          mkdir -p "$RUNNER_TEMP/unpack"
+          tar -xzf dist/ov-skills.tar.gz -C "$RUNNER_TEMP/unpack"
+          test -f "$RUNNER_TEMP/unpack/skills/handoff/SKILL.md"
+          test -x "$RUNNER_TEMP/unpack/skills/handoff/scripts/ov-handoff-path.sh"
+
+          # Then install from it, so the stamped installer is exercised too.
+          bash dist/install.sh --local "$RUNNER_TEMP/unpack" --to "$RUNNER_TEMP/verify"
+          test -f "$RUNNER_TEMP/verify/handoff/SKILL.md"
 
       - name: Create GitHub Release
         env:
