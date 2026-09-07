@@ -720,3 +720,67 @@ def test_bind_prefers_a_stored_login_over_the_api_key(tmp_path: Path) -> None:
 
     written = json.loads(Path(env["OPENVIKING_CLI_CONFIG_FILE"]).read_text())
     assert written["api_key"] == jwt, "bind wrote the static key over the login"
+
+
+# --- login offers to bind ------------------------------------------------
+
+
+def test_login_offers_to_bind_only_where_it_can_ask(tmp_path: Path) -> None:
+    """No terminal means no prompt: in a script, silence is not consent."""
+    import inspect
+
+    from ovx import cli
+
+    source = inspect.getsource(cli._offer_to_bind)
+    assert "_has_tty()" in source, "the offer can fire without a terminal"
+
+
+def test_the_bind_offer_defaults_to_no() -> None:
+    """A stray Enter must not leave a credential on disk.
+
+    Binding undoes the one guarantee ovx makes, so the safe answer is the
+    default and saying yes is deliberate.
+    """
+    import inspect
+
+    from ovx import cli
+
+    source = inspect.getsource(cli._offer_to_bind)
+    assert '("y", "yes")' in source, "the offer no longer requires an explicit yes"
+    assert "[y/N]" in source, "the prompt no longer shows which way it defaults"
+
+
+@pytest.mark.parametrize(
+    ("args", "leftover"),
+    [
+        (["-L", "lab", "--no-bind"], "--no-bind"),
+        (["--logout", "lab", "--bind"], "--bind"),
+        (["-l", "lab", "extra"], "extra"),
+    ],
+)
+def test_a_command_that_never_runs_ov_refuses_leftover_args(
+    args: list[str], leftover: str, tmp_path: Path
+) -> None:
+    """Otherwise the flag lands on ov's side of the split and is discarded.
+
+    `ovx -L lab --no-bind` prompted anyway, because --no-bind came after the
+    profile name and so belonged to an ov that never ran.
+    """
+    config = tmp_path / "config.toml"
+    config.write_text('["lab"]\nurl = "https://x"\n')
+    result = subprocess.run(
+        [str(Path(sys.executable).parent / "ovx"), *args],
+        env={
+            **os.environ,
+            "OVX_DIR": str(tmp_path / "ovx"),
+            "OVX_CONFIG_FILE": str(config),
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "does not run ov" in result.stderr, result.stderr
+    assert leftover in result.stderr
+    assert "before the profile name" in result.stderr

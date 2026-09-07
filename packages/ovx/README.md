@@ -60,6 +60,8 @@ ovx -d lab             # delete `lab`, after confirmation
 ovx -l                 # list profiles
 ovx -L lab             # log in to `lab` through Vault, store the token
 ovx --logout lab       # forget `lab`'s stored login
+ovx -L --bind lab      # log in and bind, without being asked
+ovx -L --no-bind lab   # log in and skip the offer
 ovx --bind lab         # write `lab` to ov's own config, for other tools
 ovx --unbind           # take that config back off disk
 ovx -V                 # show the ovx version
@@ -109,6 +111,15 @@ your home directory. `ovx` says so when you bind, and if it wrote a Vault
 token it tells you when that expires — a bound token goes stale and needs
 `--bind` again.
 
+A successful `ovx --login` offers to bind, because a fresh token is when it
+is most worth doing — and wanting a bare `ov` or an agent to reach the profile
+is usually why you logged in. The offer defaults to **no**: binding undoes the
+one guarantee `ovx` makes, so a stray Enter must not leave a credential on
+disk. Pass `--bind` to say yes without being asked, or `--no-bind` to skip the
+question. Both go *before* the profile name, since everything after it belongs
+to `ov`. If the profile is already bound, a login re-binds without asking, so
+the refreshed token actually reaches the file.
+
 `ovx --unbind` removes it. It will only remove a file `ovx` itself wrote:
 `ov`'s config path may well have been set up by hand long before `ovx`
 existed, and deleting that on your behalf would be an unpleasant surprise.
@@ -120,9 +131,13 @@ token, so a profile can work with no API key at all:
 
 ```
 $ ovx -L lab
-ovx: no Vault session; logging in as 'jasper'.
-Password for jasper:
+ovx: no Vault session.
+Vault username [jasper]: operator
+Password for operator:
 ovx: logged in. Token stored for profile 'lab'.
+ovx: bind this profile to ov's config, so a bare 'ov' and other tools can use it?
+     The credential then stays on disk until 'ovx --unbind'.
+Bind [y/N]:
 ```
 
 **All it needs is `$VAULT_ADDR`.** `ovx` talks to Vault's HTTP API itself, so the
@@ -159,10 +174,12 @@ or a log. It cannot be piped in, deliberately.
 The token lands at `~/.ovx/tokens/lab.json`, mode `600`. It is an RS256 JWT
 carrying an `ov_account` claim, which is how the server works out who you are.
 
-> The profile's `user` field doubles as your **Vault** username when `ovx` has
-> to log in. Its `account` and `user` are no longer consulted for OpenViking
-> identity — that comes from the token's claims — but `user` still picks the
-> Vault account, and `ovx` prints which one it is using before asking.
+> The profile's `user` field is *offered* as the Vault username, not used
+> outright. OpenViking stopped reading it for identity — that comes from the
+> token's claims — so it drifts, and Vault's userpass is case-sensitive. Using
+> it silently meant typing a real password at a prompt for an account that did
+> not exist, and getting back a bare "invalid username or password". Press
+> Enter to accept it, or type the right one.
 
 A stored token outranks the profile's own `api_key`, so a profile can carry
 both; the key stays as a fallback for when you have not logged in.

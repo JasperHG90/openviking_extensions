@@ -98,6 +98,7 @@ KNOWN_OPTIONS = frozenset(
         "--logout",
         "--bind",
         "--unbind",
+        "--no-bind",
         "--install-firefox-host",
         "--uninstall-firefox-host",
         "-V",
@@ -172,8 +173,19 @@ def _resolve_profile(locations: Locations, name: str | None, action: str) -> str
     return name
 
 
-def _login(locations: Locations, name: str) -> None:
-    """Mint a Vault identity token for ``name`` and store it."""
+def _login(locations: Locations, name: str, *, bind_after: bool | None = None) -> None:
+    """Mint a Vault identity token for ``name`` and store it.
+
+    Parameters
+    ----------
+    locations :
+        Where ovx keeps its config and tokens.
+    name :
+        Profile to log in for.
+    bind_after :
+        ``True`` to bind without asking, ``False`` to skip silently, ``None``
+        to offer it.
+    """
     if not vault.address():
         raise OvxError(
             "$VAULT_ADDR is not set, so ovx does not know which Vault to use",
@@ -203,6 +215,49 @@ def _login(locations: Locations, name: str) -> None:
     ensure_private_dir(locations.token_dir)
     tokens.save(locations.token_dir, name, token, chosen)
     print(f"ovx: logged in. Token stored for profile {name!r}.", file=sys.stderr)
+    _offer_to_bind(locations, name, bind_after)
+
+
+def _offer_to_bind(locations: Locations, name: str, decided: bool | None) -> None:
+    """Bind after a login, asking first unless the caller already decided.
+
+    A fresh token is exactly when binding is worth offering: it is the moment
+    the credential is newest, and the reason to bind -- letting a bare ``ov``
+    or an agent reach the profile -- is usually why someone logged in at all.
+
+    It is an offer rather than the default because binding undoes the one
+    guarantee ovx makes. The answer defaults to no for the same reason: a
+    stray Enter must not leave a credential on disk.
+    """
+    if decided is False:
+        return
+    if decided is True:
+        _bind(locations, name)
+        return
+
+    # Nobody said either way. Only ask where there is a terminal to ask on --
+    # in a script or a CI job, silence means no.
+    if not _has_tty():
+        return
+    if bind_module.read_binding(locations) is not None:
+        # Already bound. Re-bind without asking so the refreshed token
+        # actually reaches the file the last bind wrote.
+        _bind(locations, name)
+        return
+
+    from ovx.wizard import ask
+
+    print(
+        "ovx: bind this profile to ov's config, so a bare 'ov' and other "
+        "tools can use it?",
+        file=sys.stderr,
+    )
+    print(
+        "     The credential then stays on disk until 'ovx --unbind'.",
+        file=sys.stderr,
+    )
+    if str(ask("Bind [y/N]")).strip().lower() in ("y", "yes"):
+        _bind(locations, name)
 
 
 def _bind(locations: Locations, name: str) -> None:
@@ -375,6 +430,11 @@ def main(
     unbind_profile: bool = typer.Option(
         False, "--unbind", help="Remove the config --bind wrote."
     ),
+    no_bind: bool = typer.Option(
+        False,
+        "--no-bind",
+        help="With --login, do not offer to bind afterwards.",
+    ),
     install_firefox_host: bool = typer.Option(
         False,
         "--install-firefox-host",
@@ -413,6 +473,8 @@ def main(
       ovx -d lab             Delete profile 'lab', after confirmation
       ovx -L lab             Log in to 'lab' through Vault, token is stored
       ovx --logout lab       Forget 'lab's stored login
+      ovx -L --bind lab      Log in and bind, without being asked
+      ovx -L --no-bind lab   Log in and skip the offer
       ovx --bind lab         Write 'lab' to ov's own config, for other tools
       ovx --unbind           Take that config back off disk
       ovx -- -o json status  Pick a profile, forward '-o json status' to ov
@@ -463,6 +525,12 @@ def main(
       That credential is then persistent, which is the whole trade.
 
     \b
+      A successful --login offers to bind, since a fresh token is when it is
+      most worth doing. The offer defaults to no. Pass --bind to say yes
+      without being asked, or --no-bind to skip the question -- both before
+      the profile name, since everything after it belongs to ov.
+
+    \b
     Config: ~/.ovx/config.toml  (override with $OVX_CONFIG_FILE or $OVX_DIR)
     Format: TOML, one [profile] table per OpenViking instance. Keys are the
     keys of ovcli.conf:
@@ -486,6 +554,27 @@ def main(
     # context rather than in ctx.args -- click never saw them.
     ov_args: list[str] = list(ctx.obj or [])
 
+    # Everything after the profile name belongs to ov -- but these actions
+    # never run ov, so anything left over was silently discarded. `ovx -L lab
+    # --no-bind` put --no-bind on ov's side of the split and then prompted
+    # anyway, with nothing to say why.
+    standalone = (
+        list_profiles
+        or login
+        or logout
+        or bind_profile
+        or unbind_profile
+        or delete
+        or install_firefox_host
+        or uninstall_firefox_host
+    )
+    if standalone and ov_args:
+        leftover = " ".join(ov_args)
+        raise OvxError(
+            f"this command does not run ov, so it cannot forward {leftover!r}",
+            "ovx options go before the profile name: 'ovx -L --bind lab'.",
+        )
+
     if list_profiles:
         wizard.list_profiles(locations.config_file)
         raise typer.Exit
@@ -499,7 +588,7 @@ def main(
         print(f"ovx: unbound; removed {removed}.", file=sys.stderr)
         raise typer.Exit
 
-    if bind_profile:
+    if bind_profile and not login:
         name = _resolve_profile(locations, profile, "bind")
         _bind(locations, name)
         raise typer.Exit
@@ -508,7 +597,10 @@ def main(
         action = "log in to" if login else "log out of"
         name = _resolve_profile(locations, profile, action)
         if login:
-            _login(locations, name)
+            # --bind alongside --login means "yes, bind" rather than a
+            # separate action; --no-bind means "do not ask".
+            decided = True if bind_profile else (False if no_bind else None)
+            _login(locations, name, bind_after=decided)
         elif tokens.forget(locations.token_dir, name):
             print(
                 f"ovx: logged out of profile {name!r}. The token expires on its own.",
