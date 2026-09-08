@@ -43,6 +43,9 @@ repos:
           - pydantic>=2
           - pydantic-settings>=2
           - pytest>=7
+          # The reflection tests parse the shipped memory-type schema to prove
+          # it stays a valid one; PyYAML has no inline types.
+          - types-PyYAML
           # `rerank` imports requests to pool the rerank client's connection.
           - types-requests>=2.31
         args: [--config-file=packages/ov-ext/pyproject.toml]

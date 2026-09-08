@@ -58,15 +58,25 @@ def citation_map(uris: Sequence[str]) -> tuple[dict[str, int], dict[int, str]]:
 def parse_timestamp(value: object) -> datetime:
     """Coerce ``value`` into a timezone-aware UTC datetime.
 
-    Accepts a datetime or an ISO string, including the ``Z`` suffix that
-    ``datetime.fromisoformat`` rejects before 3.11. Falls back to the current
-    time rather than raising: a memory with an unreadable timestamp should
-    still be reflected on, just without contributing anything to recency.
+    Accepts a datetime, an ISO string (including the ``Z`` suffix that
+    ``datetime.fromisoformat`` rejects before 3.11), or a number.
+
+    A number is **epoch milliseconds**, which is how OpenViking encodes a
+    ``date_time`` field -- ``parse_datetime_to_epoch_ms`` in the backends
+    multiplies by 1000 on the way in, and the index hands the integer straight
+    back. Reading it as seconds, or failing to read it at all, silently stamps
+    every row with the current time: the watermark then advances to now on
+    every sweep, and every memory is shown to the model as having happened
+    today.
+
+    Falls back to the current time rather than raising for anything else: a
+    memory with an unreadable timestamp should still be reflected on, just
+    without contributing to recency.
 
     Parameters
     ----------
     value :
-        A datetime, an ISO-8601 string, or anything else.
+        A datetime, an ISO-8601 string, epoch milliseconds, or anything else.
 
     Returns
     -------
@@ -75,6 +85,17 @@ def parse_timestamp(value: object) -> datetime:
     """
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+    if isinstance(value, bool):
+        # bool is an int subclass; treating True as 1ms past the epoch would be
+        # a silent absurdity rather than an obvious one.
+        return datetime.now(timezone.utc)
+
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return datetime.now(timezone.utc)
 
     if isinstance(value, str):
         try:

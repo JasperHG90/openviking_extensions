@@ -7,7 +7,9 @@ removes memory types a deployment relies on.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -43,10 +45,11 @@ def config(monkeypatch: pytest.MonkeyPatch) -> FakeConfig:
     def get_openviking_config() -> FakeConfig:
         return fake
 
-    module = type("m", (), {"get_openviking_config": staticmethod(get_openviking_config)})
-    monkeypatch.setitem(
-        __import__("sys").modules, "openviking_cli.utils.config", module  # type: ignore[arg-type]
-    )
+    # A real module object rather than a class standing in for one, so the
+    # import inside the code under test resolves the way it would in production.
+    module = ModuleType("openviking_cli.utils.config")
+    module.get_openviking_config = get_openviking_config  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "openviking_cli.utils.config", module)
     return fake
 
 

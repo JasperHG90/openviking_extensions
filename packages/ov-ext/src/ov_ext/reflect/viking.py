@@ -180,7 +180,11 @@ class VikingStore:
                 PathScope("uri", self._memory_root),
                 Eq("context_type", "memory"),
                 Eq("level", 2),
-                TimeRange("updated_at", start=moment),
+                # ISO string, not a datetime: the backends coerce a
+                # `date_time` operand through `parse_datetime_to_epoch_ms`,
+                # which accepts a string or a number and rejects everything
+                # else outright.
+                TimeRange("updated_at", start=moment.isoformat()),
             ]
         )
         # Ascending, so `limit` truncates the *newest* rows rather than the

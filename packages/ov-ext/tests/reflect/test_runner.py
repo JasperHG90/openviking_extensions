@@ -108,9 +108,7 @@ async def test_a_sweep_that_advanced_stores_the_new_mark() -> None:
 
 async def test_a_sweep_resumes_from_the_stored_mark() -> None:
     """The whole point: the second sweep must not re-read the first one's work."""
-    mark = Watermark(
-        last_seen=datetime(1970, 1, 20, tzinfo=timezone.utc), swept_at=NOW
-    )
+    mark = Watermark(last_seen=datetime(1970, 1, 20, tzinfo=timezone.utc), swept_at=NOW)
     fs = FakeFS({STATE: mark.dumps()})
     db = FakeDB([changed_row(5)])  # older than the mark
 

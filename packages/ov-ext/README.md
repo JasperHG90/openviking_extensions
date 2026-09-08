@@ -342,6 +342,23 @@ converges on confirming itself.
 Ported from memex. `src/ov_ext/reflect/PROVENANCE.md` is the itemized
 accounting of what came across and what deliberately did not.
 
+### Proving it works
+
+The unit suite runs the whole sweep against in-memory stand-ins. That is not
+enough on its own: every adapter defect found in review was an assumption about
+OpenViking's API that a fake happily satisfied. So there is a second suite
+against the real thing — a real RAGFS filesystem, a real
+`VikingVectorIndexBackend`, the real `ov_postgres` adapter, and a real
+PostgreSQL with pgvector in a container:
+
+```bash
+uv run --directory packages/ov-ext pytest -m integration
+```
+
+It needs a container runtime; point `OV_POSTGRES_TEST_DSN` at an existing
+server to skip that. Only the model is scripted, which is what lets a test
+prove a fabricated quote never reaches the store.
+
 ## Layout
 
 | Module | Depends on OpenViking? |
