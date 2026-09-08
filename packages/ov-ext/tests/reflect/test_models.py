@@ -1,8 +1,13 @@
 """How a URI is reduced to the area of the store it belongs to.
 
-``peer`` decides whether an observation counts as connecting two bodies of
-work, so getting it wrong is quiet: too specific and every observation is
-trivially cross-peer, too broad and none ever is.
+``area`` decides whether an observation counts as connecting things written
+apart, so getting it wrong is quiet: too specific and every observation spans
+areas trivially, too broad and none ever does.
+
+The parent directory is used rather than a prefix rule, because no fixed depth
+survives the shapes real URIs take — a repository under
+``resources/github.com/<owner>/<repo>/`` sits five segments deep, an entity
+category three.
 """
 
 from __future__ import annotations
@@ -15,34 +20,53 @@ from .helpers import row
 @pytest.mark.parametrize(
     ("uri", "expected"),
     [
-        # The owner prefix is shared by everything, so it distinguishes nothing.
-        ("viking://user/jasper/memories/a.md", "memories"),
-        ("viking://user/jasper/memories/entities/a.md", "memories/entities"),
-        # Deep enough to separate two repositories under resources...
-        ("viking://user/jasper/resources/embedder/a.md", "resources/embedder"),
-        ("viking://user/jasper/resources/openviking/a.md", "resources/openviking"),
-        # ...and shallow enough that a deeper tree stays one area.
         (
-            "viking://user/jasper/resources/embedder/deep/nested/a.md",
-            "resources/embedder",
+            "viking://user/jasper/memories/entities/a.md",
+            "viking://user/jasper/memories/entities",
         ),
-        # Non-user roots keep their own shape.
-        ("viking://resources/shared/a.md", "resources/shared"),
-        ("viking://a.md", "root"),
+        (
+            "viking://user/jasper/memories/preferences/jasper/a.md",
+            "viking://user/jasper/memories/preferences/jasper",
+        ),
+        (
+            "viking://user/jasper/resources/github.com/acme/repo-a/README.md",
+            "viking://user/jasper/resources/github.com/acme/repo-a",
+        ),
     ],
 )
-def test_a_uri_reduces_to_its_area(uri: str, expected: str) -> None:
-    assert row(uri, "text").peer == expected
+def test_a_uri_reduces_to_its_directory(uri: str, expected: str) -> None:
+    assert row(uri, "text").area == expected
 
 
 def test_two_files_in_one_directory_are_one_area() -> None:
-    """Keeping the filename would make every memory its own peer."""
+    """Keeping the filename would make every memory its own area."""
     left = row("viking://user/jasper/memories/entities/a.md", "x")
     right = row("viking://user/jasper/memories/entities/b.md", "y")
-    assert left.peer == right.peer
+    assert left.area == right.area
 
 
 def test_two_repositories_are_two_areas() -> None:
-    left = row("viking://user/jasper/resources/embedder/a.md", "x")
-    right = row("viking://user/jasper/resources/openviking/a.md", "y")
-    assert left.peer != right.peer
+    """The motivating case: repo A and repo B solving the same problem.
+
+    These sit five segments deep under the host, which is why a fixed
+    two-segment prefix collapsed them into one and made the check vacuous.
+    """
+    left = row("viking://user/jasper/resources/github.com/acme/repo-a/notes.md", "x")
+    right = row("viking://user/jasper/resources/github.com/other/repo-b/notes.md", "y")
+    assert left.area != right.area
+
+
+def test_two_handoffs_for_different_projects_are_two_areas() -> None:
+    """The real handoff shape, which also nests below a host segment."""
+    left = row(
+        "viking://user/jasper/resources/handoffs/github.com/j/openviking/h.md", "x"
+    )
+    right = row("viking://user/jasper/resources/handoffs/github.com/j/memex/h.md", "y")
+    assert left.area != right.area
+
+
+def test_two_entity_categories_are_two_areas() -> None:
+    """Deliberate: entity categories are separate folders, so separate areas."""
+    left = row("viking://user/jasper/memories/entities/software_project/a.md", "x")
+    right = row("viking://user/jasper/memories/entities/dev_tool/b.md", "y")
+    assert left.area != right.area

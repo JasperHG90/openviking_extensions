@@ -130,9 +130,9 @@ class ReflectionEngine:
         self._settings = settings or ReflectSettings()
 
     @traced("ov_ext.reflect.sweep")
-    async def sweep(self, watermark: Watermark, *, now: datetime | None = None) -> tuple[
-        SweepReport, Watermark
-    ]:
+    async def sweep(
+        self, watermark: Watermark, *, now: datetime | None = None
+    ) -> tuple[SweepReport, Watermark]:
         """Reflect on everything changed since ``watermark``.
 
         Parameters
@@ -154,6 +154,13 @@ class ReflectionEngine:
         settings = self._settings
         moment = now or datetime.now(timezone.utc)
         report = SweepReport()
+
+        if not settings.enabled:
+            # The last guard between "off by default" and unattended writes.
+            # Checked here rather than only at registration, because the sweep
+            # is reachable from a cron and a CLI that never called install().
+            annotate({"ov_ext.reflect.outcome": "disabled"})
+            return report, watermark
 
         changed = await self._store.changed_since(
             watermark.last_seen, limit=settings.batch_limit
@@ -187,12 +194,21 @@ class ReflectionEngine:
     ) -> datetime | None:
         """Reflect on one directory's changed memories.
 
-        Returns the newest ``created_at`` among the changed rows actually read,
-        so the caller can advance the watermark to what was seen rather than to
-        the wall clock. ``None`` when the batch produced nothing to advance on.
+        Returns the newest ``updated_at`` among the changed rows actually
+        read, so the caller can advance the watermark to what was seen rather
+        than to the wall clock -- ``updated_at`` because that is what
+        ``changed_since`` filters on, and advancing on ``created_at`` would
+        leave an edited old memory permanently above the mark, re-reflected
+        every sweep forever.
+
+        ``None`` when the batch produced nothing to advance on, which includes
+        a model call that failed: marking that batch done would drop those
+        memories from reflection permanently over a transient outage.
         """
         report.batches += 1
-        annotate({"ov_ext.reflect.directory": directory, "ov_ext.reflect.changed": len(uris)})
+        annotate(
+            {"ov_ext.reflect.directory": directory, "ov_ext.reflect.changed": len(uris)}
+        )
 
         changed_rows = await self._store.rows(uris)
         if not changed_rows:
@@ -206,12 +222,18 @@ class ReflectionEngine:
         annotate({"ov_ext.reflect.gathered": len(gathered)})
 
         scope = await self._store.read_overview(directory)
-        await self._propose(contexts, scope, index_to_uri, rows_by_uri, report)
+        proposed_ok = await self._propose(
+            contexts, scope, index_to_uri, rows_by_uri, report
+        )
 
+        contradicted_ok = True
         if self._settings.contradictions:
-            await self._contradict(contexts, index_to_uri, report)
+            contradicted_ok = await self._contradict(contexts, index_to_uri, report)
 
-        return max(row.created_at for row in changed_rows)
+        if not (proposed_ok and contradicted_ok):
+            annotate({"ov_ext.reflect.outcome": "batch_incomplete"})
+            return None
+        return max(row.updated_at for row in changed_rows)
 
     async def _gather(self, changed: Sequence[MemoryRow]) -> list[MemoryRow]:
         """Collect the evidence pool: what changed, its neighbours, and a tail.
@@ -243,8 +265,16 @@ class ReflectionEngine:
         index_to_uri: dict[int, str],
         rows_by_uri: dict[str, MemoryRow],
         report: SweepReport,
-    ) -> None:
-        """Ask for observations, verify them, and write the survivors."""
+    ) -> bool:
+        """Ask for observations, verify them, write survivors; report success.
+
+        Returns
+        -------
+        bool
+            False when the model call failed or returned nothing parseable, so
+            the caller leaves the watermark where it was and the batch is tried
+            again.
+        """
         settings = self._settings
         prompt = propose_prompt(contexts, scope=scope)
 
@@ -253,12 +283,12 @@ class ReflectionEngine:
         except Exception as exc:  # the model is a network call; a batch may fail
             record_error(exc, "propose_failed", NAMESPACE)
             report.failures += 1
-            return
+            return False
 
         if proposed is None:
             annotate({"ov_ext.reflect.outcome": "propose_unparsed"})
             report.failures += 1
-            return
+            return False
 
         report.proposed += len(proposed.observations)
         kept, dropped = verify_observations(
@@ -266,12 +296,13 @@ class ReflectionEngine:
             index_to_uri,
             rows_by_uri,
             min_evidence=settings.min_evidence,
-            require_cross_peer=settings.require_cross_peer,
+            require_cross_area=settings.require_cross_area,
         )
         report.record_drops(dropped)
 
         for observation in kept:
             await self._write(observation, report)
+        return True
 
     async def _write(self, observation: Observation, report: SweepReport) -> None:
         """Persist one observation and link it to every memory it cites."""
@@ -303,8 +334,14 @@ class ReflectionEngine:
         contexts: Sequence[ReflectMemoryContext],
         index_to_uri: dict[int, str],
         report: SweepReport,
-    ) -> None:
-        """Ask which memories are in tension and record an edge for each pair."""
+    ) -> bool:
+        """Ask which memories are in tension; record an edge per pair.
+
+        Returns
+        -------
+        bool
+            False when the model call failed or returned nothing parseable.
+        """
         try:
             found = await self._llm.complete(
                 contradiction_prompt(contexts),
@@ -313,12 +350,12 @@ class ReflectionEngine:
         except Exception as exc:
             record_error(exc, "contradict_failed", NAMESPACE)
             report.failures += 1
-            return
+            return False
 
         if found is None:
             annotate({"ov_ext.reflect.outcome": "contradict_unparsed"})
             report.failures += 1
-            return
+            return False
 
         for relationship in found.relationships:
             weight = _RECORDED_RELATIONS.get(relationship.relation.strip().lower())
@@ -341,3 +378,4 @@ class ReflectionEngine:
                     left, right, link_type="contradicts", weight=weight
                 )
             report.contradictions += 1
+        return True

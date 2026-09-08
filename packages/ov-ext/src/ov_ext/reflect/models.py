@@ -72,27 +72,30 @@ class MemoryRow:
     uri: str
     text: str
     created_at: datetime
+    updated_at: datetime
 
     @property
-    def peer(self) -> str:
-        """The area of the store this memory belongs to.
+    def area(self) -> str:
+        """The directory this memory sits in.
 
-        Used to tell one body of work from another, so an observation citing
-        both ``memories/entities`` and ``resources/embedder`` can be recognised
-        as connecting two of them.
+        Used as the proxy for "a body of work", so an observation citing two
+        areas can be recognised as connecting things that were not written
+        together.
 
-        The owner prefix is dropped -- every memory shares it, so it
-        distinguishes nothing -- along with the filename, which distinguishes
-        too much: keeping it would make every memory its own peer and every
-        observation trivially cross-peer. What is left is capped at two
-        segments, deep enough to separate two repositories under ``resources``
-        and shallow enough that two entity files stay in the same area.
+        The parent directory rather than a cleverer heuristic, because no
+        prefix rule survives the shapes real URIs take. Under
+        ``resources/github.com/<owner>/<repo>/`` two repositories are four and
+        five segments deep; under ``memories/entities/<category>/`` a category
+        is three. Any fixed depth is wrong for one of them -- too shallow and
+        two repositories collapse into one area, too deep and every file is its
+        own.
+
+        The directory is exact for a store organised by directory, which
+        OpenViking's memory types enforce through their ``filename_template``,
+        and it never degenerates: two files together are always one area, two
+        files apart are always two.
         """
-        rest = self.uri.split("://", 1)[-1]
-        parts = [part for part in rest.split("/") if part]
-        if len(parts) > 2 and parts[0] == "user":
-            parts = parts[2:]
-        return "/".join(parts[:-1][:2]) or "root"
+        return self.uri.rsplit("/", 1)[0] if "/" in self.uri else self.uri
 
 
 class ReflectMemoryContext(BaseModel):
@@ -202,17 +205,22 @@ class Observation:
     evidence : tuple[tuple[str, str], ...]
         ``(uri, quote)`` pairs. Each becomes a ``derived_from`` link whose
         ``match_text`` is the quote.
-    peers : frozenset[str]
-        Distinct top-level paths the evidence spans. More than one means the
-        observation connects separate bodies of work.
+    areas : frozenset[str]
+        Distinct directories the evidence spans. More than one means the
+        observation connects memories that were not written together.
     """
 
     title: str
     content: str
     evidence: tuple[tuple[str, str], ...]
-    peers: frozenset[str]
+    areas: frozenset[str]
 
     @property
-    def is_cross_peer(self) -> bool:
-        """Whether the evidence spans more than one project."""
-        return len(self.peers) > 1
+    def sources(self) -> frozenset[str]:
+        """Distinct memories cited, which is what the evidence floor counts."""
+        return frozenset(uri for uri, _ in self.evidence)
+
+    @property
+    def spans_areas(self) -> bool:
+        """Whether the evidence comes from more than one directory."""
+        return len(self.areas) > 1

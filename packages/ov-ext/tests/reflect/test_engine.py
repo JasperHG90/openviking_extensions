@@ -66,7 +66,8 @@ def store() -> FakeStore:
 async def test_a_verified_observation_is_written_and_linked_to_its_sources() -> None:
     fake = store()
     engine = ReflectionEngine(
-        fake, FakeLLM([proposed((0, "retries failed jobs"), (1, "retries failed jobs"))]),
+        fake,
+        FakeLLM([proposed((0, "retries failed jobs"), (1, "retries failed jobs"))]),
         settings(),
     )
 
@@ -83,7 +84,9 @@ async def test_a_verified_observation_is_written_and_linked_to_its_sources() -> 
 async def test_an_unsupported_observation_never_reaches_the_store() -> None:
     fake = store()
     engine = ReflectionEngine(
-        fake, FakeLLM([proposed((0, "retries failed jobs"), (1, "invented span"))]), settings()
+        fake,
+        FakeLLM([proposed((0, "retries failed jobs"), (1, "invented span"))]),
+        settings(),
     )
 
     report, _ = await engine.sweep(Watermark.beginning(), now=EPOCH)
@@ -106,7 +109,13 @@ async def test_nothing_changed_leaves_the_watermark_where_it_was() -> None:
     assert mark.last_seen == start.last_seen
 
 
-async def test_a_model_that_fails_costs_a_batch_not_the_sweep() -> None:
+async def test_a_failed_batch_leaves_its_memories_for_the_next_sweep() -> None:
+    """A transient outage must not drop memories from reflection permanently.
+
+    The watermark is how a memory is remembered as done. Advancing it past a
+    batch whose model call failed means those memories are never reflected on
+    again -- a 500 from the provider costing them forever.
+    """
     fake = store()
     engine = ReflectionEngine(fake, FakeLLM([RuntimeError("upstream down")]), settings())
 
@@ -114,9 +123,16 @@ async def test_a_model_that_fails_costs_a_batch_not_the_sweep() -> None:
 
     assert report.failures == 1
     assert report.written == 0
-    # The batch was read even though the model call failed, so the watermark
-    # still moves: re-reading it next sweep would repeat the same failure.
-    assert mark.last_seen == EPOCH + timedelta(days=2)
+    assert mark.last_seen == Watermark.beginning().last_seen
+
+    # And a later sweep really does see them again.
+    retry = ReflectionEngine(
+        fake,
+        FakeLLM([proposed((0, "retries failed jobs"), (1, "retries failed jobs"))]),
+        settings(),
+    )
+    retry_report, _ = await retry.sweep(mark, now=EPOCH)
+    assert retry_report.written == 1
 
 
 async def test_an_unparseable_reply_is_a_failure_not_a_crash() -> None:
@@ -146,14 +162,20 @@ async def test_neighbours_and_tail_widen_what_the_model_sees() -> None:
     This is the difference between reflection and extraction: without the
     neighbour and tail passes the model only ever sees the window that changed.
     """
-    old = row("viking://user/j/memories/entities/old.md", "An older note on retries.", day=-30)
-    tail = row("viking://user/j/memories/entities/tail.md", "A stray note on retries.", day=-90)
+    old = row(
+        "viking://user/j/memories/entities/old.md", "An older note on retries.", day=-30
+    )
+    tail = row(
+        "viking://user/j/memories/entities/tail.md", "A stray note on retries.", day=-90
+    )
     fake = FakeStore(
         [row(A, "The scheduler retries failed jobs.", day=1)],
         neighbours={A: [old]},
         tail=[tail],
     )
-    llm = FakeLLM([proposed((0, "retries failed jobs"), (1, "older note"), (2, "stray note"))])
+    llm = FakeLLM(
+        [proposed((0, "retries failed jobs"), (1, "older note"), (2, "stray note"))]
+    )
     engine = ReflectionEngine(
         fake, llm, settings(neighbour_limit=4, tail_sample=2, min_evidence=3)
     )
@@ -184,9 +206,9 @@ async def test_contradictions_are_recorded_as_links_between_the_pair() -> None:
     report, _ = await engine.sweep(Watermark.beginning(), now=EPOCH)
 
     assert report.contradictions == 1
-    # Changed memories arrive newest first, so B is index 0 and A is index 1 --
-    # the edge runs in the direction the model named, not in URI order.
-    assert fake.links == [(B, A, "contradicts", None, 0.9)]
+    # Changed memories arrive oldest first, so A is index 0 and B is index 1 --
+    # the edge runs in the direction the model named.
+    assert fake.links == [(A, B, "contradicts", None, 0.9)]
     # No match_text: the claim is about two memories as wholes, and OpenViking
     # checks match_text verbatim, so inventing a span would fail that check.
     assert fake.links[0][3] is None
@@ -223,10 +245,16 @@ async def test_a_contradiction_citing_itself_or_nothing_is_dropped() -> None:
             Contradictions(
                 relationships=[
                     ContradictionRelationship(
-                        left_index=0, right_index=0, relation="contradict", reasoning="self"
+                        left_index=0,
+                        right_index=0,
+                        relation="contradict",
+                        reasoning="self",
                     ),
                     ContradictionRelationship(
-                        left_index=0, right_index=42, relation="contradict", reasoning="ghost"
+                        left_index=0,
+                        right_index=42,
+                        relation="contradict",
+                        reasoning="ghost",
                     ),
                 ]
             ),
@@ -256,16 +284,66 @@ async def test_the_overview_is_offered_as_background_and_never_cited() -> None:
     assert {link[1] for link in fake.links} == {A}
 
 
-async def test_the_batch_limit_bounds_one_sweep() -> None:
-    rows = [row(f"viking://user/j/memories/entities/{i}.md", f"note {i}", day=i) for i in range(10)]
+async def test_the_batch_limit_truncates_the_newest_not_the_oldest() -> None:
+    """Truncation must be resumable, or the remainder is lost forever.
+
+    Rows arrive oldest first, so the limit cuts the newest and the watermark
+    advances only as far as this batch reached. Cutting the oldest instead
+    would move the mark past them and they would never be read again.
+    """
+    rows = [
+        row(f"viking://user/j/memories/entities/{i}.md", f"note {i}", day=i)
+        for i in range(1, 11)
+    ]
     fake = FakeStore(rows)
-    engine = ReflectionEngine(fake, FakeLLM([]), settings(batch_limit=3))
+    llm = FakeLLM([ProposedObservations(observations=[])])
+    engine = ReflectionEngine(fake, llm, settings(batch_limit=3))
 
-    report, _ = await engine.sweep(Watermark.beginning(), now=EPOCH)
+    report, mark = await engine.sweep(Watermark.beginning(), now=EPOCH)
 
-    # One directory, so one batch -- but only three memories reached it.
     assert report.batches == 1
-    assert report.failures == 1  # the empty fake returns None, counted as such
+    assert mark.last_seen == EPOCH + timedelta(days=3)
+
+    # The seven the limit cut are still ahead of the mark.
+    remaining = await fake.changed_since(mark.last_seen, limit=100)
+    assert len(remaining) == 7
+
+
+async def test_a_disabled_sweep_writes_nothing() -> None:
+    """The last guard between "off by default" and unattended writes.
+
+    Registration checks the flag, but a cron or CLI can reach the engine
+    without ever calling install().
+    """
+    fake = store()
+    llm = FakeLLM([proposed((0, "retries failed jobs"), (1, "retries failed jobs"))])
+    engine = ReflectionEngine(fake, llm, settings(enabled=False))
+
+    report, mark = await engine.sweep(Watermark.beginning(), now=EPOCH)
+
+    assert report.written == 0
+    assert fake.written == []
+    assert llm.prompts == []
+    assert mark.last_seen == Watermark.beginning().last_seen
+
+
+async def test_an_edited_old_memory_stops_being_re_reflected() -> None:
+    """The watermark must advance on the column it filters on.
+
+    A memory created long ago but edited today is above the mark by
+    `updated_at`. Advancing on `created_at` would leave the mark in the past,
+    so the same batch, the same model calls and the same write would repeat
+    every sweep forever.
+    """
+    old = row(A, "The scheduler retries failed jobs.", day=-500, updated=2)
+    fake = FakeStore([old, row(B, "The worker retries failed jobs too.", day=2)])
+    llm = FakeLLM([proposed((0, "retries failed jobs"), (1, "retries failed jobs"))])
+    engine = ReflectionEngine(fake, llm, settings())
+
+    _, mark = await engine.sweep(Watermark.beginning(), now=EPOCH)
+
+    assert mark.last_seen == EPOCH + timedelta(days=2)
+    assert await fake.changed_since(mark.last_seen, limit=100) == []
 
 
 def test_memories_are_grouped_by_their_directory() -> None:

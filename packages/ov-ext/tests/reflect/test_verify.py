@@ -12,7 +12,7 @@ import pytest
 from ov_ext.reflect.models import CandidateObservation, EvidenceItem
 from ov_ext.reflect.verify import (
     normalise,
-    peers_covered,
+    areas_covered,
     quote_is_present,
     verify_observations,
 )
@@ -33,7 +33,8 @@ INDEX = {0: "viking://user/j/memories/a.md", 1: "viking://user/j/memories/b.md"}
 def observation(*evidence: EvidenceItem) -> CandidateObservation:
     """Build a candidate carrying the given evidence."""
     return CandidateObservation(
-        title="retry policy", content="Retries are bounded and jittered.",
+        title="retry policy",
+        content="Retries are bounded and jittered.",
         evidence=list(evidence),
     )
 
@@ -55,7 +56,10 @@ def cite(index: int | None, quote: str) -> EvidenceItem:
     ],
 )
 def test_a_quote_counts_only_when_it_is_really_there(quote: str, present: bool) -> None:
-    assert quote_is_present(quote, "The scheduler retries failed jobs three times.") is present
+    assert (
+        quote_is_present(quote, "The scheduler retries failed jobs three times.")
+        is present
+    )
 
 
 def test_normalise_leaves_words_alone() -> None:
@@ -77,7 +81,7 @@ def test_an_observation_whose_quotes_check_out_survives() -> None:
         "bad_index": 0,
         "quote_not_found": 0,
         "too_little_evidence": 0,
-        "single_peer": 0,
+        "single_area": 0,
     }
 
 
@@ -137,45 +141,89 @@ def test_a_lower_floor_lets_a_single_quote_through() -> None:
     assert len(kept) == 1
 
 
-def test_cross_peer_is_recorded_but_not_required_by_default() -> None:
+def test_spanning_areas_is_recorded_but_not_required_by_default() -> None:
     kept, _ = verify_observations(
         [observation(cite(0, "retries failed jobs"), cite(1, "exponential backoff"))],
         INDEX,
         MEMORIES,
     )
-    assert kept[0].is_cross_peer is False
+    assert kept[0].spans_areas is False
 
 
-def test_requiring_cross_peer_drops_a_single_project_observation() -> None:
+def test_requiring_two_areas_drops_a_single_directory_observation() -> None:
     kept, dropped = verify_observations(
         [observation(cite(0, "retries failed jobs"), cite(1, "exponential backoff"))],
         INDEX,
         MEMORIES,
-        require_cross_peer=True,
+        require_cross_area=True,
     )
     assert kept == []
-    assert dropped["single_peer"] == 1
+    assert dropped["single_area"] == 1
 
 
-def test_requiring_cross_peer_keeps_one_that_spans_two_projects() -> None:
+def test_requiring_two_areas_keeps_one_that_spans_two_directories() -> None:
+    # Two repositories under the shape OpenViking actually ingests them in --
+    # deep, with the owner and repo below a host segment.
+    left = "viking://user/j/resources/github.com/acme/repo-a/notes.md"
+    right = "viking://user/j/resources/github.com/other/repo-b/notes.md"
     memories = {
-        "viking://user/j/memories/a.md": row(
-            "viking://user/j/memories/a.md", "openviking coalesces requests."
-        ),
-        "viking://user/j/resources/embedder/b.md": row(
-            "viking://user/j/resources/embedder/b.md", "embedder coalesces requests."
-        ),
+        left: row(left, "openviking coalesces requests."),
+        right: row(right, "embedder coalesces requests."),
     }
-    index = {0: "viking://user/j/memories/a.md", 1: "viking://user/j/resources/embedder/b.md"}
+    index = {0: left, 1: right}
     kept, _ = verify_observations(
         [observation(cite(0, "coalesces requests"), cite(1, "coalesces requests"))],
         index,
         memories,
-        require_cross_peer=True,
+        require_cross_area=True,
     )
     assert len(kept) == 1
-    assert kept[0].is_cross_peer is True
+    assert kept[0].spans_areas is True
 
 
-def test_peers_covered_ignores_uris_it_has_no_row_for() -> None:
-    assert peers_covered(["viking://nowhere/x.md"], MEMORIES) == frozenset()
+def test_areas_covered_ignores_uris_it_has_no_row_for() -> None:
+    assert areas_covered(["viking://nowhere/x.md"], MEMORIES) == frozenset()
+
+
+def test_three_quotes_from_one_memory_do_not_clear_a_floor_of_three() -> None:
+    """The floor counts distinct memories, not distinct quotes.
+
+    Counting quotes would let nested substrings of a single sentence stand in
+    for a synthesis, which is the exact failure the floor exists to reject.
+    """
+    kept, dropped = verify_observations(
+        [
+            observation(
+                cite(0, "The scheduler"),
+                cite(0, "The scheduler retries"),
+                cite(0, "retries failed jobs three times"),
+            )
+        ],
+        INDEX,
+        MEMORIES,
+        min_evidence=3,
+    )
+    assert kept == []
+    assert dropped["too_little_evidence"] == 1
+
+
+def test_two_distinct_memories_clear_a_floor_of_two() -> None:
+    kept, _ = verify_observations(
+        [
+            observation(
+                cite(0, "The scheduler"),
+                cite(0, "retries failed jobs"),
+                cite(1, "exponential backoff"),
+            )
+        ],
+        INDEX,
+        MEMORIES,
+        min_evidence=2,
+    )
+    assert len(kept) == 1
+    # Every verified quote is kept as evidence; only the *count* is per memory.
+    assert len(kept[0].evidence) == 3
+    assert kept[0].sources == {
+        "viking://user/j/memories/a.md",
+        "viking://user/j/memories/b.md",
+    }

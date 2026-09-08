@@ -21,15 +21,14 @@ lives.
 | `prompts.py` | `reflect/prompts.py`, `contradiction/signatures.py` | 38 | 0 | 36 lines of instruction, transcribed from the signature docstrings |
 | `verify.py` | `reflect/trends.py` (`verify_evidence_quotes`) | 67 | 0 — the idea, reimplemented | — |
 | `engine.py` | `reflect/reflection.py` | 199 | 0 — phase *sequence* followed, no code lifted | — |
-| `viking.py` | — | 208 | 0 | — |
-| `config.py` | — | 109 | 0 | — |
-| `register.py`, `ports.py`, `watermark.py`, `__init__.py` | — | 127 | 0 | — |
-| **Total** | | **878** | **~78** | **~57** |
+| `viking.py` | — | see below | 0 | — |
+| `config.py`, `register.py`, `runner.py`, `ports.py`, `watermark.py`, `exceptions.py`, `__init__.py` | — | see below | 0 | — |
 
-So: **about 78 of 878 code lines are ported**, plus roughly 57 lines of prompt
-and field text carried across near-verbatim. The rest is new, and almost all
-of it is the part that touches OpenViking — which had to be written either way,
-because memex's equivalent is bound to a schema this package does not have.
+So: **about 78 code lines are ported**, plus roughly 57 lines of prompt and
+field text carried across near-verbatim. Run the snippet at the foot of this file for the current totals; the ratio matters more than
+the absolute, and it is low by design. The rest is new, and almost all of it is
+the part that touches OpenViking — which had to be written either way, because
+memex's equivalent is bound to a schema this package does not have.
 
 The low ratio is the expected result rather than a disappointment. memex's
 value here is concentrated in its declarative layer; its orchestration layer
@@ -41,9 +40,12 @@ OpenViking's file-behind-a-URI model does not pose.
 1. **No DSPy.** memex drives every call through `dspy.Predict`. Nothing else —
    no `ChainOfThought`, no optimizers, no compiled prompts — so the signatures
    carry only their text, and that text ports without the dependency.
-   OpenViking's `StructuredVLM.complete_model` does the same job, which keeps
-   one model config, one set of credentials and one trace in a process that is
-   already OpenViking's.
+   `openviking_cli.utils.llm.StructuredLLM` does the same job, which keeps one
+   model config, one set of credentials and one trace in a process that is
+   already OpenViking's. Note it is that class and not
+   `openviking.models.vlm.llm.StructuredVLM`: the latter builds a client from a
+   config dict and an empty one defaults to OpenAI, which would be a second
+   model stack wearing OpenViking's name.
 
 2. **No `MentalModel` table, no CAS.** memex stores observations as rows and
    guards concurrent updates with a version column. An observation here is a
@@ -75,20 +77,32 @@ OpenViking's file-behind-a-URI model does not pose.
    memories are in tension and leaves the resolution to a person, so a field
    naming a winner would be one nothing reads.
 
-7. **Tail sampling by age, not randomness.** `_sample_tail_memories` uses
-   `ORDER BY random()`. OpenViking's filter API has no random ordering, so
-   `tail_sample` takes the oldest rows — a different mechanism for the same
-   purpose, which is that the model must see memories nothing selected for
-   resembling its own candidates.
+7. **Tail sampling reads a window, then samples it.** `_sample_tail_memories`
+   uses `ORDER BY random()`. OpenViking's filter API has no random ordering, so
+   `tail_sample` reads a wider slice of the least recently updated memories and
+   picks from it with `random.Random.sample`. Taking the oldest *n* directly
+   would return identical rows in every batch of every sweep — a constant, and
+   a constant cannot break an echo chamber.
 
 8. **Quote verification is a gate, not a report.** memex's
    `verify_evidence_quotes` returns errors that a caller may act on. Here a
-   failed quote drops its evidence, and an observation left under the floor is
-   discarded before anything is written.
+   failed quote drops its evidence, and an observation citing fewer than
+   `min_evidence` *distinct memories* is discarded before anything is written.
+   The floor counts sources rather than quotes, so nested substrings of one
+   sentence cannot stand in for a synthesis.
 
-9. **Cross-peer evidence is new.** No memex equivalent. An observation records
-   which areas of the store its evidence spans, and a pass can require more
-   than one.
+11. **Reflection refuses to run without stored row content.** memex always has
+    the unit text. OpenViking stores a row's `content` only when the backend
+    sets `USE_CONTENT_FIELD`, which is `False` by default. Falling back to
+    `abstract` would verify quotes against a generated summary and write links
+    whose `match_text` is absent from the memory they point at, so
+    `ContentUnavailableError` stops the sweep instead.
+
+9. **Cross-area evidence is new.** No memex equivalent. An observation records
+   which directories its evidence spans, and a pass can require more than one.
+   The area is the parent directory: no fixed prefix depth works across the
+   shapes real URIs take, and a shallower rule made the check vacuous for the
+   case that motivated it.
 
 10. **Reinforcement is not recorded.** memex applies a positive confidence
     delta for `reinforce`. Agreement is the normal state of a memory store, so
@@ -102,3 +116,23 @@ OpenViking's file-behind-a-URI model does not pose.
 `reflect/entity_locks.py` (54 — needed only for parallel workers),
 `reflect/exceptions.py` (56 — every one of them describes a CAS failure mode
 that does not exist here).
+
+
+## Counting these numbers
+
+Docstrings and comments excluded, so the figures compare code against code:
+
+```bash
+python3 - <<'EOF'
+import pathlib, re
+def code_lines(p):
+    src = re.sub(r'""".*?"""', '', pathlib.Path(p).read_text(), flags=re.S)
+    return sum(1 for l in src.splitlines()
+               if l.strip() and not l.strip().startswith('#'))
+total = 0
+for f in sorted(pathlib.Path("src/ov_ext/reflect").glob("*.py")):
+    n = code_lines(f); total += n
+    print(f"{n:5d}  {f.name}")
+print(f"{total:5d}  TOTAL")
+EOF
+```

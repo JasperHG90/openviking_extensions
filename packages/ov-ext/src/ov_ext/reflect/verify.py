@@ -11,10 +11,13 @@ check does not. Three gates, cheapest first:
    also exactly what OpenViking already promises about a link's ``match_text``
    -- so passing this gate is what makes the evidence link legal, not merely
    plausible.
-3. **Enough survives.** An observation left with fewer than
-   ``min_evidence`` verified quotes is dropped. memex gets this from a separate
-   validate model call; a floor on verified evidence does most of the same job
-   for nothing.
+3. **Enough distinct memories survive.** An observation resting on fewer
+   than ``min_evidence`` *different* memories is dropped. The count is over
+   source URIs, not quotes: three quotes from one paragraph -- or three nested
+   substrings of one sentence -- are one memory restated, which is precisely
+   what the floor exists to reject. memex gets this from a separate validate
+   model call; a floor on distinct sources does most of the same job for
+   nothing.
 
 Whitespace is normalised on both sides before comparing. Models reflow text --
 a newline becomes a space, two spaces become one -- and rejecting a quote for
@@ -30,11 +33,11 @@ from collections.abc import Mapping, Sequence
 
 from .models import CandidateObservation, MemoryRow, Observation
 
-__all__ = ["normalise", "peers_covered", "quote_is_present", "verify_observations"]
+__all__ = ["areas_covered", "normalise", "quote_is_present", "verify_observations"]
 
-# Default floor on verified evidence. Two rather than one because a single
-# quote is usually the model restating one memory, which is not an observation
-# -- it is a copy.
+# Default floor on distinct cited memories. Two rather than one because an
+# observation resting on a single memory is that memory restated, which is a
+# copy rather than a synthesis.
 DEFAULT_MIN_EVIDENCE = 2
 
 _WHITESPACE = re.compile(r"\s+")
@@ -70,13 +73,13 @@ def quote_is_present(quote: str, haystack: str) -> bool:
     return needle in normalise(haystack)
 
 
-def peers_covered(uris: Sequence[str], rows: Mapping[str, MemoryRow]) -> frozenset[str]:
-    """The distinct projects a set of cited URIs spans.
+def areas_covered(uris: Sequence[str], rows: Mapping[str, MemoryRow]) -> frozenset[str]:
+    """The distinct directories a set of cited URIs spans.
 
-    More than one means the observation connects separate bodies of work, which
-    is the thing a cross-peer pass is looking for.
+    More than one means the observation connects memories that were not written
+    together, which is what a cross-area pass is looking for.
     """
-    return frozenset(rows[uri].peer for uri in uris if uri in rows)
+    return frozenset(rows[uri].area for uri in uris if uri in rows)
 
 
 def verify_observations(
@@ -85,7 +88,7 @@ def verify_observations(
     rows: Mapping[str, MemoryRow],
     *,
     min_evidence: int = DEFAULT_MIN_EVIDENCE,
-    require_cross_peer: bool = False,
+    require_cross_area: bool = False,
 ) -> tuple[list[Observation], dict[str, int]]:
     """Keep the observations whose evidence holds up.
 
@@ -99,19 +102,20 @@ def verify_observations(
         Every memory shown to the model, keyed by URI, for checking quotes
         against.
     min_evidence :
-        How many verified quotes an observation needs to survive.
-    require_cross_peer :
+        How many *distinct memories* an observation must cite to survive.
+        Counted over source URIs, so repeating one memory cannot clear it.
+    require_cross_area :
         When set, additionally drop observations whose evidence sits inside a
-        single project. Off by default -- ordinary single-project observations
-        are wanted too -- and turned on by a pass that exists specifically to
-        find connections between projects.
+        single directory. Off by default -- ordinary same-area observations are
+        wanted too -- and turned on by a pass that exists specifically to find
+        connections between things written apart.
 
     Returns
     -------
     tuple[list[Observation], dict[str, int]]
         The survivors, and counts of why the rest were dropped: keys
         ``bad_index``, ``quote_not_found``, ``too_little_evidence``,
-        ``single_peer``. The counts are what tells you whether a prompt change
+        ``single_area``. The counts are what tells you whether a prompt change
         made the model worse, so they are returned rather than logged.
     """
     kept: list[Observation] = []
@@ -119,7 +123,7 @@ def verify_observations(
         "bad_index": 0,
         "quote_not_found": 0,
         "too_little_evidence": 0,
-        "single_peer": 0,
+        "single_area": 0,
     }
 
     for candidate in candidates:
@@ -146,13 +150,17 @@ def verify_observations(
             seen.add(pair)
             verified.append((uri, item.quote))
 
-        if len(verified) < min_evidence:
+        # Distinct *memories*, not distinct quotes. Counting quotes would let
+        # three nested substrings of one sentence clear a floor of three, which
+        # is the restatement the floor exists to reject.
+        cited = {uri for uri, _ in verified}
+        if len(cited) < min_evidence:
             dropped["too_little_evidence"] += 1
             continue
 
-        peers = peers_covered([uri for uri, _ in verified], rows)
-        if require_cross_peer and len(peers) < 2:
-            dropped["single_peer"] += 1
+        areas = areas_covered(sorted(cited), rows)
+        if require_cross_area and len(areas) < 2:
+            dropped["single_area"] += 1
             continue
 
         kept.append(
@@ -160,7 +168,7 @@ def verify_observations(
                 title=candidate.title.strip(),
                 content=candidate.content.strip(),
                 evidence=tuple(verified),
-                peers=peers,
+                areas=areas,
             )
         )
 

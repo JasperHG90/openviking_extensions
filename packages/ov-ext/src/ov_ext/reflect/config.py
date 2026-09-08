@@ -95,27 +95,29 @@ class ReflectSettings(BaseSettings):
         default=3,
         ge=0,
         description=(
-            "Memories drawn at random into every batch. Without them the model "
-            "only ever sees what resembles its own candidates, and reflection "
-            "converges on confirming itself. 0 disables the safeguard."
+            "Memories drawn into every batch at random from the least recently "
+            "updated end of the store. Without them the model only ever sees "
+            "what resembles its own candidates, and reflection converges on "
+            "confirming itself. 0 disables the safeguard."
         ),
     )
     min_evidence: int = Field(
         default=DEFAULT_MIN_EVIDENCE,
         ge=1,
         description=(
-            "Verified quotes an observation needs to survive. Below 2 an "
-            "observation can rest on a single memory, which is a restatement "
-            "rather than a synthesis."
+            "Distinct memories an observation must cite to survive. Counted "
+            "over sources, not quotes, so three quotes from one paragraph do "
+            "not clear a floor of three. Below 2 an observation can rest on a "
+            "single memory, which is a restatement rather than a synthesis."
         ),
     )
-    require_cross_peer: bool = Field(
+    require_cross_area: bool = Field(
         default=False,
         description=(
-            "Keep only observations whose evidence spans more than one project. "
-            "Off for a general sweep, where single-project observations are "
-            "wanted too; on for a pass that exists to find connections between "
-            "separate bodies of work."
+            "Keep only observations whose evidence spans more than one "
+            "directory. Off for a general sweep, where same-area observations "
+            "are wanted too; on for a pass that exists to find connections "
+            "between things written apart."
         ),
     )
     contradictions: bool = Field(

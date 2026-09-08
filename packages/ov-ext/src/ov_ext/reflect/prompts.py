@@ -122,7 +122,9 @@ def propose_prompt(
         listed = "\n".join(f"- {title}" for title in known)
         parts.append("Observations already known. Do not repeat these:\n\n" + listed)
 
-    parts.append("Memories, each with the index you must cite it by:\n\n" + _render(contexts))
+    parts.append(
+        "Memories, each with the index you must cite it by:\n\n" + _render(contexts)
+    )
     return "\n\n---\n\n".join(parts)
 
 

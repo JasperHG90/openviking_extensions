@@ -290,8 +290,9 @@ extra call rather than a second pipeline.
 the memory it cites, checked by substring in code — a second model asked "is
 this true?" shares the first one's blind spots, a substring check does not. A
 citation outside the range it was shown is a fabrication and is dropped. An
-observation left with fewer than `MIN_EVIDENCE` verified quotes is discarded,
-which is what stops the model restating one memory and calling it a synthesis.
+observation citing fewer than `MIN_EVIDENCE` **distinct memories** is
+discarded — counted over sources, not quotes, so three quotes from one
+paragraph do not stand in for a synthesis.
 
 Observations land as their own memory type, one `derived_from` link per quote
 with the quote as `match_text`. That is not a structure invented here:
@@ -299,13 +300,22 @@ OpenViking's link vocabulary already defines `derived_from` for summary facts
 and already contracts `match_text` to appear verbatim. Verification is what
 makes reflection's links legal rather than merely plausible.
 
-Reads run against the vector index, never the document store — the L2 rows
-carry the memory text already, so a sweep finds its changes, gathers evidence
-and verifies every quote without opening a file. Only conclusions are written.
+Change detection, evidence and verification all run against the vector index:
+the L2 rows carry the memory text, so the sweep never opens a file to find or
+check anything. It does read one document per batch — the directory overview it
+uses as background — and writes only conclusions.
 
-Registering reflection does not start it. A sweep runs when a cron or a CLI
-calls it, because something that writes to memory unattended should do so
-because someone decided it should.
+**This requires the backend to store row content.** OpenViking's adapters
+default `USE_CONTENT_FIELD` to `False` (ov-postgres derives it from
+`store_content`), and with it off the only text on a row is `abstract`, a
+generated summary. Reflection refuses to run rather than verify quotes against
+a summary: a link whose `match_text` came from a summary would not appear in
+the memory it points at, breaking the contract the whole design rests on.
+
+Registering reflection does not start it. `ov_ext.reflect.run_sweep(fs, db,
+ctx)` runs one — it loads the watermark from the store, sweeps, and writes the
+mark back — so a cron or a script decides when, because something that writes
+to memory unattended should run when someone chose that it would.
 
 | Variable | Default | What it does |
 |---|---|---|
@@ -314,8 +324,8 @@ because someone decided it should.
 | `OV_REFLECT_BATCH_LIMIT` | `50` | Most changed memories per sweep |
 | `OV_REFLECT_NEIGHBOUR_LIMIT` | `8` | Semantic neighbours per changed memory |
 | `OV_REFLECT_TAIL_SAMPLE` | `3` | Memories drawn from the far end of the store |
-| `OV_REFLECT_MIN_EVIDENCE` | `2` | Verified quotes an observation needs to survive |
-| `OV_REFLECT_REQUIRE_CROSS_PEER` | `false` | Keep only observations spanning several projects |
+| `OV_REFLECT_MIN_EVIDENCE` | `2` | Distinct memories an observation must cite to survive |
+| `OV_REFLECT_REQUIRE_CROSS_AREA` | `false` | Keep only observations spanning several directories |
 | `OV_REFLECT_CONTRADICTIONS` | `true` | Ask which memories are in tension |
 | `OV_REFLECT_OBSERVATIONS_ROOT` | `viking://~/memories/observations` | Where observations are written |
 | `OV_REFLECT_STATE_PATH` | `viking://~/resources/reflect/watermark.json` | Where the watermark lives |

@@ -62,11 +62,14 @@ One search, two LLM calls, one write pass. Not seven phases — a function.
 4. **Change detection on L2, scope from L1** — because of finding 5.
 5. **Cross-peer linking is an observation, not a link.** The ask was "repo A
    and repo B are solving the same problem", which is a candidate whose
-   evidence spans two peers. The engine counts distinct top-level paths across
-   an observation's evidence and tags the ones spanning several; a dedicated
-   cross-peer pass sets `require_cross_peer` and drops the rest. A blanket
-   filter would reject ordinary single-project observations, which are also
-   wanted. *(Rejected: generic memory↔memory association, which degenerates.)*
+   evidence spans two areas. The area is the memory's **parent directory** —
+   no fixed prefix depth works, because a repo under
+   `resources/github.com/<owner>/<repo>/` is five segments deep while an entity
+   category is three, and a two-segment rule collapsed two repos into one area,
+   making the check vacuous for its motivating case. A dedicated pass sets
+   `require_cross_area`; a blanket filter would reject ordinary same-area
+   observations, which are also wanted. *(Rejected: generic memory↔memory
+   association, which degenerates.)*
 6. **Port contradiction detection; skip the Beta posterior.** No confidence
    column on OV memories, and adding one costs a MinIO write per delta.
    `StoredLink.weight` already carries contestedness — compute it from the

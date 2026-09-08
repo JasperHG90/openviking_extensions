@@ -20,7 +20,7 @@ def test_the_safeguards_are_on_by_default() -> None:
     settings = ReflectSettings()
     assert settings.tail_sample > 0  # or reflection only confirms itself
     assert settings.min_evidence >= 2  # or one memory restated is an "observation"
-    assert settings.require_cross_peer is False  # single-project ones are wanted too
+    assert settings.require_cross_area is False  # single-project ones are wanted too
 
 
 def test_settings_come_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -31,7 +31,9 @@ def test_settings_come_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> 
     assert settings.min_evidence == 5
 
 
-def test_a_misspelled_variable_is_refused_by_name(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_misspelled_variable_is_refused_by_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """pydantic-settings never enumerates the environment, so it would be ignored.
 
     Someone who set it would watch reflection ignore them with nothing to

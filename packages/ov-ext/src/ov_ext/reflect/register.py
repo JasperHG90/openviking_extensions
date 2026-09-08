@@ -11,6 +11,11 @@ one is not read; overwriting the operator's choice to install our own would be
 worse than declining to. In that case the schema is copied into the directory
 they chose, so it registers without the setting changing.
 
+Setting it when it is empty is not free either: ``MemoryTypeRegistry`` falls
+back to ``resolve_memory_templates_dir()`` when the custom dir is unset, so
+filling it in suppresses that fallback. Whatever was there before is recorded
+and put back by :func:`unregister`.
+
 Registration is idempotent and does not start anything. A sweep runs when
 something calls :meth:`ov_ext.reflect.engine.ReflectionEngine.sweep` -- from a
 cron, a CLI, or a test -- rather than on a timer inside the server. Reflection
@@ -35,6 +40,12 @@ TEMPLATES_DIR = Path(__file__).parent / "templates"
 # Set by register() so unregister() removes only a file we installed.
 _installed: Path | None = None
 
+# The value of custom_templates_dir before register() changed it, so
+# unregister() can put an operator's configuration back rather than leaving
+# ours in place. A sentinel distinguishes "not changed" from "was empty".
+_UNSET: object = object()
+_previous_dir: str | None | object = _UNSET
+
 
 def register(settings: ReflectSettings | None = None) -> None:
     """Make the ``observations`` memory type available to OpenViking.
@@ -47,7 +58,7 @@ def register(settings: ReflectSettings | None = None) -> None:
     settings :
         Behaviour toggles. Read from the environment when omitted.
     """
-    global _installed
+    global _installed, _previous_dir
     resolved = settings or ReflectSettings()
     if not resolved.enabled:
         logger.debug("ov-ext reflect: disabled, memory type not registered")
@@ -57,7 +68,8 @@ def register(settings: ReflectSettings | None = None) -> None:
     configured = _configured_templates_dir()
 
     if configured is None:
-        _set_templates_dir(TEMPLATES_DIR)
+        _previous_dir = _current_templates_dir()
+        _set_templates_dir(str(TEMPLATES_DIR))
         logger.info("ov-ext reflect: memory templates dir set to %s", TEMPLATES_DIR)
         return
 
@@ -79,10 +91,13 @@ def unregister() -> None:
     configured keeps everything else it holds, and a setting this process did
     not change is left alone.
     """
-    global _installed
+    global _installed, _previous_dir
     if _installed is not None and _installed.exists():
         _installed.unlink()
     _installed = None
+    if _previous_dir is not _UNSET:
+        _set_templates_dir(_previous_dir)  # type: ignore[arg-type]
+        _previous_dir = _UNSET
 
 
 def _configured_templates_dir() -> Path | None:
@@ -98,8 +113,18 @@ def _configured_templates_dir() -> Path | None:
     return Path(configured) if configured else None
 
 
-def _set_templates_dir(path: Path) -> None:
+def _current_templates_dir() -> str | None:
+    """Return the raw configured value, or ``None`` when there is no config."""
+    try:
+        from openviking_cli.utils.config import get_openviking_config
+
+        return str(get_openviking_config().memory.custom_templates_dir)
+    except Exception:
+        return None
+
+
+def _set_templates_dir(path: str | None) -> None:
     """Point OpenViking's custom memory templates dir at ``path``."""
     from openviking_cli.utils.config import get_openviking_config
 
-    get_openviking_config().memory.custom_templates_dir = str(path)
+    get_openviking_config().memory.custom_templates_dir = path or ""

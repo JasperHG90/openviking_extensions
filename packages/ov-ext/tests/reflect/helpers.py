@@ -24,9 +24,20 @@ T = TypeVar("T", bound=BaseModel)
 EPOCH = datetime(2026, 9, 1, tzinfo=timezone.utc)
 
 
-def row(uri: str, text: str, *, day: int = 0) -> MemoryRow:
-    """Build a memory row at a fixed offset from a fixed date."""
-    return MemoryRow(uri=uri, text=text, created_at=EPOCH + timedelta(days=day))
+def row(uri: str, text: str, *, day: int = 0, updated: int | None = None) -> MemoryRow:
+    """Build a memory row at a fixed offset from a fixed date.
+
+    ``updated`` defaults to ``day``; pass it separately to model a memory that
+    was created long ago and edited recently, which is the case that
+    distinguishes advancing the watermark on the right column from the wrong
+    one.
+    """
+    return MemoryRow(
+        uri=uri,
+        text=text,
+        created_at=EPOCH + timedelta(days=day),
+        updated_at=EPOCH + timedelta(days=day if updated is None else updated),
+    )
 
 
 class FakeStore:
@@ -56,9 +67,13 @@ class FakeStore:
         self.links: list[tuple[str, str, str, str | None, float]] = []
 
     async def changed_since(self, moment: datetime, *, limit: int) -> list[str]:
-        """Return URIs of rows created after ``moment``, newest first."""
-        fresh = [r for r in self._rows.values() if r.created_at > moment]
-        fresh.sort(key=lambda r: r.created_at, reverse=True)
+        """Return URIs of rows updated after ``moment``, oldest first.
+
+        Ascending like the real store, so ``limit`` truncates the newest and
+        the remainder survives for the next sweep.
+        """
+        fresh = [r for r in self._rows.values() if r.updated_at > moment]
+        fresh.sort(key=lambda r: r.updated_at)
         return [r.uri for r in fresh[:limit]]
 
     async def rows(self, uris: Sequence[str]) -> list[MemoryRow]:

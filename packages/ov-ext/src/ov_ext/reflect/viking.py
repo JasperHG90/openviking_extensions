@@ -22,7 +22,9 @@ serializes it so the format is theirs rather than ours.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import random
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from typing import Any, TypeVar
@@ -31,6 +33,7 @@ from pydantic import BaseModel
 
 from .citations import parse_timestamp
 from .config import ReflectSettings
+from .exceptions import ContentUnavailableError
 from .models import MemoryRow, Observation
 
 __all__ = ["VikingLLM", "VikingStore"]
@@ -44,41 +47,51 @@ T = TypeVar("T", bound=BaseModel)
 # that end up in a batch.
 _CHANGE_FIELDS = ["uri", "updated_at"]
 
-# Fields a row needs to become a MemoryRow.
-_ROW_FIELDS = ["uri", "content", "abstract", "created_at", "updated_at"]
+# Fields a row needs to become a MemoryRow. `abstract` is deliberately absent:
+# quotes are verified against whatever text a row carries, and a summary is not
+# the memory.
+_ROW_FIELDS = ["uri", "content", "created_at", "updated_at"]
+
+# How much wider than the requested sample to read before choosing at random.
+# Wide enough that two sweeps rarely draw the same rows, narrow enough that the
+# query stays a cheap indexed scan.
+_TAIL_WINDOW = 10
 
 
 class VikingLLM:
     """OpenViking's structured-output model, behind the reflection protocol.
 
-    Wraps ``StructuredVLM.complete_model``, which appends the JSON schema to
-    the prompt, parses the reply and validates it against the class -- returning
-    ``None`` when any of that fails. Using OpenViking's own model layer rather
-    than a second client means one set of credentials, one timeout policy and
-    one trace, in a process that is already OpenViking's.
+    Wraps ``openviking_cli.utils.llm.StructuredLLM``, which appends the JSON
+    schema to the prompt, calls the model and parses the reply. That class
+    rather than ``openviking.models.vlm.llm.StructuredVLM``: the latter builds
+    its own client from a config dict, and an empty dict defaults it to OpenAI
+    (``VLMFactory.create`` in ``models/vlm/base.py``). The CLI one resolves
+    ``get_openviking_config().vlm``, which is the model the server was actually
+    configured with -- so one set of credentials, one timeout policy and one
+    trace, in a process that is already OpenViking's.
 
     Parameters
     ----------
-    vlm :
-        A ``StructuredVLM``. Built from OpenViking's configured model when
-        omitted.
+    llm :
+        Something with ``complete_json_async(prompt, schema=...)``. Built from
+        OpenViking's configured model when omitted.
     """
 
-    def __init__(self, vlm: Any | None = None) -> None:
-        self._vlm = vlm
+    def __init__(self, llm: Any | None = None) -> None:
+        self._llm = llm
 
-    def _get_vlm(self) -> Any:
+    def _get_llm(self) -> Any:
         """Return the wrapped model, building OpenViking's default on first use."""
-        if self._vlm is None:
-            from openviking.models.vlm.llm import StructuredVLM
+        if self._llm is None:
+            from openviking_cli.utils.llm import StructuredLLM
 
-            self._vlm = StructuredVLM()
-        return self._vlm
+            self._llm = StructuredLLM()
+        return self._llm
 
     async def complete(self, prompt: str, model: type[T]) -> T | None:
         """Answer ``prompt`` as an instance of ``model``, or ``None``."""
         schema = model.model_json_schema()
-        payload = await self._get_vlm().complete_json_async(prompt, schema=schema)
+        payload = await self._get_llm().complete_json_async(prompt, schema=schema)
         if payload is None:
             return None
         try:
@@ -106,6 +119,10 @@ class VikingStore:
         here is scoped by it.
     settings :
         Behaviour toggles, for the roots reflection reads and writes under.
+    rng :
+        Source of randomness for the tail sample. Injectable so a test can make
+        it deterministic; left to the system otherwise, because varying between
+        sweeps is the point.
     """
 
     def __init__(
@@ -114,11 +131,15 @@ class VikingStore:
         vikingdb: Any,
         ctx: Any,
         settings: ReflectSettings | None = None,
+        rng: random.Random | None = None,
     ) -> None:
         self._fs = viking_fs
         self._db = vikingdb
         self._ctx = ctx
         self._settings = settings or ReflectSettings()
+        # Unseeded on purpose: the tail sample exists to vary between sweeps,
+        # so reproducibility here would defeat it. Tests inject their own.
+        self._rng = rng or random.Random()
 
     @property
     def _memory_root(self) -> str:
@@ -128,19 +149,22 @@ class VikingStore:
     def _row_from_record(self, record: dict[str, Any]) -> MemoryRow | None:
         """Build a :class:`MemoryRow` from an index record, or ``None``.
 
-        Prefers ``content`` over ``abstract``: for a memory the two are nearly
-        the same text, but ``content`` is the one quotes are verified against,
-        and verifying against a shorter field would reject good evidence for
-        having been truncated away.
+        Reads ``content`` and nothing else. There is deliberately no fallback
+        to ``abstract``: quotes are verified against whatever text this
+        returns, and verifying against a generated summary would produce links
+        whose ``match_text`` is absent from the memory they point at. A row
+        without content is skipped, and :meth:`rows` turns a whole batch of
+        them into a refusal.
         """
         uri = record.get("uri")
-        text = record.get("content") or record.get("abstract")
+        text = record.get("content")
         if not uri or not text:
             return None
         return MemoryRow(
             uri=str(uri),
             text=str(text),
             created_at=parse_timestamp(record.get("created_at")),
+            updated_at=parse_timestamp(record.get("updated_at")),
         )
 
     async def changed_since(self, moment: datetime, *, limit: int) -> list[str]:
@@ -159,18 +183,31 @@ class VikingStore:
                 TimeRange("updated_at", start=moment),
             ]
         )
+        # Ascending, so `limit` truncates the *newest* rows rather than the
+        # oldest. The watermark then advances only as far as this batch reached
+        # and the remainder is picked up next sweep. Descending would strand
+        # everything below the cut permanently.
         records = await self._db.filter(
             filter=condition,
             limit=limit,
             output_fields=_CHANGE_FIELDS,
             order_by="updated_at",
-            order_desc=True,
+            order_desc=False,
             ctx=self._ctx,
         )
         return [str(record["uri"]) for record in records if record.get("uri")]
 
     async def rows(self, uris: Sequence[str]) -> list[MemoryRow]:
-        """Fetch the text and timestamps for specific URIs."""
+        """Fetch the text and timestamps for specific URIs.
+
+        Raises
+        ------
+        ContentUnavailableError
+            When rows came back but none carried ``content``. That means the
+            backend is not storing memory text, so no quote could be verified
+            against the memory it cites -- see the exception for why falling
+            back to ``abstract`` would be worse than stopping.
+        """
         from openviking.storage.expr import In
 
         if not uris:
@@ -181,11 +218,31 @@ class VikingStore:
             output_fields=_ROW_FIELDS,
             ctx=self._ctx,
         )
-        rows = (self._row_from_record(record) for record in records)
-        return [row for row in rows if row is not None]
+        records = list(records)
+        rows = [
+            row
+            for row in (self._row_from_record(record) for record in records)
+            if row is not None
+        ]
+        if records and not rows:
+            raise ContentUnavailableError(
+                f"{len(records)} memory rows came back with no `content` field. "
+                "Reflection verifies every quote against the memory it cites, "
+                "which needs the text in the index. Enable content storage on "
+                "the vector backend (ov-postgres: `store_content`; OpenViking: "
+                "the adapter's USE_CONTENT_FIELD) and re-index."
+            )
+        return rows
 
     async def neighbours(self, row: MemoryRow, *, limit: int) -> list[MemoryRow]:
-        """Return memories semantically near ``row``, excluding itself."""
+        """Return memories semantically near ``row``, excluding itself.
+
+        Search is used to pick *which* memories, then their text is fetched
+        through :meth:`rows`. A ``MatchedContext`` carries ``abstract`` but no
+        ``content`` and no timestamps, so using it directly would hand the
+        model a summary to quote and stamp every neighbour with the current
+        time -- while the prompt asks it to prefer memories written apart.
+        """
         result = await self._fs.search(
             query=row.text,
             target_uri=self._memory_root,
@@ -193,44 +250,38 @@ class VikingStore:
             level=[2],
             ctx=self._ctx,
         )
-        found: list[MemoryRow] = []
-        for context in getattr(result, "matched_contexts", []) or []:
-            candidate = self._row_from_context(context)
-            if candidate is not None and candidate.uri != row.uri:
-                found.append(candidate)
-        return found[:limit]
+        uris = [
+            uri
+            for uri in (self._stored_uri(context) for context in result.memories or [])
+            if uri is not None and uri != row.uri
+        ]
+        return await self.rows(uris[:limit])
 
-    def _row_from_context(self, context: Any) -> MemoryRow | None:
-        """Build a row from a retrieval result.
+    @staticmethod
+    def _stored_uri(context: Any) -> str | None:
+        """The stored URI behind a retrieval result, or ``None`` to skip it.
 
-        Retrieval returns level-suffixed URIs -- ``/.abstract.md`` for L0,
-        ``/.overview.md`` for L1 -- but these are level-2 results, so the URI
-        is already the stored one. Guarded anyway: a suffixed URI would not
-        match anything the citation map can resolve, so it is dropped rather
-        than cited.
+        Retrieval appends a level suffix -- ``/.abstract.md`` for L0,
+        ``/.overview.md`` for L1. These are level-2 results so no suffix is
+        expected, but one would name a generated summary rather than a memory,
+        and citing it is exactly what the design forbids.
         """
         uri = getattr(context, "uri", None)
-        text = getattr(context, "content", None) or getattr(context, "abstract", None)
-        if not uri or not text:
+        if not uri:
             return None
         uri = str(uri)
         if uri.endswith("/.abstract.md") or uri.endswith("/.overview.md"):
             return None
-        return MemoryRow(
-            uri=uri,
-            text=str(text),
-            created_at=parse_timestamp(getattr(context, "created_at", None)),
-        )
+        return uri
 
     async def tail_sample(self, *, limit: int) -> list[MemoryRow]:
         """Return a few memories from the far end of the store.
 
-        memex samples at random with ``ORDER BY random()``. OpenViking's filter
-        API has no random ordering, so this takes the *oldest* rows instead --
-        a different mechanism for the same purpose. What matters is that the
-        model sees memories nothing selected for resembling its candidates, and
-        the oldest are the least likely to have been surfaced by a neighbour
-        search over recent changes.
+        memex samples with ``ORDER BY random()``. OpenViking's filter API has
+        no random ordering, so this reads a wider window of the least recently
+        updated memories and picks from it at random. Taking the oldest *n*
+        directly would return the same rows in every batch of every sweep --
+        a constant, not a sample, and a constant cannot break an echo chamber.
         """
         from openviking.storage.expr import And, Eq, PathScope
 
@@ -244,14 +295,20 @@ class VikingStore:
                     Eq("level", 2),
                 ]
             ),
-            limit=limit,
+            limit=limit * _TAIL_WINDOW,
             output_fields=_ROW_FIELDS,
             order_by="updated_at",
             order_desc=False,
             ctx=self._ctx,
         )
-        rows = (self._row_from_record(record) for record in records)
-        return [row for row in rows if row is not None]
+        rows = [
+            row
+            for row in (self._row_from_record(record) for record in records)
+            if row is not None
+        ]
+        if len(rows) <= limit:
+            return rows
+        return self._rng.sample(rows, limit)
 
     async def read_overview(self, directory: str) -> str | None:
         """Return a directory's generated L1 overview, or ``None`` if absent."""
@@ -271,8 +328,13 @@ class VikingStore:
         from openviking.session.memory.dataclass import MemoryFile
         from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 
-        topic = _slug(next(iter(sorted(observation.peers)), "general").split("/")[-1])
-        name = _slug(observation.title)
+        topic = _slug(sorted(observation.areas)[0].rsplit("/", 1)[-1])
+        # The title alone collides: "Both retry" and "Both retry!" slug the
+        # same, and write_file would overwrite one with the other. The digest
+        # is over the evidence, so re-running a sweep that reaches the same
+        # conclusion from the same memories lands on the same file and merges,
+        # while two different observations stay apart.
+        name = f"{_slug(observation.title)}-{_digest(observation)}"
         root = self._settings.observations_root.replace(
             "viking://~", f"viking://user/{self._ctx.user.user_id}"
         )
@@ -293,11 +355,11 @@ class VikingStore:
         memory_file = MemoryFile(
             uri=uri,
             content=_render(observation),
-            metadata={"topic": topic, "name": name, "links": links},
+            links=links,
+            memory_type="observations",
+            extra_fields={"topic": topic, "name": name},
         )
-        await self._fs.write_file(
-            uri, MemoryFileUtils.serialize(memory_file), ctx=self._ctx
-        )
+        await self._fs.write_file(uri, MemoryFileUtils.write(memory_file), ctx=self._ctx)
         return uri
 
     async def link(
@@ -334,8 +396,19 @@ class VikingStore:
         # the higher weight, so recording the same tension twice is idempotent.
         memory_file.links = merge_links(memory_file.links or [], [link])
         await self._fs.write_file(
-            from_uri, MemoryFileUtils.serialize(memory_file), ctx=self._ctx
+            from_uri, MemoryFileUtils.write(memory_file), ctx=self._ctx
         )
+
+
+def _digest(observation: Observation) -> str:
+    """A short stable hash of what an observation rests on.
+
+    Over the cited memories and quotes rather than the title, so the same
+    conclusion drawn from the same evidence keeps its filename across sweeps
+    and merges into itself instead of accumulating near-duplicates.
+    """
+    material = "\n".join(f"{uri}\t{quote}" for uri, quote in sorted(observation.evidence))
+    return hashlib.sha256(material.encode()).hexdigest()[:8]
 
 
 def _slug(text: str) -> str:
