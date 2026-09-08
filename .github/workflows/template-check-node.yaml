@@ -45,6 +45,28 @@ jobs:
       - name: Unit tests
         run: npm test
 
+      # The integration suites here sign in against a real Vault, and a suite
+      # with nothing to talk to fails rather than skips -- which is the point,
+      # but it means CI has to hand it one. Dev mode, in memory, thrown away
+      # with the runner: it holds nothing worth protecting. The port and root
+      # token match ov-dash's justfile, so local and CI agree.
+      - name: Start a throwaway Vault
+        if: >-
+          ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+              && hashFiles(format('packages/{0}/vitest.integration.config.ts', inputs.package)) != '' }}
+        run: |
+          set -euo pipefail
+          docker run -d --name ovdash-vault -p 18200:8200 \
+            -e VAULT_DEV_ROOT_TOKEN_ID=root hashicorp/vault:latest
+
+          # Bounded, so a container that never comes up fails in a minute
+          # instead of sitting against the job timeout.
+          for _ in $(seq 1 60); do
+            curl -sf -m 2 http://127.0.0.1:18200/v1/sys/health > /dev/null && break
+            sleep 1
+          done
+          curl -sf -m 2 http://127.0.0.1:18200/v1/sys/health > /dev/null
+
       # Against a real OpenViking, in a container the harness starts. Opt-in
       # per package via the script existing, and only on a branch push or when
       # asked: it pulls a large image and takes minutes, which is too much for

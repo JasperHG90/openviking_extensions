@@ -233,6 +233,12 @@ just image      # build the container
 just push       # publish it, multi-arch, to GHCR
 ```
 
+Releasing is a workflow, not a recipe: Actions → release, package `ov-dash`. It
+re-runs the gates, tags `ov-dash-v<version>`, and pushes the image to
+`ghcr.io/jasperhg90/ov-dash` for amd64 and arm64. `just push` is the hand path
+for when you need an image without cutting a release; it tags with the commit
+sha rather than a version.
+
 Under `just gates` are the same three npm scripts, if you would rather run one:
 
 ```bash

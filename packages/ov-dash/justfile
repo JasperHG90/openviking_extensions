@@ -154,9 +154,10 @@ push tag=tag:
 
 # Tag a release the way this repo names them: <package>-v<version>.
 #
-# ov-dash has no release workflow of its own yet — .github/workflows/release.yaml
-# builds Python packages — so this only applies the naming convention and pushes
-# the tag. The image is published separately with `just push tag=<version>`.
+# Releases normally come from .github/workflows/release.yaml (Actions → release,
+# package ov-dash), which tags, builds multi-arch and pushes to GHCR in one run.
+# This is the escape hatch for cutting one by hand when Actions is not an
+# option: it only tags, so pair it with `just push tag=<version>`.
 [doc('Tag a release as ov-dash-v<version> and push the tag.')]
 [group('ship')]
 release-tag version:
