@@ -115,3 +115,24 @@ class HybridSettings(BaseSettings):
         ge=0.0,
         description="Weight of search-tag overlap in the similarity blend.",
     )
+    rerank_pooling: bool = Field(
+        default=True,
+        description=(
+            "Route rerank calls through one pooled, trace-propagating "
+            "connection instead of a fresh one per call. OpenViking reranks "
+            "once per directory the descent visits, so a search opens hundreds "
+            "of connections and the TCP and TLS handshake costs more than the "
+            "inference."
+        ),
+    )
+    rerank_max_calls: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Ceiling on rerank calls per retrieval; 0 removes the ceiling. "
+            "Past it, candidates keep their vector scores -- the same "
+            "degradation OpenViking already applies when reranking fails. "
+            "Bounds the tail on a wide tree, where the descent has no cap of "
+            "its own on how many directories it visits."
+        ),
+    )

@@ -39,7 +39,7 @@ from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
 from opentelemetry.util.types import AttributeValue
 
-__all__ = ["annotate", "record_error", "traced"]
+__all__ = ["annotate", "record_error", "traced", "traced_sync"]
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -105,6 +105,45 @@ def traced(
         # method here names it, which mypy rejects. The cast covers
         # `functools.wraps`, whose result is typed `_Wrapped`.
         return cast(Callable[P, Awaitable[R]], wrapper)
+
+    return decorate
+
+
+def traced_sync(name: str) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    """Wrap a plain function so each call opens a span called ``name``.
+
+    The sibling of :func:`traced`, for the one code path here that is not
+    async: the rerank client reaches the network with a synchronous
+    ``requests.post``, which OpenViking calls from ``asyncio.to_thread``.
+    OpenTelemetry carries context across ``to_thread``, so a span opened here
+    still lands under the retrieval that caused it.
+
+    Parameters
+    ----------
+    name :
+        Span name.
+
+    Returns
+    -------
+    Callable
+        A decorator preserving the function's signature.
+
+    Raises
+    ------
+    TypeError
+        If applied to a coroutine function, which wants :func:`traced`.
+    """
+
+    def decorate(func: Callable[P, R]) -> Callable[P, R]:
+        if inspect.iscoroutinefunction(func):
+            raise TypeError(f"{func.__qualname__} is async; use traced() for it")
+
+        @functools.wraps(func)
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+            with _tracer().start_as_current_span(name):
+                return func(*args, **kwargs)
+
+        return cast(Callable[P, R], wrapper)
 
     return decorate
 

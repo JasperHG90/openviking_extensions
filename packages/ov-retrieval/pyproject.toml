@@ -46,6 +46,10 @@ dependencies = [
     "opentelemetry-api>=1.14",
     "pydantic>=2",
     "pydantic-settings>=2",
+    # Imported directly by `rerank`, which pools the connection OpenViking's
+    # rerank client opens per call. Declared rather than leant on: openviking
+    # already requires it, but a transitive dependency is not a promise.
+    "requests>=2.31",
 ]
 
 [project.scripts]

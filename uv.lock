@@ -2713,6 +2713,7 @@ dependencies = [
     { name = "openviking" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
+    { name = "requests" },
 ]
 
 [package.dev-dependencies]
@@ -2730,6 +2731,7 @@ requires-dist = [
     { name = "openviking", specifier = ">=0.4.16,<0.5" },
     { name = "pydantic", specifier = ">=2" },
     { name = "pydantic-settings", specifier = ">=2" },
+    { name = "requests", specifier = ">=2.31" },
 ]
 
 [package.metadata.requires-dev]

@@ -23,6 +23,7 @@ import logging
 from typing import Any
 
 from .config import HybridSettings
+from .rerank import install_pooled_rerank, uninstall_pooled_rerank
 from .retriever import HybridRetriever
 
 __all__ = ["install", "uninstall"]
@@ -56,8 +57,17 @@ def install(settings: HybridSettings | None = None) -> None:
         If the expected class is not where it should be, or is not a class.
         Better a refused startup than retrieval silently losing its keyword
         leg and its diversity pass.
+    pydantic.ValidationError
+        If ``settings`` is omitted and the environment holds a bad or
+        misspelled ``OV_RETRIEVAL_`` variable, since the settings are then read
+        here. Also a deliberate startup failure: a misspelled variable is one
+        the operator believes is in effect.
     """
     global _original
+
+    # Read before anything is patched, so a bad environment fails cleanly
+    # rather than half way through.
+    resolved = settings or HybridSettings()
 
     import importlib
 
@@ -78,6 +88,16 @@ def install(settings: HybridSettings | None = None) -> None:
     # settings, so an identity check would miss its own previous patch, record
     # it as the original, and leave uninstall() restoring a patch instead of
     # OpenViking's class.
+    # After both refusals above, so a startup this function is going to reject
+    # leaves nothing patched behind it. Otherwise the RuntimeError path would
+    # exit with the rerank client swapped and nobody left to call uninstall().
+    #
+    # Independent of the retriever swap itself: pooling helps whoever calls the
+    # rerank client, patched retriever or not, so it happens even on the
+    # already-installed path below.
+    if resolved.rerank_pooling:
+        install_pooled_rerank()
+
     if issubclass(current, HybridRetriever):
         logger.debug("ov-retrieval: already installed")
         return
@@ -90,7 +110,7 @@ def install(settings: HybridSettings | None = None) -> None:
         """A HybridRetriever carrying the settings install() was given."""
 
         def __init__(self, **kwargs: Any) -> None:
-            kwargs.setdefault("settings", settings)
+            kwargs.setdefault("settings", resolved)
             super().__init__(**kwargs)
 
     _ConfiguredHybridRetriever.__name__ = HybridRetriever.__name__
@@ -108,6 +128,8 @@ def uninstall() -> None:
     Does nothing when nothing was installed.
     """
     global _original
+
+    uninstall_pooled_rerank()
 
     if _original is None:
         return

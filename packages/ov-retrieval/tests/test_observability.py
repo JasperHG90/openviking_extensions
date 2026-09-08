@@ -12,13 +12,14 @@ import pytest
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import StatusCode
 
-from ov_retrieval.observability import annotate, record_error, traced
+from ov_retrieval.observability import annotate, record_error, traced, traced_sync
 
-# Explicit rather than relying on `asyncio_mode = "auto"`, which pytest reads
-# from this package's pyproject only when rootdir is this package. A run from
-# the workspace root has a different rootdir, and every async test here would
-# be skipped as unsupported. `tests/test_retriever.py` carries the same line.
-pytestmark = pytest.mark.asyncio
+# Marked per test rather than with a module-level `pytestmark`, and explicit
+# rather than relying on `asyncio_mode = "auto"`: pytest reads that setting
+# from this package's pyproject only when rootdir is this package, so a run
+# from the workspace root would skip every async test here as unsupported. A
+# module-level mark would fix that too, but it also lands on the sync tests
+# below, which pytest-asyncio warns about.
 
 # Absolute, not relative: this test package carries no `__init__.py`, so pytest
 # imports each module top-level with the directory on sys.path.
@@ -54,6 +55,7 @@ class Stub:
             return []
 
 
+@pytest.mark.asyncio
 async def test_a_traced_method_opens_one_span_named_after_it(
     spans: InMemorySpanExporter,
 ) -> None:
@@ -63,6 +65,7 @@ async def test_a_traced_method_opens_one_span_named_after_it(
     assert [span.name for span in spans.get_finished_spans()] == ["ov_retrieval.stub"]
 
 
+@pytest.mark.asyncio
 async def test_a_traced_method_returns_what_it_would_have(
     spans: InMemorySpanExporter,
 ) -> None:
@@ -70,6 +73,7 @@ async def test_a_traced_method_returns_what_it_would_have(
     assert await Stub().work(21) == 42
 
 
+@pytest.mark.asyncio
 async def test_annotate_adds_to_the_span_that_is_open(
     spans: InMemorySpanExporter,
 ) -> None:
@@ -92,6 +96,7 @@ def test_annotate_outside_a_span_does_nothing(spans: InMemorySpanExporter) -> No
     assert spans.get_finished_spans() == ()
 
 
+@pytest.mark.asyncio
 async def test_a_swallowed_failure_still_marks_its_own_span_failed(
     spans: InMemorySpanExporter,
 ) -> None:
@@ -111,12 +116,43 @@ def test_traced_refuses_a_sync_method() -> None:
     Raised at decoration time, so the mistake surfaces on import.
     """
     with pytest.raises(TypeError, match="sync"):
-
-        @traced("ov_retrieval.wrong")
+        # Deliberately the wrong type: the point is the runtime guard, and
+        # mypy correctly objects to the very call this test exists to make.
+        @traced("ov_retrieval.wrong")  # type: ignore[arg-type]
         def plain(self: object) -> None:
             """Never decorated successfully."""
 
 
+def test_traced_sync_refuses_an_async_function() -> None:
+    """The mirror of the guard on ``traced``, which has one and is tested.
+
+    Wrapping a coroutine in the sync wrapper would return the coroutine
+    unawaited, so the call would appear to succeed and do nothing.
+    """
+    with pytest.raises(TypeError, match="async"):
+        # mypy accepts this: a coroutine function satisfies `Callable[P, R]`
+        # with R bound to the coroutine. Which is exactly why the guard has to
+        # exist at runtime -- the type system will not catch this mistake.
+        @traced_sync("ov_retrieval.wrong")
+        async def coroutine() -> None:
+            """Never decorated successfully."""
+
+
+def test_traced_sync_opens_a_span_and_returns_the_value(
+    spans: InMemorySpanExporter,
+) -> None:
+    """The rerank client's HTTP call is sync, and still has to be traced."""
+
+    @traced_sync("ov_retrieval.sync_work")
+    def work(value: int) -> int:
+        """Double a number inside a span."""
+        return value * 2
+
+    assert work(21) == 42
+    assert [s.name for s in spans.get_finished_spans()] == ["ov_retrieval.sync_work"]
+
+
+@pytest.mark.asyncio
 async def test_retrieve_records_the_shape_of_the_work(
     spans: InMemorySpanExporter,
 ) -> None:
@@ -135,6 +171,7 @@ async def test_retrieve_records_the_shape_of_the_work(
     assert top.attributes["ov_retrieval.results"] == 2
 
 
+@pytest.mark.asyncio
 async def test_a_single_candidate_still_reports_its_result_count(
     spans: InMemorySpanExporter,
 ) -> None:
@@ -154,6 +191,7 @@ async def test_a_single_candidate_still_reports_its_result_count(
     assert top.attributes["ov_retrieval.results"] == 1
 
 
+@pytest.mark.asyncio
 async def test_the_passes_nest_under_the_retrieval(
     spans: InMemorySpanExporter,
 ) -> None:
@@ -170,12 +208,15 @@ async def test_the_passes_nest_under_the_retrieval(
         "ov_retrieval.keyword_search",
         "ov_retrieval.diversify",
     } <= set(finished)
+    top_context = top.get_span_context()
+    assert top_context is not None
     for name in ("ov_retrieval.fuse_keywords", "ov_retrieval.diversify"):
         parent = finished[name].parent
         assert parent is not None
-        assert parent.span_id == top.get_span_context().span_id
+        assert parent.span_id == top_context.span_id
 
 
+@pytest.mark.asyncio
 async def test_a_failing_keyword_leg_is_visible_without_failing_the_retrieval(
     spans: InMemorySpanExporter,
 ) -> None:
@@ -199,6 +240,7 @@ async def test_a_failing_keyword_leg_is_visible_without_failing_the_retrieval(
     assert finished["ov_retrieval.retrieve"].status.status_code is StatusCode.UNSET
 
 
+@pytest.mark.asyncio
 async def test_a_backend_without_keyword_search_says_so(
     spans: InMemorySpanExporter,
 ) -> None:
@@ -218,6 +260,7 @@ async def test_a_backend_without_keyword_search_says_so(
     assert keyword.attributes["ov_retrieval.outcome"] == "backend_lacks_keyword_search"
 
 
+@pytest.mark.asyncio
 async def test_diversity_without_a_similarity_signal_says_so(
     spans: InMemorySpanExporter,
 ) -> None:

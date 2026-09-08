@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextvars import ContextVar
 from typing import Any
 
 from openviking.retrieve.hierarchical_retriever import HierarchicalRetriever
@@ -39,6 +40,14 @@ logger = logging.getLogger(__name__)
 # Ranker names, used as RRF keys and in the debug log.
 _VECTOR = "vector"
 _KEYWORD = "keyword"
+
+# Rerank calls still allowed in the retrieval currently running on this task.
+# A ContextVar rather than an attribute because one retriever instance serves
+# every concurrent request, so a counter on `self` would have them spending
+# each other's budget. None means no ceiling.
+_rerank_budget: ContextVar[int | None] = ContextVar(
+    "ov_retrieval_rerank_budget", default=None
+)
 
 
 class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is untyped
@@ -111,7 +120,14 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
             }
         )
 
-        result = await super().retrieve(query, ctx, limit=pool, **kwargs)
+        # Set before the base retriever runs, since the descent it drives is
+        # what spends the budget. The token is reset in `finally` so a task
+        # reused for the next request does not inherit what is left.
+        token = _rerank_budget.set(settings.rerank_max_calls or None)
+        try:
+            result = await super().retrieve(query, ctx, limit=pool, **kwargs)
+        finally:
+            _rerank_budget.reset(token)
         contexts: list[MatchedContext] = list(result.matched_contexts)
         annotate({"ov_retrieval.candidates": len(contexts)})
         if len(contexts) <= 1:
@@ -145,6 +161,66 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
         finished = self._finish(result, contexts, limit)
         annotate({"ov_retrieval.results": len(finished.matched_contexts)})
         return finished
+
+    @traced("ov_retrieval.rerank")
+    async def _rerank_scores(
+        self,
+        query: str,
+        documents: list[str],
+        fallback_scores: list[float],
+    ) -> list[float]:
+        """Rerank as the base class does, under a per-retrieval call ceiling.
+
+        The base retriever calls this once per directory the descent visits,
+        serially, and caps neither the calls nor the directories. On a wide
+        tree that is hundreds of round trips for one search. This adds the
+        ceiling ``rerank_max_calls`` and otherwise defers entirely.
+
+        Exhausting the budget returns ``fallback_scores`` -- the vector
+        ordering -- which is the same degradation the base class already
+        applies when the rerank client fails or answers oddly. So the worst
+        case is a ranking OpenViking itself considers acceptable, rather than
+        an error.
+
+        Parameters
+        ----------
+        query :
+            Query text handed to the rerank model.
+        documents :
+            Candidate texts to score.
+        fallback_scores :
+            Vector scores to keep when reranking is skipped.
+
+        Returns
+        -------
+        list[float]
+            Rerank scores, or ``fallback_scores`` when the budget is spent.
+        """
+        annotate({"ov_retrieval.documents": len(documents)})
+        # Spend nothing on a batch the base class will refuse anyway: it
+        # returns early when every document is blank, without calling the
+        # service. A subtree of directories with no abstract yet -- ordinary
+        # during a backfill -- would otherwise burn the whole ceiling before
+        # one real rerank had happened.
+        if not any(document.strip() for document in documents):
+            annotate({"ov_retrieval.outcome": "nothing_to_rerank"})
+            return fallback_scores
+
+        remaining = _rerank_budget.get()
+        if remaining is not None:
+            if remaining <= 0:
+                # Recorded rather than logged: a search that silently stopped
+                # reranking half way looks identical to one that never had a
+                # reranker, and the scores do not say which.
+                annotate({"ov_retrieval.outcome": "rerank_budget_spent"})
+                return fallback_scores
+            _rerank_budget.set(remaining - 1)
+
+        scores: list[float] = await super()._rerank_scores(
+            query, documents, fallback_scores
+        )
+        annotate({"ov_retrieval.outcome": "reranked"})
+        return scores
 
     @classmethod
     def _stored_uri(cls, context: MatchedContext) -> str:

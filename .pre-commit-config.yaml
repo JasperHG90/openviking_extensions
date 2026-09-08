@@ -43,6 +43,8 @@ repos:
           - pydantic>=2
           - pydantic-settings>=2
           - pytest>=7
+          # `rerank` imports requests to pool the rerank client's connection.
+          - types-requests>=2.31
         args: [--config-file=packages/ov-retrieval/pyproject.toml]
 
       - id: mypy

@@ -164,6 +164,54 @@ similarity matrix is computed, and no over-fetch happens — retrieval behaves
 exactly as it would without this installed. Useful while a collection is still
 backfilling its bodies, or to A/B a ranking complaint.
 
+## Rerank cost
+
+OpenViking reranks **once per directory** its hierarchical descent visits, not
+once per query. The calls run one after another, and nothing caps how many
+directories a search explores — only a convergence heuristic. On a wide tree a
+single search made hundreds of rerank calls.
+
+Worse, each went out through a module-level `requests.post` with no session, so
+every call paid a fresh TCP and TLS handshake. Against a LAN rerank service,
+calls it answered in about 5 ms came back in 15–30 ms: the handshake cost more
+than the inference.
+
+Two settings address that:
+
+| Setting | Default | Does |
+|---|---|---|
+| `OV_RETRIEVAL_RERANK_POOLING` | `true` | Routes rerank calls through one pooled connection and adds a `traceparent` header |
+| `OV_RETRIEVAL_RERANK_MAX_CALLS` | `0` (no limit) | Caps rerank calls per retrieval |
+
+Past the cap, candidates keep their vector scores — the same degradation
+OpenViking already applies when reranking fails, so the worst case is a ranking
+it considers acceptable rather than an error. The `ov_retrieval.rerank` span
+records `rerank_budget_spent` when it bites, because a search that quietly
+stopped reranking half way looks exactly like one that never had a reranker.
+
+Two details of the pooling worth knowing:
+
+- **Cookies are refused, not shared.** A `Session` keeps a cookie jar where the
+  per-call `requests.post` had none. A load balancer's stickiness cookie would
+  otherwise be replayed on every later call, pinning the whole process to one
+  backend node. The jar is disabled outright.
+- **`traceparent` goes out on both clients.** Safe even on the VikingDB one,
+  which signs its headers first: `SignerV4` covers `Content-Type`,
+  `Content-Md5`, `Host` and `X-*` and names exactly those in `SignedHeaders`,
+  so a verifier ignores anything else. That client sends its body as a
+  pre-encoded string rather than JSON, though, so its span carries no batch
+  size.
+- **The pool holds 32 connections; exceeding it costs reuse, not requests.**
+  Above that, urllib3 logs `Connection pool is full, discarding connection`.
+  It is discarding the socket after the response, not the call — those requests
+  are sent and answered, they just fall back to a connection each. A test pins
+  this with a pool of 2 and 20 concurrent calls.
+
+What this does **not** fix: the calls are still one per directory and still
+serial. Batching a whole round into one call, or issuing them concurrently,
+means overriding `_recursive_search` and copying the descent logic this package
+exists to avoid reimplementing. Both belong upstream.
+
 ## Tracing
 
 Each pass emits an OpenTelemetry span, so a trace shows where retrieval spent
@@ -176,6 +224,8 @@ its time and — more usefully — which passes declined to run.
 | `ov_retrieval.fuse_keywords` | vector candidates, keyword hits, fused count |
 | `ov_retrieval.diversify` | candidates, embedding pairs, tag pairs, selected |
 | `ov_retrieval.embedding_similarity` | URIs asked about, pairs returned |
+| `ov_retrieval.rerank` | documents scored, or `rerank_budget_spent` |
+| `ov_retrieval.rerank_call` | one HTTP call to the rerank service; batch size when the body is JSON |
 
 There is nothing to configure. OpenViking's server installs the global tracer
 from `server.observability.traces` in `ov.conf`, and these spans join whatever
@@ -196,6 +246,7 @@ request failed would be a lie.
 | `fusion` | No — pure functions |
 | `diversity` | No — pure functions |
 | `observability` | No — OpenTelemetry API only |
+| `rerank` | Patches OpenViking's rerank client |
 | `retriever`, `install` | Yes |
 
 The algorithms are deliberately free of OpenViking imports, so they are
