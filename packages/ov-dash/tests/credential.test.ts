@@ -31,10 +31,12 @@ function config(extra: Record<string, string> = {}) {
   });
 }
 
+// A real address, because the test below is about identity not reaching the
+// cookie and an empty one would be in every string ever written.
 const VIEWER: Viewer = {
   sub: "jasper",
   name: "jasper",
-  email: "",
+  email: "jasper@example.com",
   account: "lab",
   user: "jasper",
 };
@@ -85,7 +87,11 @@ describe("the credential cookie", () => {
       const decoded = Buffer.from(part, "base64url").toString("utf8");
       expect(decoded).not.toContain(TOKEN);
       expect(decoded).not.toContain(VIEWER.account);
-      expect(decoded).not.toContain("@");
+      // The address itself. This used to look for a bare "@", which decoded
+      // ciphertext produces on its own roughly one run in seven -- a test that
+      // failed at random while proving nothing, since the fixture had no email
+      // to leak.
+      expect(decoded).not.toContain(VIEWER.email);
     }
   });
 
