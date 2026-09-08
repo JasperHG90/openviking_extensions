@@ -49,10 +49,10 @@ jobs:
           SKIP: check-ov-dash,lint-ov-dash,test-ov-dash,check-ov-clip,lint-ov-clip,test-ov-clip
         run: uvx prek@0.2.25 run --all-files --show-diff-on-failure
 
-  # The package list lives in the filters below and in the two fallback lists;
-  # a new package adds one filter block and one name, in the list matching the
-  # template that builds it. Every filter also names the shared files a package
-  # depends on: the workspace files and the workflows.
+  # The package list lives in the filters below and in the three fallback
+  # lists; a new package adds one filter block and one name, in the list
+  # matching the template that builds it. Every filter also names the shared
+  # files a package depends on: the workspace files and the workflows.
   detect:
     name: detect changed packages
     runs-on: ubuntu-latest
@@ -100,8 +100,9 @@ jobs:
 
       # Split the changed set by which template can build each package: a
       # Python package gets a wheel built and imported, a shell package gets
-      # its suite run against several bashes. Neither template can stand in
-      # for the other, so they are separate jobs over separate lists.
+      # its suite run against several bashes, a Node package gets its whole
+      # toolchain installed and whatever it ships built. No template can stand
+      # in for another, so they are separate jobs over separate lists.
       #
       # workflow_dispatch has no base to diff against, so fall back to every
       # package.

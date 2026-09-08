@@ -21,35 +21,47 @@ Each package has its own README with install and usage instructions.
 packages/
   ov-postgres/     Python package (uv workspace member)
   ov-retrieval/    Python package (uv workspace member)
-  ovx/             Python package with a Typer CLI (standalone uv project)
-  ov-skills/       Agent skills with a Python test suite (standalone uv project)
+  ovx/             Typer CLI, Vault login, Firefox native host (standalone uv project)
+  ov-skills/       Agent skills, a bash installer, a Python test suite (standalone uv project)
   ov-dash/         Node service and Svelte client (npm, its own toolchain)
   ov-clip/         Firefox extension (npm, its own toolchain)
 ```
 
-Python packages are members of a single [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/): one `uv.lock` and one `.venv` at the root cover all of them. Packages in other languages live under `packages/` beside them with their own toolchains.
+Two of the four Python packages — `ov-postgres` and `ov-retrieval` — are members of a single [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/): one `uv.lock` and one `.venv` at the root cover both. `ovx` and `ov-skills` stand alone, each with a lock and a `.venv` of its own. Packages in other languages live under `packages/` beside them with their own toolchains.
 
-`ovx` is a Python package too, but is excluded from the workspace rather than added to it: a workspace resolves one Python floor across every member, and `ovx` needs 3.11+ for `tomllib` while `ov-postgres` still supports 3.10. Standing alone it keeps its own lock and its own floor.
-
-`ov-skills` ships markdown and a bash installer rather than Python, but is tested in Python, so it carries a `pyproject.toml` of its own for the same reason.
+They stand alone because a workspace resolves one Python floor across every member: `ovx` needs 3.11+ for `tomllib` while `ov-postgres` still supports 3.10. `ov-skills` ships markdown and a bash installer rather than Python, but its tests need 3.11+ too, so it carries a `pyproject.toml` of its own and stays out for the same reason. The root `pyproject.toml` names both in `exclude`, which stops uv adopting them when a command runs inside their directories.
 
 ## Development
 
 ```bash
-uv sync --all-packages        # install every workspace package with its dev group
-uvx prek run --all-files      # lint, type-check, and unit-test everything
+uv sync --all-packages             # the two workspace members, with their dev groups
+uvx prek@0.2.25 run --all-files    # ruff, mypy, and the Python suites
 ```
+
+`--all-packages` reaches the workspace and stops there, so it installs `ov-postgres` and `ov-retrieval` only. `ovx` and `ov-skills` build their own environments the first time you `uv run --directory` into them.
+
+`prek` covers the Python packages on a bare checkout, but not the Node ones. Its six Node hooks shell out to each package's own `node_modules`, which nothing at the root installs, so until you have run `npm install` there they fail on a missing `biome` rather than on anything about the code. CI's repo-wide job skips them by name for that reason and runs them in the Node template instead, with the package's pinned toolchain.
 
 To work on one package, run commands scoped to it:
 
 ```bash
 uv run --directory packages/ov-postgres pytest
-uv run --directory packages/ovx pytest        # its own project, its own lock
+uv run --directory packages/ovx pytest          # its own project, its own lock
+uv run --directory packages/ov-skills pytest
+
+npm --prefix packages/ov-clip install && npm --prefix packages/ov-clip test
+cd packages/ov-dash && npm install && just gates   # ov-dash drives its gates through just
 ```
 
 ## CI
 
-One workflow, [`ci.yaml`](.github/workflows/ci.yaml), covers the repo: repo-wide checks run once, then each package whose files changed is tested by the template that fits it. [`template-check.yaml`](.github/workflows/template-check.yaml) tests a Python package across its supported interpreters and builds and imports its wheel; [`template-check-shell.yaml`](.github/workflows/template-check-shell.yaml) runs a shell package's suite on both Ubuntu and macOS, since macOS still ships bash 3.2 and rejects syntax every other bash accepts.
+One workflow, [`ci.yaml`](.github/workflows/ci.yaml), covers the repo: repo-wide checks run once, then each package whose files changed is tested by the template that fits it. There are three.
+
+| Template | Packages | What it runs |
+| --- | --- | --- |
+| [`template-check.yaml`](.github/workflows/template-check.yaml) | `ov-postgres`, `ov-retrieval`, `ovx` | The suite on the floor its `requires-python` names and on the newest interpreter, then builds a wheel and checks it installs and imports on its own. |
+| [`template-check-shell.yaml`](.github/workflows/template-check-shell.yaml) | `ov-skills` | The suite on both Ubuntu and macOS, since macOS still ships bash 3.2 and rejects syntax every other bash accepts. |
+| [`template-check-node.yaml`](.github/workflows/template-check-node.yaml) | `ov-dash`, `ov-clip` | Type-check, lint and tests against the `node_modules` it installs — the gates the repo-wide job cannot run — then builds whatever the package ships: a container where there is a `Dockerfile`, an extension where there is a `manifest.json`. |
 
 Adding a package means adding one filter block to `ci.yaml` and its name to whichever of the three fallback lists matches its template. It also needs an entry in `release.yaml`'s `package` choice. A Python package needs nothing more there, since that is the branch everything falls into by default. Any other package goes in two more places: the literal naming its template — `'["ov-skills"]'` for a shell package, `'["ov-clip", "ov-dash"]'` for a Node one — and all four `'["ov-skills", "ov-clip", "ov-dash"]'` exclusions, one on the `test` job and three on the publish job's Python steps. Miss the last and the Python template runs against a package that has no wheel. GitHub Actions cannot share a list between workflows or choose a reusable workflow from an expression, so that list is repeated rather than defined once. A Python package also goes in the workspace members in [`pyproject.toml`](pyproject.toml); a standalone one goes in that file's `exclude` list instead.
 
@@ -57,7 +69,7 @@ Adding a package means adding one filter block to `ci.yaml` and its name to whic
 
 Each package releases on its own, from the manual [`release.yaml`](.github/workflows/release.yaml) workflow (Actions → release). Pick the package and an increment — a plain PATCH/MINOR/MAJOR bump of the package's newest tag — or type an explicit version, and run with `dry_run` first to see the plan. A real run re-tests the package, pushes an annotated `<package>-v<version>` tag, and publishes a GitHub release carrying the built artifacts. Nothing releases on push.
 
-The tag is the only place a version exists. A Python package gets there through hatch-vcs, which reads the tag at build time. A shell package has no wheel and no hatch-vcs, so the release stamps the version in and attaches an installer pinned to the same release — a checkout claims no version, because an untagged working copy has none. `ov-skills` stamps its plugin manifest, which reads `0.0.0` in a checkout, and ships a tarball of `skills/`; its installer defaults to the newest release rather than to `main`, and installing the branch tip is opt-in via `--main`.
+The tag is the only place a version exists. A Python package gets there through hatch-vcs, which reads the tag at build time. A shell package has no wheel and no hatch-vcs, so the release stamps the version in and attaches an installer pinned to the same release — a checkout claims no version, because an untagged working copy has none. `ov-skills` stamps its plugin manifest, which reads `0.0.0` in a checkout, and ships a tarball holding `skills/` and that manifest — the shape `install.sh` unpacks, and a drop-in Claude Code plugin directory for anyone who would rather unpack it by hand. Its installer defaults to the newest release rather than to `main`, and installing the branch tip is opt-in via `--main`.
 
 `ov-clip` follows the same rule: its `manifest.json` reads `0.0.0` in a checkout and the release stamps the tag in, then checks the stamp took — Firefox refuses to install two builds claiming the same version, so a stamp that silently failed would look like "the update did not apply". With `AMO_JWT_ISSUER` and `AMO_JWT_SECRET` set, the release signs through AMO and attaches an installable `.xpi`; without them it attaches an unsigned `.zip` rather than failing, so a fork can still cut a release.
 
