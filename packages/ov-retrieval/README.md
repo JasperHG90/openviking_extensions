@@ -205,7 +205,7 @@ Two details of the pooling worth knowing:
   Above that, urllib3 logs `Connection pool is full, discarding connection`.
   It is discarding the socket after the response, not the call — those requests
   are sent and answered, they just fall back to a connection each. A test pins
-  this with a pool of 2 and 20 concurrent calls.
+  this with a pool of 2 and four rounds of eight concurrent calls.
 
 What this does **not** fix: the calls are still one per directory and still
 serial. Batching a whole round into one call, or issuing them concurrently,

@@ -228,6 +228,26 @@ def test_installing_twice_does_not_stack() -> None:
     assert module.requests is first
 
 
+def test_the_packages_uninstall_also_unpools() -> None:
+    """``uninstall()`` has to undo everything ``install()`` did.
+
+    Tested through the public function rather than the pooling one it calls:
+    the tests around it all reach for `uninstall_pooled_rerank` directly, so
+    nothing otherwise notices if `uninstall()` stops calling it and leaves both
+    modules patched with the session open.
+    """
+    from ov_retrieval.install import install, uninstall
+
+    module = importlib.import_module(_OPENAI_RERANK)
+    original = module.requests
+    install()
+    assert isinstance(module.requests, _PooledRequests), "nothing to undo otherwise"
+
+    uninstall()
+
+    assert module.requests is original
+
+
 def test_uninstalling_restores_the_real_module() -> None:
     """Process-global state, so it has to be reversible."""
     module = importlib.import_module(_OPENAI_RERANK)

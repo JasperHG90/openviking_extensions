@@ -84,10 +84,6 @@ def install(settings: HybridSettings | None = None) -> None:
             f"{_MODULE}.{_ATTRIBUTE} is {type(current)!r}, not a class. Refusing "
             "to replace something whose shape is not understood."
         )
-    # `issubclass`, not `is`: what gets installed is a subclass carrying the
-    # settings, so an identity check would miss its own previous patch, record
-    # it as the original, and leave uninstall() restoring a patch instead of
-    # OpenViking's class.
     # After both refusals above, so a startup this function is going to reject
     # leaves nothing patched behind it. Otherwise the RuntimeError path would
     # exit with the rerank client swapped and nobody left to call uninstall().
@@ -98,6 +94,10 @@ def install(settings: HybridSettings | None = None) -> None:
     if resolved.rerank_pooling:
         install_pooled_rerank()
 
+    # `issubclass`, not `is`: what gets installed is a subclass carrying the
+    # settings, so an identity check would miss its own previous patch, record
+    # it as the original, and leave uninstall() restoring a patch instead of
+    # OpenViking's class.
     if issubclass(current, HybridRetriever):
         logger.debug("ov-retrieval: already installed")
         return

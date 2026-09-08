@@ -32,6 +32,17 @@ worth writing down because it looks like it should not be. ``SignerV4`` signs
 and names exactly that set in the request's ``SignedHeaders``. A verifier
 checks the headers named there and ignores the rest, so ``traceparent`` --
 which can never be in the set -- rides along without disturbing the signature.
+``requests`` already puts five unsigned headers on every one of those calls
+(``Accept``, ``Accept-Encoding``, ``Connection``, ``Content-Length``,
+``User-Agent``), so a service refusing unsigned headers would have rejected
+this client long before we added a sixth.
+
+One thing to know before adding to what goes out: ``inject`` emits whatever
+propagators are configured, which by default is ``tracecontext`` *and*
+``baggage``. Nothing in OpenViking sets baggage today, but if anything ever
+does, its contents would leave the process with every rerank call -- and the
+rerank endpoint is frequently a third-party vendor. Pin ``OTEL_PROPAGATORS`` to
+``tracecontext`` if that matters more than the convenience.
 
 Why ``requests`` here and not ``httpx``, against this repo's usual rule: this
 module is a drop-in for an existing ``requests`` call site inside somebody
@@ -191,9 +202,10 @@ class _PooledRequests:
     def _prepare(kwargs: dict[str, Any]) -> None:
         """Stamp the trace context on the outgoing headers, and note the batch.
 
-        Takes a ``MutableMapping`` rather than a ``dict``, because the VikingDB
-        client hands over the header container its signer built rather than a
-        plain dictionary.
+        Any mutable mapping is accepted rather than only ``dict``. Both clients
+        happen to pass a plain dictionary today; nothing here controls that,
+        and a header container is the sort of thing a library swaps for a
+        case-insensitive mapping without calling it a breaking change.
         """
         headers = kwargs.get("headers")
         if isinstance(headers, MutableMapping):
