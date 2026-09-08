@@ -184,7 +184,9 @@ def test_every_public_method_that_runs_sql_is_traced() -> None:
     # the most consequential DDL this package runs, and it happens here.
     by_class: dict[str, dict[str, ast.FunctionDef | ast.AsyncFunctionDef]] = {}
     for module in (ov_postgres.collection, ov_postgres.adapter):
-        tree = ast.parse(pathlib.Path(module.__file__).read_text())
+        source = module.__file__
+        assert source is not None, f"{module.__name__} has no file to parse"
+        tree = ast.parse(pathlib.Path(source).read_text())
         # Module-level functions count too: SQL reached through one of those
         # would otherwise be invisible to this walk.
         module_level = {
