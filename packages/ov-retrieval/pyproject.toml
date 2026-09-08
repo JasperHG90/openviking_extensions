@@ -114,6 +114,15 @@ plugins = ["pydantic.mypy"]
 module = ["openviking.*", "openviking_cli.*", "testcontainers.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+# hatch-vcs writes `_version.py` at build time, so it is absent from a fresh
+# checkout. `__init__` already falls back to importlib.metadata when the import
+# fails; without this the type check passes locally, where an editable install
+# has generated the file, and fails in CI, where nothing has. ov-postgres
+# carries the same override for the same reason.
+module = ["ov_retrieval._version"]
+ignore_missing_imports = true
+
 [tool.uv.sources]
 ov-postgres = { workspace = true }
 
