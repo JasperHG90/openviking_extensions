@@ -20,8 +20,8 @@ from __future__ import annotations
 import logging
 
 from .reflect.config import ReflectSettings
-from .reflect.register import register as register_reflect
-from .reflect.register import unregister as unregister_reflect
+from .reflect.registration import register as register_reflect
+from .reflect.registration import unregister as unregister_reflect
 from .retrieval.config import HybridSettings
 from .retrieval.patch import install as install_retrieval
 from .retrieval.patch import uninstall as uninstall_retrieval

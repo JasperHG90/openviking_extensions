@@ -11,13 +11,13 @@ caught by importing the class and looking.
 from __future__ import annotations
 
 import random
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
 
 from ov_ext.reflect.exceptions import ContentUnavailableError
-from ov_ext.reflect.models import Observation
+from ov_ext.reflect.models import MemoryRow, Observation
 from ov_ext.reflect.viking import VikingStore, _digest, _render, _slug
 
 NOW = datetime(2026, 9, 8, tzinfo=timezone.utc)
@@ -241,8 +241,14 @@ async def test_a_contradiction_link_is_merged_into_what_the_file_already_has() -
     existing = MemoryFile(
         uri="viking://x/a.md",
         content="body",
-        links=[{"from_uri": "viking://x/a.md", "to_uri": "viking://x/keep.md",
-                "link_type": "related_to", "weight": 0.5}],
+        links=[
+            {
+                "from_uri": "viking://x/a.md",
+                "to_uri": "viking://x/keep.md",
+                "link_type": "related_to",
+                "weight": 0.5,
+            }
+        ],
     )
     fs = FakeFS({"viking://x/a.md": MemoryFileUtils.write(existing)})
 
@@ -281,3 +287,118 @@ def test_the_rendered_body_carries_every_quote() -> None:
     assert "retries failed jobs" in body
     assert "exponential backoff" in body
     assert body.startswith("# Both retry")
+
+
+# --- the paths a mutation survived until they were covered ------------------
+
+
+class FakeFind:
+    """What `viking_fs.search` returns: a FindResult-shaped object."""
+
+    def __init__(self, memories: list[Any]) -> None:
+        self.memories = memories
+
+
+class FakeSearchFS(FakeFS):
+    """A filesystem whose search returns canned matches."""
+
+    def __init__(self, matches: list[Any]) -> None:
+        super().__init__()
+        self._matches = matches
+        self.searches: list[dict[str, Any]] = []
+
+    async def search(self, **kwargs: Any) -> FakeFind:
+        self.searches.append(kwargs)
+        return FakeFind(self._matches)
+
+
+class FakeMatch:
+    """A MatchedContext-shaped result: a URI, and no content or timestamps."""
+
+    def __init__(self, uri: str) -> None:
+        self.uri = uri
+        self.abstract = "a generated summary"
+
+
+async def test_neighbours_reads_the_attribute_find_result_actually_has() -> None:
+    """`matched_contexts` lives on QueryResult; reading it here returns nothing.
+
+    A getattr default hid that, which made the neighbour leg -- the thing that
+    makes this reflection rather than summarising the changed window -- a
+    silent no-op.
+    """
+    neighbour = "viking://user/jasper/memories/entities/b.md"
+    fs = FakeSearchFS([FakeMatch(neighbour)])
+    db = FakeDB([{"uri": neighbour, "content": "older note", "created_at": NOW}])
+    subject = MemoryRow(
+        uri="viking://x/a.md", text="note", created_at=NOW, updated_at=NOW
+    )
+
+    found = await store(db, fs).neighbours(subject, limit=4)
+
+    assert [r.uri for r in found] == [neighbour]
+    assert found[0].text == "older note"  # the memory, not the summary
+
+
+async def test_neighbours_excludes_the_memory_it_started_from() -> None:
+    subject = MemoryRow(
+        uri="viking://user/jasper/memories/entities/a.md",
+        text="note",
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    fs = FakeSearchFS([FakeMatch(subject.uri)])
+    assert await store(FakeDB([]), fs).neighbours(subject, limit=4) == []
+
+
+async def test_neighbours_never_cites_a_generated_summary() -> None:
+    """A level-suffixed URI names an overview, and quoting one proves nothing."""
+    fs = FakeSearchFS([FakeMatch("viking://user/jasper/memories/entities/.overview.md")])
+    subject = MemoryRow(
+        uri="viking://x/a.md", text="note", created_at=NOW, updated_at=NOW
+    )
+    assert await store(FakeDB([]), fs).neighbours(subject, limit=4) == []
+
+
+async def test_the_boundary_row_does_not_come_back_every_sweep() -> None:
+    """TimeRange compiles `start` to `>=`, so the row on the mark repeats.
+
+    Harmless once, but with enough rows sharing a timestamp it fills the batch
+    and the mark can never advance past them.
+    """
+    db = FakeDB(
+        [
+            {"uri": "viking://x/on-the-mark.md", "updated_at": NOW},
+            {"uri": "viking://x/after.md", "updated_at": NOW + timedelta(seconds=1)},
+        ]
+    )
+    assert await store(db).changed_since(NOW, limit=10) == ["viking://x/after.md"]
+
+
+async def test_the_written_uri_carries_the_digest() -> None:
+    """Asserting `_digest` in isolation does not prove the filename uses it."""
+    fs = FakeFS()
+    uri = await store(fs=fs).write_observation(observation())
+    assert _digest(observation()) in uri
+    assert uri.endswith(".md")
+
+
+async def test_the_same_memories_are_written_to_the_same_file_twice() -> None:
+    """So a re-sweep merges rather than accumulating near-duplicates."""
+    fs = FakeFS()
+    first = await store(fs=fs).write_observation(observation())
+    second = await store(fs=fs).write_observation(observation())
+    assert first == second
+
+
+async def test_different_memories_are_written_to_different_files() -> None:
+    other = Observation(
+        title="Both retry",
+        content="Same title, different sources.",
+        evidence=(("viking://x/c.md", "q1"), ("viking://x/d.md", "q2")),
+        areas=frozenset({"viking://x"}),
+    )
+    fs = FakeFS()
+    assert await store(fs=fs).write_observation(observation()) != await store(
+        fs=fs
+    ).write_observation(other)

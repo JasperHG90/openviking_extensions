@@ -132,11 +132,26 @@ class FakeLLM:
         self.prompts: list[str] = []
 
     async def complete(self, prompt: str, model: type[T]) -> T | None:
-        """Return the next queued reply, or ``None`` when the queue is empty."""
+        """Return the next queued reply, or ``None`` when the queue is empty.
+
+        Raises
+        ------
+        AssertionError
+            If the queued reply is not of the type the caller asked for. The
+            engine makes two calls per batch wanting two different shapes, so a
+            fake that handed back whichever came next would turn a test's
+            queueing mistake into a confusing attribute error deep in the
+            engine rather than a clear failure here.
+        """
         self.prompts.append(prompt)
         if not self._replies:
             return None
         reply = self._replies.pop(0)
         if isinstance(reply, Exception):
             raise reply
-        return reply  # type: ignore[no-any-return]
+        if reply is not None and not isinstance(reply, model):
+            raise AssertionError(
+                f"queued a {type(reply).__name__} but the engine asked for "
+                f"{model.__name__}"
+            )
+        return reply

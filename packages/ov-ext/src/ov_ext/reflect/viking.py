@@ -187,6 +187,12 @@ class VikingStore:
         # oldest. The watermark then advances only as far as this batch reached
         # and the remainder is picked up next sweep. Descending would strand
         # everything below the cut permanently.
+        #
+        # TimeRange compiles `start` to `>=`, not `>`, so the row sitting
+        # exactly on the mark comes back every sweep. Harmless on its own --
+        # re-reflecting one memory is idempotent -- and dropped below so it
+        # does not spend a batch slot. It must NOT be filtered in SQL: rows
+        # written in the same second as the mark would be lost with it.
         records = await self._db.filter(
             filter=condition,
             limit=limit,
@@ -195,7 +201,11 @@ class VikingStore:
             order_desc=False,
             ctx=self._ctx,
         )
-        return [str(record["uri"]) for record in records if record.get("uri")]
+        return [
+            str(record["uri"])
+            for record in records
+            if record.get("uri") and parse_timestamp(record.get("updated_at")) > moment
+        ]
 
     async def rows(self, uris: Sequence[str]) -> list[MemoryRow]:
         """Fetch the text and timestamps for specific URIs.
@@ -403,11 +413,18 @@ class VikingStore:
 def _digest(observation: Observation) -> str:
     """A short stable hash of what an observation rests on.
 
-    Over the cited memories and quotes rather than the title, so the same
-    conclusion drawn from the same evidence keeps its filename across sweeps
-    and merges into itself instead of accumulating near-duplicates.
+    Over the cited memories alone -- not the quotes, and not the title. The
+    same conclusion drawn from the same memories then keeps its filename across
+    sweeps and merges into itself, even when the model picks slightly different
+    spans the second time.
+
+    It still changes when the *set of memories* changes, which the random tail
+    sample makes possible: an observation that happens to cite a tail memory
+    lands somewhere new next sweep. Living with that until the compare/merge
+    pass exists, because the alternative -- hashing the title -- collides two
+    unrelated observations into one file.
     """
-    material = "\n".join(f"{uri}\t{quote}" for uri, quote in sorted(observation.evidence))
+    material = "\n".join(sorted(observation.sources))
     return hashlib.sha256(material.encode()).hexdigest()[:8]
 
 

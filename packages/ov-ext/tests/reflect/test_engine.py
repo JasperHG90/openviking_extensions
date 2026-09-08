@@ -335,14 +335,21 @@ async def test_an_edited_old_memory_stops_being_re_reflected() -> None:
     so the same batch, the same model calls and the same write would repeat
     every sweep forever.
     """
-    old = row(A, "The scheduler retries failed jobs.", day=-500, updated=2)
-    fake = FakeStore([old, row(B, "The worker retries failed jobs too.", day=2)])
+    # Both rows are old by creation and recent by edit, and their creation
+    # dates differ from their edit dates. Advancing on `created_at` would put
+    # the mark at day -400, leaving both above it forever.
+    fake = FakeStore(
+        [
+            row(A, "The scheduler retries failed jobs.", day=-500, updated=2),
+            row(B, "The worker retries failed jobs too.", day=-400, updated=3),
+        ]
+    )
     llm = FakeLLM([proposed((0, "retries failed jobs"), (1, "retries failed jobs"))])
     engine = ReflectionEngine(fake, llm, settings())
 
     _, mark = await engine.sweep(Watermark.beginning(), now=EPOCH)
 
-    assert mark.last_seen == EPOCH + timedelta(days=2)
+    assert mark.last_seen == EPOCH + timedelta(days=3)
     assert await fake.changed_since(mark.last_seen, limit=100) == []
 
 
@@ -359,3 +366,64 @@ def test_memories_are_grouped_by_their_directory() -> None:
         "viking://user/j/memories/preferences",
     }
     assert len(grouped["viking://user/j/memories/entities"]) == 2
+
+
+async def test_a_failed_batch_holds_back_a_later_one_that_succeeded() -> None:
+    """Batches are grouped by directory, so they are not in time order.
+
+    Without a barrier, a newer directory that succeeded drags the mark past an
+    older one that failed, and those memories are never read again.
+    """
+    alpha = "viking://user/j/memories/alpha/a.md"
+    beta = "viking://user/j/memories/beta/b.md"
+    fake = FakeStore([row(alpha, "alpha note", day=1), row(beta, "beta note", day=2)])
+    # Alpha is proposed first (oldest first) and fails; beta then succeeds.
+    llm = FakeLLM([RuntimeError("upstream down"), ProposedObservations(observations=[])])
+    engine = ReflectionEngine(fake, llm, settings())
+
+    report, mark = await engine.sweep(Watermark.beginning(), now=EPOCH)
+
+    assert report.failures == 1
+    assert mark.last_seen == Watermark.beginning().last_seen
+    assert set(await fake.changed_since(mark.last_seen, limit=100)) == {alpha, beta}
+
+
+async def test_a_batch_that_always_fails_does_not_block_forever() -> None:
+    """Holding the mark back is right; holding it back forever is its own bug.
+
+    memex bounds this with a queue and a dead-letter table. Here it is a stall
+    counter: past `max_stalls` the sweep steps over the blockage and says so.
+    """
+    fake = FakeStore([row(A, "poisoned", day=1)])
+    mark = Watermark.beginning()
+    engine = ReflectionEngine(
+        fake, FakeLLM([RuntimeError("always")] * 10), settings(max_stalls=2)
+    )
+
+    for expected_stalls in (1, 2):
+        report, mark = await engine.sweep(mark, now=EPOCH)
+        assert mark.stalls == expected_stalls
+        assert report.stepped_over is False
+        assert mark.last_seen == Watermark.beginning().last_seen
+
+    report, mark = await engine.sweep(mark, now=EPOCH)
+
+    assert report.stepped_over is True
+    assert mark.last_seen == EPOCH + timedelta(days=1)
+    assert mark.stalls == 0
+    assert await fake.changed_since(mark.last_seen, limit=100) == []
+
+
+async def test_progress_clears_a_stall() -> None:
+    """So an intermittent failure never accumulates toward stepping over."""
+    fake = FakeStore([row(A, "note", day=1)])
+    stalled = Watermark.beginning().stalled(now=EPOCH).stalled(now=EPOCH)
+    assert stalled.stalls == 2
+
+    engine = ReflectionEngine(
+        fake, FakeLLM([ProposedObservations(observations=[])]), settings()
+    )
+    _, mark = await engine.sweep(stalled, now=EPOCH)
+
+    assert mark.last_seen == EPOCH + timedelta(days=1)
+    assert mark.stalls == 0

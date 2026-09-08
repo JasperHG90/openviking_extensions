@@ -22,6 +22,7 @@ from typing import Any
 
 from .config import ReflectSettings
 from .engine import ReflectionEngine, SweepReport
+from .ports import StructuredLLM
 from .viking import VikingLLM, VikingStore
 from .watermark import Watermark
 
@@ -41,6 +42,7 @@ async def run_sweep(
     ctx: Any,
     settings: ReflectSettings | None = None,
     *,
+    llm: StructuredLLM | None = None,
     now: datetime | None = None,
 ) -> SweepReport:
     """Load the watermark, sweep, and store the mark the sweep reached.
@@ -55,6 +57,10 @@ async def run_sweep(
         Request context carrying the user and their permissions.
     settings :
         Behaviour toggles. Read from the environment when omitted.
+    llm :
+        The model. Defaults to OpenViking's configured one; injectable so a
+        test can run the whole path without a provider, and so a caller can
+        point one sweep at a different model without changing the server's.
     now :
         Treated as the current time when stamping the mark. Passed in so tests
         stay deterministic.
@@ -67,7 +73,7 @@ async def run_sweep(
     """
     resolved = settings or ReflectSettings()
     store = VikingStore(viking_fs, vikingdb, ctx, resolved)
-    engine = ReflectionEngine(store, VikingLLM(), resolved)
+    engine = ReflectionEngine(store, llm or VikingLLM(), resolved)
     state_uri = _expand(resolved.state_path, ctx.user.user_id)
 
     try:

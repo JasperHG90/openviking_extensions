@@ -120,6 +120,18 @@ class ReflectSettings(BaseSettings):
             "between things written apart."
         ),
     )
+    max_stalls: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "Consecutive sweeps that may read something and advance nothing "
+            "before the watermark steps over the batch that is blocking it. "
+            "A failed batch holds the mark back so an outage cannot drop "
+            "memories permanently; without this bound, one batch that fails "
+            "every time would block every memory behind it for good. Stepping "
+            "over is logged at error level and named in the report."
+        ),
+    )
     contradictions: bool = Field(
         default=True,
         description=(

@@ -32,11 +32,11 @@ T = TypeVar("T", bound=BaseModel)
 class StructuredLLM(Protocol):
     """A model that answers in a given shape, or does not answer.
 
-    Matches ``StructuredVLM.complete_model``: OpenViking appends the JSON
-    schema to the prompt, parses what comes back, and validates it. A failure
-    to parse or validate returns ``None`` rather than raising, and reflection
-    treats that as "this batch produced nothing" rather than an error -- one
-    unparseable response should not stop a sweep.
+    Matches OpenViking's ``StructuredLLM``: the JSON schema is appended to the
+        prompt, the reply is parsed and validated, and a failure to do either
+        returns ``None`` rather than raising. Reflection treats that as "this batch
+        produced nothing" -- one unparseable response should cost a batch, not a
+        sweep.
     """
 
     async def complete(self, prompt: str, model: type[T]) -> T | None:
@@ -47,22 +47,40 @@ class StructuredLLM(Protocol):
 class MemoryStore(Protocol):
     """The slice of OpenViking reflection reads and writes.
 
-    Every read here is answerable from the vector index -- the L2 rows carry
-    the memory text already, so a sweep never opens a file. Only the two writes
-    reach the document store, and only for conclusions.
+    Change detection, evidence and verification are all answerable from the
+    vector index -- the L2 rows carry the memory text already. The document
+    store is touched for one read per batch, the directory overview used as
+    prompt background, and for the two writes, which are conclusions.
     """
 
     async def changed_since(self, moment: datetime, *, limit: int) -> list[str]:
-        """Return stored URIs of L2 rows updated after ``moment``, newest first.
+        """Return stored URIs of L2 rows updated after ``moment``, oldest first.
 
         URIs only, no content: this is the change signal, and it runs over
         every memory in the store. It deliberately reads L2 rather than the
         directory overviews, whose refresh lags behind their contents by
         design.
+
+        Oldest first, so ``limit`` truncates the newest and the remainder is
+        still ahead of the watermark next sweep. Newest-first truncation would
+        strand everything below the cut permanently.
         """
         ...
 
-    async def rows(self, uris: Sequence[str]) -> list[MemoryRow]: ...
+    async def rows(self, uris: Sequence[str]) -> list[MemoryRow]:
+        """Return the text and timestamps for specific URIs.
+
+        The text must be the memory itself, not a generated summary: quotes
+        are verified against it, and a link whose ``match_text`` came from a
+        summary would be absent from the memory it points at.
+
+        Raises
+        ------
+        ContentUnavailableError
+            When the backend stores no row content, so no quote could be
+            verified. Refusing beats verifying against the wrong text.
+        """
+        ...
 
     async def neighbours(self, row: MemoryRow, *, limit: int) -> list[MemoryRow]:
         """Return memories semantically near ``row``.
@@ -74,11 +92,14 @@ class MemoryStore(Protocol):
         ...
 
     async def tail_sample(self, *, limit: int) -> list[MemoryRow]:
-        """Return a few memories at random.
+        """Return a few memories chosen without regard to the batch.
 
         Ported in spirit from memex's ``_sample_tail_memories``. Without it,
         every memory the model sees was selected for resembling something it
         already believes, and reflection converges on confirming itself.
+
+        The choice must vary between sweeps. Returning the same rows every time
+        is a constant, and a constant cannot break an echo chamber.
         """
         ...
 
@@ -92,10 +113,12 @@ class MemoryStore(Protocol):
         ...
 
     async def write_observation(self, observation: Observation) -> str:
-        """Persist an observation and return its URI.
+        """Persist an observation as a memory file and return its URI.
 
-        Goes through OpenViking's memory write path rather than a raw file
-        write, so the link and merge machinery sees it.
+        Written directly rather than through ``remember``, which would hand the
+        text to the extractor and get back whatever it decided the text meant.
+        The file is still a first-class memory -- indexed, searchable, linkable
+        -- because OpenViking's own serializer writes it.
         """
         ...
 

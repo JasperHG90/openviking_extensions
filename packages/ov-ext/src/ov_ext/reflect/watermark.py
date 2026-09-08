@@ -10,6 +10,13 @@ The overlap is deliberate too. The watermark advances to the newest row the
 sweep actually *read*, not to the moment it ran, so a memory written while the
 sweep was in flight is picked up next time instead of falling in the gap
 between "when I started" and "what I saw".
+
+A failed batch holds the mark back, which is what stops a provider outage
+dropping memories permanently -- but held back forever is its own failure. A
+batch that fails every time would block everything behind it, so the mark
+counts consecutive sweeps that made no progress and, past a limit, steps over
+the blockage and says so loudly. memex solves this with a work queue and a
+dead-letter table; this is the same idea at the scale of one counter.
 """
 
 from __future__ import annotations
@@ -39,6 +46,16 @@ class Watermark(BaseModel):
     swept_at: datetime = Field(
         description="When that sweep finished, for operators reading the file."
     )
+    stalls: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Consecutive sweeps that read something but could not advance, "
+            "because a batch failed. Reset the moment the mark moves. Past "
+            "`max_stalls` the sweep steps over the blockage rather than "
+            "retrying it forever."
+        ),
+    )
 
     @classmethod
     def beginning(cls) -> Watermark:
@@ -48,7 +65,7 @@ class Watermark(BaseModel):
         memories that already exist, not wait for the next one to be written.
         """
         epoch = datetime.fromtimestamp(0, tz=timezone.utc)
-        return cls(last_seen=epoch, swept_at=epoch)
+        return cls(last_seen=epoch, swept_at=epoch, stalls=0)
 
     @classmethod
     def loads(cls, raw: str | None) -> Watermark:
@@ -80,7 +97,7 @@ class Watermark(BaseModel):
         return json.dumps(json.loads(self.model_dump_json()), indent=2)
 
     def advanced_to(self, seen: datetime, *, now: datetime) -> Watermark:
-        """Return a watermark moved forward to ``seen``.
+        """Return a watermark moved forward to ``seen``, clearing any stall.
 
         Never moves backwards: a sweep that read only older rows -- because
         nothing new arrived, or because a batch limit truncated it -- must not
@@ -89,7 +106,7 @@ class Watermark(BaseModel):
         Parameters
         ----------
         seen :
-            Newest ``updated_at`` this sweep read.
+            Newest ``updated_at`` this sweep read and finished with.
         now :
             When the sweep finished. Passed in rather than read from the clock
             so the caller controls it and tests stay deterministic.
@@ -99,4 +116,27 @@ class Watermark(BaseModel):
         Watermark
             A new mark; this one is unchanged.
         """
-        return Watermark(last_seen=max(seen, self.last_seen), swept_at=now)
+        advanced = max(seen, self.last_seen)
+        moved = advanced > self.last_seen
+        return Watermark(
+            last_seen=advanced,
+            swept_at=now,
+            stalls=0 if moved else self.stalls,
+        )
+
+    def stalled(self, *, now: datetime) -> Watermark:
+        """Return a watermark that read something but could not advance.
+
+        Counts the stall so a batch that fails every time cannot block the
+        memories behind it indefinitely.
+        """
+        return Watermark(last_seen=self.last_seen, swept_at=now, stalls=self.stalls + 1)
+
+    def stepped_over(self, seen: datetime, *, now: datetime) -> Watermark:
+        """Return a watermark forced past a blockage, stall count cleared.
+
+        Used only when :attr:`stalls` has passed its limit. The memories being
+        stepped over are not reflected on, which is a loss -- but a smaller one
+        than every memory behind them never being reflected on either.
+        """
+        return Watermark(last_seen=max(seen, self.last_seen), swept_at=now, stalls=0)

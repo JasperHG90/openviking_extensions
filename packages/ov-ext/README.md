@@ -319,7 +319,7 @@ to memory unattended should run when someone chose that it would.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `OV_REFLECT_ENABLED` | `false` | Register the memory type. Off until you turn it on |
+| `OV_REFLECT_ENABLED` | `false` | Register the memory type and allow sweeps. Off until you turn it on |
 | `OV_REFLECT_DRY_RUN` | `false` | Read, prompt and verify; report what it would write |
 | `OV_REFLECT_BATCH_LIMIT` | `50` | Most changed memories per sweep |
 | `OV_REFLECT_NEIGHBOUR_LIMIT` | `8` | Semantic neighbours per changed memory |
@@ -327,6 +327,7 @@ to memory unattended should run when someone chose that it would.
 | `OV_REFLECT_MIN_EVIDENCE` | `2` | Distinct memories an observation must cite to survive |
 | `OV_REFLECT_REQUIRE_CROSS_AREA` | `false` | Keep only observations spanning several directories |
 | `OV_REFLECT_CONTRADICTIONS` | `true` | Ask which memories are in tension |
+| `OV_REFLECT_MAX_STALLS` | `3` | Sweeps that may advance nothing before stepping over a failing batch |
 | `OV_REFLECT_OBSERVATIONS_ROOT` | `viking://~/memories/observations` | Where observations are written |
 | `OV_REFLECT_STATE_PATH` | `viking://~/resources/reflect/watermark.json` | Where the watermark lives |
 

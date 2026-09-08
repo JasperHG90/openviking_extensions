@@ -66,7 +66,13 @@ class MemoryRow:
         ``strip_all_links(content)`` truncated by OpenViking, so it is the
         distilled form rather than the raw file.
     created_at : datetime
-        When the row was created, used for trend and recency work.
+        When the row was created, shown to the model as ``occurred`` so it can
+        prefer observations connecting memories written at different times.
+    updated_at : datetime
+        When the row last changed. This is what the sweep filters on and what
+        the watermark advances to -- advancing on ``created_at`` instead would
+        leave a memory created long ago but edited today permanently above the
+        mark, re-reflected every sweep.
     """
 
     uri: str

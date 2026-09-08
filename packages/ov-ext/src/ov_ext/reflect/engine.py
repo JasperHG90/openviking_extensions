@@ -44,7 +44,7 @@ from .prompts import contradiction_prompt, propose_prompt
 from .verify import verify_observations
 from .watermark import Watermark
 
-__all__ = ["ReflectionEngine", "SweepReport"]
+__all__ = ["BatchOutcome", "ReflectionEngine", "SweepReport"]
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +55,29 @@ NAMESPACE = "ov_ext.reflect"
 # the normal state of a memory store, so linking it would add an edge to most
 # pairs and drown the disagreements that matter.
 _RECORDED_RELATIONS = {"contradict": 0.9, "weaken": 0.5}
+
+
+@dataclass(frozen=True)
+class BatchOutcome:
+    """What one directory's batch left behind for the watermark.
+
+    Attributes
+    ----------
+    complete : bool
+        Whether every model call in the batch finished. A batch that did not
+        becomes a barrier the mark may not pass.
+    newest : datetime | None
+        Newest ``updated_at`` read. Set whether or not the batch completed:
+        a completed batch advances the mark to it, and a failing one that has
+        exhausted its stalls is stepped over to it.
+    oldest : datetime | None
+        Oldest ``updated_at`` read, which is where the barrier sits when the
+        batch did not complete.
+    """
+
+    complete: bool
+    newest: datetime | None
+    oldest: datetime | None
 
 
 @dataclass
@@ -76,6 +99,10 @@ class SweepReport:
         ``proposed`` is the signal that a prompt change made things worse.
     failures : int
         Batches abandoned because a model call failed or returned nothing.
+    stepped_over : bool
+        Whether the sweep forced the watermark past a batch that has been
+        failing for more sweeps than ``max_stalls``. The memories in it were
+        not reflected on.
     """
 
     batches: int = 0
@@ -84,6 +111,7 @@ class SweepReport:
     contradictions: int = 0
     dropped: dict[str, int] = field(default_factory=dict)
     failures: int = 0
+    stepped_over: bool = False
 
     def record_drops(self, counts: dict[str, int]) -> None:
         """Fold one batch's drop counts into the running totals."""
@@ -170,11 +198,26 @@ class ReflectionEngine:
             annotate({"ov_ext.reflect.outcome": "nothing_changed"})
             return report, watermark
 
-        newest = watermark.last_seen
+        # A failed batch is a barrier, not merely a skipped one. Batches are
+        # grouped by directory, so they are not in time order: without this, a
+        # later directory holding newer rows would drag the mark past an
+        # earlier directory that failed, and those memories would never be read
+        # again. The mark may therefore advance only as far as the oldest row
+        # in any batch that did not finish.
+        barrier: datetime | None = None
+        finished: list[datetime] = []
+        every: list[datetime] = []
         for directory, uris in group_by_directory(changed).items():
-            batch_newest = await self._run_batch(directory, uris, report)
-            if batch_newest is not None:
-                newest = max(newest, batch_newest)
+            outcome = await self._run_batch(directory, uris, report)
+            if outcome.newest is not None:
+                every.append(outcome.newest)
+                if outcome.complete:
+                    finished.append(outcome.newest)
+            if not outcome.complete and outcome.oldest is not None:
+                barrier = min(barrier or outcome.oldest, outcome.oldest)
+
+        below = [when for when in finished if barrier is None or when < barrier]
+        newest = max(below) if below else watermark.last_seen
 
         annotate(
             {
@@ -183,15 +226,38 @@ class ReflectionEngine:
                 "ov_ext.reflect.written": report.written,
                 "ov_ext.reflect.contradictions": report.contradictions,
                 "ov_ext.reflect.failures": report.failures,
-                "ov_ext.reflect.outcome": "ok",
             }
         )
-        return report, watermark.advanced_to(newest, now=moment)
+
+        if newest > watermark.last_seen:
+            annotate({"ov_ext.reflect.outcome": "ok"})
+            return report, watermark.advanced_to(newest, now=moment)
+
+        # Read something, advanced nothing: a batch at or below the mark
+        # failed. Hold, and count it -- but not forever, or one poisoned batch
+        # blocks every memory behind it for good.
+        if watermark.stalls + 1 > settings.max_stalls:
+            forced = max(every) if every else watermark.last_seen
+            report.stepped_over = True
+            logger.error(
+                "ov-ext reflect: no progress for %d sweeps; stepping the watermark "
+                "over %s to %s. The memories in the failing batch will NOT be "
+                "reflected on. Failures this sweep: %d.",
+                watermark.stalls + 1,
+                watermark.last_seen.isoformat(),
+                forced.isoformat(),
+                report.failures,
+            )
+            annotate({"ov_ext.reflect.outcome": "stepped_over"})
+            return report, watermark.stepped_over(forced, now=moment)
+
+        annotate({"ov_ext.reflect.outcome": "stalled"})
+        return report, watermark.stalled(now=moment)
 
     @traced("ov_ext.reflect.batch")
     async def _run_batch(
         self, directory: str, uris: Sequence[str], report: SweepReport
-    ) -> datetime | None:
+    ) -> BatchOutcome:
         """Reflect on one directory's changed memories.
 
         Returns the newest ``updated_at`` among the changed rows actually
@@ -213,7 +279,7 @@ class ReflectionEngine:
         changed_rows = await self._store.rows(uris)
         if not changed_rows:
             annotate({"ov_ext.reflect.outcome": "no_rows"})
-            return None
+            return BatchOutcome(complete=True, newest=None, oldest=None)
 
         gathered = await self._gather(changed_rows)
         rows_by_uri = {row.uri: row for row in gathered}
@@ -230,10 +296,12 @@ class ReflectionEngine:
         if self._settings.contradictions:
             contradicted_ok = await self._contradict(contexts, index_to_uri, report)
 
-        if not (proposed_ok and contradicted_ok):
+        oldest = min(row.updated_at for row in changed_rows)
+        newest = max(row.updated_at for row in changed_rows)
+        complete = proposed_ok and contradicted_ok
+        if not complete:
             annotate({"ov_ext.reflect.outcome": "batch_incomplete"})
-            return None
-        return max(row.updated_at for row in changed_rows)
+        return BatchOutcome(complete=complete, newest=newest, oldest=oldest)
 
     async def _gather(self, changed: Sequence[MemoryRow]) -> list[MemoryRow]:
         """Collect the evidence pool: what changed, its neighbours, and a tail.

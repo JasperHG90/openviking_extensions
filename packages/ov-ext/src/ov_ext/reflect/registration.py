@@ -68,9 +68,10 @@ def register(settings: ReflectSettings | None = None) -> None:
     configured = _configured_templates_dir()
 
     if configured is None:
-        _previous_dir = _current_templates_dir()
-        _set_templates_dir(str(TEMPLATES_DIR))
-        logger.info("ov-ext reflect: memory templates dir set to %s", TEMPLATES_DIR)
+        previous = _current_templates_dir()
+        if _set_templates_dir(str(TEMPLATES_DIR)):
+            _previous_dir = previous
+            logger.info("ov-ext reflect: memory templates dir set to %s", TEMPLATES_DIR)
         return
 
     if configured.resolve() == TEMPLATES_DIR.resolve():
@@ -123,8 +124,23 @@ def _current_templates_dir() -> str | None:
         return None
 
 
-def _set_templates_dir(path: str | None) -> None:
-    """Point OpenViking's custom memory templates dir at ``path``."""
-    from openviking_cli.utils.config import get_openviking_config
+def _set_templates_dir(path: str | None) -> bool:
+    """Point OpenViking's custom memory templates dir at ``path``.
 
-    get_openviking_config().memory.custom_templates_dir = path or ""
+    Returns
+    -------
+    bool
+        False when there is no OpenViking config in this process to write to --
+        a unit test, or a CLI that never booted the server. Swallowed rather
+        than raised for the same reason :func:`_configured_templates_dir`
+        swallows it: registration is a startup step, and failing it over a
+        missing config would refuse a server that has not built one yet.
+    """
+    try:
+        from openviking_cli.utils.config import get_openviking_config
+
+        get_openviking_config().memory.custom_templates_dir = path or ""
+    except Exception:
+        logger.debug("ov-ext reflect: no OpenViking config to point at templates")
+        return False
+    return True

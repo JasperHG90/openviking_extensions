@@ -35,7 +35,7 @@ from .engine import ReflectionEngine, SweepReport
 from .exceptions import ContentUnavailableError, ReflectionError
 from .models import MemoryRow, Observation
 from .ports import MemoryStore, StructuredLLM
-from .register import register, unregister
+from .registration import register, unregister
 from .runner import run_sweep
 from .viking import VikingLLM, VikingStore
 from .watermark import Watermark

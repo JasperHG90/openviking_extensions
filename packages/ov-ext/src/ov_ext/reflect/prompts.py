@@ -14,6 +14,10 @@ our own, both from the design:
 
 - Propose is told to look across projects, since an observation whose evidence
   spans two of them is the thing single-window extraction can never produce.
+- memex's "skip what is already known" instruction is dropped with it: nothing
+  here reads existing observations yet, and an instruction referring to a list
+  that is never supplied is noise in the prompt. It comes back with the
+  compare/merge pass.
 - Contradiction drops memex's notion of which side wins. Reflection records the
   tension and leaves the resolution to a person, so asking for an authority
   would produce a field nothing reads.
@@ -42,9 +46,8 @@ index, with an EXACT quote copied from the memory text. Do not paraphrase a \
 quote: it is checked against the source word for word, and an observation \
 whose quotes cannot be found is discarded.
 
-Skip anything already covered by the observations listed as known. Return an \
-empty list rather than padding: memories that support no observation are the \
-normal case, not a failure.
+Return an empty list rather than padding: memories that support no \
+observation are the normal case, not a failure.
 
 STRICT RULE: All observations MUST be written in English, regardless of the \
 language of the source memories."""
@@ -88,7 +91,6 @@ def propose_prompt(
     contexts: Sequence[ReflectMemoryContext],
     *,
     scope: str | None = None,
-    known: Sequence[str] = (),
 ) -> str:
     """Build the prompt asking for new observations.
 
@@ -100,10 +102,6 @@ def propose_prompt(
         The directory overview covering the memories that changed, used as
         background. Never cited: it is generated text, so a quote found in it
         proves only that the summary said so. Omitted when there is none.
-    known :
-        Titles of observations that already exist, so the model does not
-        propose them again.
-
     Returns
     -------
     str
@@ -117,10 +115,6 @@ def propose_prompt(
             "Background on the area these memories come from. Context only -- "
             "it is generated text, so never quote or cite it:\n\n" + scope.strip()
         )
-
-    if known:
-        listed = "\n".join(f"- {title}" for title in known)
-        parts.append("Observations already known. Do not repeat these:\n\n" + listed)
 
     parts.append(
         "Memories, each with the index you must cite it by:\n\n" + _render(contexts)
