@@ -241,9 +241,9 @@ their version labels arrived, and only then moves `latest`. `just push` is the
 hand path for when you need an image without cutting a release; it tags with the
 short commit sha rather than a version.
 
-The GHCR package is private until someone makes it public, and a brand new one
-is created by the first release that pushes it — so expect one trip to Packages
-→ `ov-dash` → *Package settings* before `docker pull` works for anyone else.
+The first release creates the GHCR package and it inherits the repository's
+visibility, so `ghcr.io/jasperhg90/ov-dash` is public and needs no trip to the
+package settings.
 
 If the release fails after tagging, the tag stands and the workflow will refuse
 that version on a re-run. Finish it by hand with `just push tag=<version>`, or
