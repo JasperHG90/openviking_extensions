@@ -206,9 +206,11 @@ jobs:
 
   # Chained via needs: a tag pushed with GITHUB_TOKEN does not trigger
   # workflows. Publishing after tagging means a release only appears with its
-  # artifacts attached; if the build fails the tag stands and a re-run of this
-  # workflow is not needed -- build locally from the tag and attach by hand,
-  # or delete the tag and start over.
+  # artifacts attached; if the build fails the tag stands. Re-running this
+  # workflow for the same version will not work -- the plan step refuses a tag
+  # that exists -- so recovery is either to finish by hand from the tag (for
+  # ov-dash: `just push tag=<version>`, then create the release) or to delete
+  # the tag and start over.
   publish:
     name: build and publish
     needs: release
@@ -222,9 +224,14 @@ jobs:
           && !cancelled()
           && needs.release.result == 'success' }}
     runs-on: ubuntu-latest
+    # A cross build under emulation is the slow path here; without this an
+    # arm64 leg that wedges runs against the six-hour default.
+    timeout-minutes: 45
     permissions:
       contents: write # create the GitHub release
-      packages: write # push the ov-dash image to GHCR
+      # Only ov-dash pushes an image, but a job's permissions cover all of it,
+      # so every package's release runs with this.
+      packages: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -415,9 +422,11 @@ jobs:
           context: packages/ov-dash
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ghcr.io/jasperhg90/ov-dash:${{ needs.release.outputs.version }}
-            ghcr.io/jasperhg90/ov-dash:latest
+          # The version alone. `latest` is moved further down, once the push
+          # has been checked: pushed here, a build that fails verification
+          # would already be what every `docker pull` returns, and nothing
+          # rolls it back.
+          tags: ghcr.io/jasperhg90/ov-dash:${{ needs.release.outputs.version }}
           # Nothing in the running dashboard reports its own version, so the
           # labels are the only place the image says what it is. Read them back
           # with `docker inspect` when a deployment looks wrong.
@@ -467,10 +476,25 @@ jobs:
           }
           echo "every architecture is labelled $VERSION"
 
+      # Only now, and by pointing at the manifest just verified rather than
+      # building again: a second build could differ from the one that passed.
+      - name: Move latest
+        if: ${{ inputs.package == 'ov-dash' }}
+        env:
+          IMAGE: ghcr.io/jasperhg90/ov-dash
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create -t "$IMAGE:latest" "$IMAGE:$VERSION"
+
       - name: Write the image's install notes
         if: ${{ inputs.package == 'ov-dash' }}
         env:
           VERSION: ${{ needs.release.outputs.version }}
+          # The example config is linked at the tag, not at main: someone
+          # running an old image needs the settings that image understands.
+          TAG: ${{ needs.release.outputs.tag }}
+          REPO: ${{ github.server_url }}/${{ github.repository }}
         run: |
           set -euo pipefail
           {
@@ -488,8 +512,8 @@ jobs:
             echo "### Run it"
             echo
             echo "The dashboard is configured entirely through the environment."
-            echo "Copy \`packages/ov-dash/.env.example\` to \`.env\`, fill it in,"
-            echo "then:"
+            echo "Start from [\`.env.example\`]($REPO/blob/$TAG/packages/ov-dash/.env.example),"
+            echo "fill it in, then:"
             echo
             echo '```bash'
             echo "docker run --rm -p 8080:8080 --env-file .env \\"
@@ -497,10 +521,11 @@ jobs:
             echo "  ghcr.io/jasperhg90/ov-dash:$VERSION"
             echo '```'
             echo
-            echo "Every setting is checked at boot, so a missing one names"
-            echo "itself instead of failing on the first request that needs it."
-            echo "\`PUBLIC_ORIGIN\` must be the address people actually reach:"
-            echo "sign-in refuses a request whose origin does not match it."
+            echo "A missing setting names itself at boot rather than failing on"
+            echo "the first request that needs it. The exception is"
+            echo "\`PUBLIC_ORIGIN\`, which has a default: leave it wrong and the"
+            echo "server starts happily, then refuses every sign-in whose origin"
+            echo "does not match. Set it to the address people actually reach."
           } > NOTES.md
 
       - name: Create GitHub Release

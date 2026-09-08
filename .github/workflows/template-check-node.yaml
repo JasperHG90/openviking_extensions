@@ -45,22 +45,31 @@ jobs:
       - name: Unit tests
         run: npm test
 
-      # The integration suites here sign in against a real Vault, and a suite
-      # with nothing to talk to fails rather than skips -- which is the point,
-      # but it means CI has to hand it one. Dev mode, in memory, thrown away
-      # with the runner: it holds nothing worth protecting. The port and root
-      # token match ov-dash's justfile, so local and CI agree.
+      # A suite that signs in against a real Vault fails rather than skips when
+      # it has nothing to talk to -- which is the point, but it means CI has to
+      # hand it one. Dev mode, in memory, thrown away with the runner: it holds
+      # nothing worth protecting. The port and root token match ov-dash's
+      # justfile, so local and CI agree.
+      #
+      # Keyed on the Vault suite itself, not on the package having integration
+      # tests at all: ov-clip's talk to an OpenViking container instead, and
+      # starting a Vault for them would make an unrelated image pull able to
+      # fail -- or block -- an ov-clip release.
       - name: Start a throwaway Vault
         if: >-
           ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-              && hashFiles(format('packages/{0}/vitest.integration.config.ts', inputs.package)) != '' }}
+              && hashFiles(format('packages/{0}/tests/vault-live.integration.ts', inputs.package)) != '' }}
         run: |
           set -euo pipefail
+          # Pinned, like every other version in this repo: a Vault release that
+          # changed dev-mode defaults would otherwise turn CI red, and block
+          # releases, on a day nobody touched the repo.
+          docker rm -f ovdash-vault > /dev/null 2>&1 || true
           docker run -d --name ovdash-vault -p 18200:8200 \
-            -e VAULT_DEV_ROOT_TOKEN_ID=root hashicorp/vault:latest
+            -e VAULT_DEV_ROOT_TOKEN_ID=root hashicorp/vault:2.1.0
 
-          # Bounded, so a container that never comes up fails in a minute
-          # instead of sitting against the job timeout.
+          # Bounded at roughly three minutes, so a container that never comes
+          # up fails on its own rather than sitting against the job timeout.
           for _ in $(seq 1 60); do
             curl -sf -m 2 http://127.0.0.1:18200/v1/sys/health > /dev/null && break
             sleep 1
