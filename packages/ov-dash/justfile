@@ -1,0 +1,170 @@
+# ov-dash — build it, check it, ship it.
+#
+# Recipes run from packages/ov-dash. The gates go through `prek` rather than
+# calling tsc and biome directly, because .pre-commit-config.yaml at the repo
+# root is where their versions and arguments are pinned; running the bare tools
+# would silently use whatever happens to be installed.
+#
+#   just            list the recipes
+#   just gates      everything CI runs for this package
+#   just image      build the container
+#   just push       publish it to GHCR
+
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+root := justfile_directory() / ".." / ".."
+
+# GHCR paths must be lowercase, whatever the GitHub org is called.
+image := "ghcr.io/jasperhg90/ov-dash"
+
+# The commit is the only thing that honestly identifies what is in an image, so
+# it is the default tag. Override for a release: `just push tag=0.1.0`.
+tag := `git rev-parse --short HEAD 2>/dev/null || echo unknown`
+
+# The lab runs a mix of amd64 boxes and arm boards, so published images cover
+# both. A local `just image` stays on this machine's architecture — building
+# two of them to run one is a slow way to test a Dockerfile.
+platforms := "linux/amd64,linux/arm64"
+
+# The throwaway Vault the integration suite talks to.
+vault_container := "ovdash-vault"
+vault_port := "18200"
+
+default:
+    @just --list --unsorted
+
+# ── working on it ──────────────────────────────────────────────
+
+# Install dependencies exactly as the lockfile pins them.
+[group('dev')]
+install:
+    npm ci --no-audit --no-fund
+
+# Vite on 5173, the server on 8080, the API proxied between them.
+[group('dev')]
+dev:
+    npm run dev
+
+# Build, then run the real server. Needs a .env — start from .env.example.
+[group('dev')]
+run: build
+    @test -f .env || { echo "no .env — cp .env.example .env and fill it in" >&2; exit 1; }
+    set -a && . ./.env && set +a && node dist/server/main.js
+
+# ── gates ──────────────────────────────────────────────────────
+
+# Everything CI runs for this package: types, lint, unit tests.
+#
+# Hook ids are passed with --files because prek refuses to select hooks by id
+# while .pre-commit-config.yaml is unstaged, and a dirty config is normal in a
+# repo several people are working in at once.
+[doc('Everything CI runs for this package: types, lint, unit tests.')]
+[group('check')]
+gates:
+    cd {{ root }} && prek run check-ov-dash lint-ov-dash test-ov-dash \
+      --files $(git ls-files packages/ov-dash)
+
+# tsc, then svelte-check.
+[group('check')]
+check:
+    npm run check
+
+[doc('biome, in check mode.')]
+[group('check')]
+lint:
+    npm run lint
+
+# Apply what biome can fix on its own.
+[group('check')]
+fix:
+    npm run lint:fix
+
+# The fast, offline suite. Runs on every commit.
+[group('check')]
+test *args:
+    npm test -- {{ args }}
+
+# The suite that talks to a real Vault, kept out of `just test` because it needs
+# a container and a network. Starts the Vault if it is not already up.
+[doc('The suite that talks to a real Vault. Starts one if needed.')]
+[group('check')]
+test-integration: vault-up
+    npm run test:integration
+
+# ── the throwaway Vault ────────────────────────────────────────
+
+# Start a dev-mode Vault for the integration suite. Idempotent, and the suite
+# configures the mount, entity and role itself.
+[doc('Start a dev-mode Vault for the integration suite. Idempotent.')]
+[group('vault')]
+vault-up:
+    @if [ -n "$(docker ps -q -f name=^{{ vault_container }}$)" ]; then \
+      echo "vault already up on :{{ vault_port }}"; \
+    else \
+      docker rm -f {{ vault_container }} >/dev/null 2>&1 || true; \
+      docker run -d --name {{ vault_container }} -p {{ vault_port }}:8200 \
+        -e VAULT_DEV_ROOT_TOKEN_ID=root hashicorp/vault:latest >/dev/null; \
+      until curl -sf -m 2 http://127.0.0.1:{{ vault_port }}/v1/sys/health >/dev/null; do sleep 1; done; \
+      echo "vault up on :{{ vault_port }}"; \
+    fi
+
+[doc('Remove the throwaway Vault.')]
+[group('vault')]
+vault-down:
+    -docker rm -f {{ vault_container }}
+
+# ── shipping ───────────────────────────────────────────────────
+
+# Client to static assets, server to one bundled file.
+[group('ship')]
+build:
+    npm run build
+
+# Build the container for this machine's architecture.
+[group('ship')]
+image:
+    docker build -t {{ image }}:{{ tag }} .
+    @echo "built {{ image }}:{{ tag }}"
+
+# Run the image you just built, on 8080, with your .env.
+[group('ship')]
+image-run: image
+    @test -f .env || { echo "no .env — cp .env.example .env and fill it in" >&2; exit 1; }
+    docker run --rm -p 8080:8080 --env-file .env -e HOST=0.0.0.0 -e PORT=8080 \
+      {{ image }}:{{ tag }}
+
+# Hand GHCR the token the gh CLI already holds, so no PAT has to live in a file.
+[group('ship')]
+login:
+    gh auth token | docker login ghcr.io -u "$(gh api user --jq .login)" --password-stdin
+
+# Publish a multi-arch image.
+#
+# Refuses on a dirty tree: an image tagged with a commit has to be the thing
+# that commit builds, and one built from uncommitted edits is a tag that lies
+# about what it contains. Pass a version to override the tag.
+[doc('Publish a multi-arch image to GHCR. Refuses on a dirty tree.')]
+[group('ship')]
+push tag=tag:
+    @git diff --quiet HEAD -- . || { \
+      echo "working tree is dirty — commit before publishing an image" >&2; exit 1; }
+    docker buildx build --platform {{ platforms }} \
+      -t {{ image }}:{{ tag }} --push .
+    @echo "pushed {{ image }}:{{ tag }} for {{ platforms }}"
+
+# Tag a release the way this repo names them: <package>-v<version>.
+#
+# ov-dash has no release workflow of its own yet — .github/workflows/release.yaml
+# builds Python packages — so this only applies the naming convention and pushes
+# the tag. The image is published separately with `just push tag=<version>`.
+[doc('Tag a release as ov-dash-v<version> and push the tag.')]
+[group('ship')]
+release-tag version:
+    @git diff --quiet HEAD -- . || { echo "working tree is dirty" >&2; exit 1; }
+    git tag -a "ov-dash-v{{ version }}" -m "ov-dash {{ version }}"
+    git push origin "refs/tags/ov-dash-v{{ version }}"
+
+[doc('Remove build output.')]
+[group('ship')]
+clean:
+    rm -rf dist node_modules/.vite
