@@ -73,6 +73,97 @@ retrieval result, so the same signal costs no extra query.
 `lambda_` weights relevance against novelty. 1.0 disables diversity; 0.0 ranks
 on novelty alone and ignores the query.
 
+## Install and run
+
+OpenViking has no plugin mechanism — its server is a console script that builds
+its retriever inline — so this package ships its own entry point. Swap one
+command for the other:
+
+```bash
+openviking-server --config /etc/ov.conf      # vector only
+ov-retrieval-server --config /etc/ov.conf    # keyword leg + diversity
+```
+
+Arguments pass through untouched, subcommands included. The wrapper installs
+the patch, logs what it enabled, and hands over.
+
+To go back, run `openviking-server` again. Nothing is written to disk and
+nothing about your data changes, so switching is reversible either way.
+
+## Configuration
+
+Every setting is an environment variable prefixed `OV_RETRIEVAL_`. There is no
+config file: the settings belong to this package, and putting them in
+`ov.conf` would mean OpenViking's own schema having to know about them.
+
+```bash
+OV_RETRIEVAL_MMR_LAMBDA=0.5 ov-retrieval-server --config /etc/ov.conf
+```
+
+| Variable | Default | What it does |
+|---|---|---|
+| `OV_RETRIEVAL_KEYWORD_ENABLED` | `true` | Run the lexical leg and fuse it in |
+| `OV_RETRIEVAL_KEYWORD_WEIGHT` | `0.7` | Weight of the keyword ranking, against `1.0` for vectors |
+| `OV_RETRIEVAL_RRF_K` | `60` | RRF smoothing; lower sharpens the preference for rank 1 |
+| `OV_RETRIEVAL_POOL_FACTOR` | `4` | Candidates gathered per requested result before re-ranking |
+| `OV_RETRIEVAL_MMR_ENABLED` | `true` | Apply the diversity pass |
+| `OV_RETRIEVAL_MMR_LAMBDA` | `0.7` | Relevance against novelty; `1.0` disables diversity |
+| `OV_RETRIEVAL_MMR_EMBEDDING_WEIGHT` | `0.6` | Weight of embedding cosine in the similarity blend |
+| `OV_RETRIEVAL_MMR_ENTITY_WEIGHT` | `0.4` | Weight of tag overlap in the same blend |
+
+A misspelled variable is **refused at startup**, naming the settings that do
+exist. Silently ignoring it would leave you tuning a knob connected to nothing.
+Out-of-range values are refused the same way — `MMR_LAMBDA=5` fails rather
+than clamping.
+
+### Tuning MMR
+
+`MMR_LAMBDA` is the one to reach for first. It weights relevance against
+novelty:
+
+| Value | Effect |
+|---|---|
+| `1.0` | Diversity off — pure relevance order |
+| `0.7` | Default. Breaks up near-duplicates, relevance still in charge |
+| `0.5` | Noticeably more varied; a strong second-best can be displaced |
+| `0.0` | Novelty alone, ignoring the query |
+
+Start at the default and lower it only if results repeat themselves. Below
+about `0.4` the top result stops reliably being the best match, which is
+usually not what a search is for.
+
+The **similarity blend** decides what "repeats itself" means. Embedding cosine
+catches documents that read alike; `search_tags` overlap catches documents
+about the same things even when worded differently. Raise
+`MMR_ENTITY_WEIGHT` if your corpus is well tagged and the wording varies;
+raise `MMR_EMBEDDING_WEIGHT` if tags are sparse. When one signal is entirely
+absent the other takes full weight, so an untagged corpus needs no change.
+
+### Tuning the keyword leg
+
+`KEYWORD_WEIGHT` is `0.7` rather than `1.0` on purpose: the lexical leg is a
+corrective for terms the embedding misses, not an equal partner. Raise it
+toward `1.0` if your queries carry identifiers, error codes or proper nouns;
+lower it if keyword matches are crowding out semantically better results.
+
+`POOL_FACTOR` sets how much is over-fetched before re-ranking. Re-ranking a
+list already cut to `limit` can only reorder the survivors, so the pool has to
+be wider than the answer. Raising it gives both passes more to work with and
+costs a wider search; `4` is a reasonable balance. Note that while either pass
+is active, OpenViking's retrieval stats count the pool rather than the answer,
+so `result_count` reads high by up to this factor.
+
+### Turning it off without uninstalling
+
+```bash
+OV_RETRIEVAL_KEYWORD_ENABLED=false OV_RETRIEVAL_MMR_ENABLED=false
+```
+
+Both off makes the package a genuine no-op: no keyword query is issued, no
+similarity matrix is computed, and no over-fetch happens — retrieval behaves
+exactly as it would without this installed. Useful while a collection is still
+backfilling its bodies, or to A/B a ranking complaint.
+
 ## Layout
 
 | Module | Depends on OpenViking? |

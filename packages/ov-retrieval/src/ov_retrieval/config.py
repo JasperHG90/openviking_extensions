@@ -7,7 +7,9 @@ without OpenViking's own config file learning about this package.
 
 from __future__ import annotations
 
-from pydantic import Field
+import os
+
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .diversity import (
@@ -17,7 +19,9 @@ from .diversity import (
 )
 from .fusion import RRF_K
 
-__all__ = ["HybridSettings"]
+__all__ = ["ENV_PREFIX", "HybridSettings"]
+
+ENV_PREFIX = "OV_RETRIEVAL_"
 
 
 class HybridSettings(BaseSettings):
@@ -48,7 +52,35 @@ class HybridSettings(BaseSettings):
         two candidates repeat each other.
     """
 
-    model_config = SettingsConfigDict(env_prefix="OV_RETRIEVAL_", extra="forbid")
+    model_config = SettingsConfigDict(env_prefix=ENV_PREFIX, extra="forbid")
+
+    @model_validator(mode="after")
+    def _reject_misspelled_variables(self) -> HybridSettings:
+        """Refuse an ``OV_RETRIEVAL_`` variable that matches no setting.
+
+        ``extra="forbid"`` does not cover this. pydantic-settings looks up the
+        fields it knows and never enumerates the environment, so
+        ``OV_RETRIEVAL_MMR_LAMDA`` is not rejected -- it is never read at all,
+        and the default silently stands. Someone who set it would see the
+        diversity pass ignore them with nothing to explain why.
+
+        Raises
+        ------
+        ValueError
+            Naming the unknown variables and the settings that do exist.
+        """
+        known = {f"{ENV_PREFIX}{name}".upper() for name in type(self).model_fields}
+        unknown = sorted(
+            name
+            for name in os.environ
+            if name.upper().startswith(ENV_PREFIX) and name.upper() not in known
+        )
+        if unknown:
+            raise ValueError(
+                f"Unknown setting(s): {', '.join(unknown)}. "
+                f"Valid names are: {', '.join(sorted(known))}"
+            )
+        return self
 
     keyword_enabled: bool = Field(
         default=True, description="Run a lexical leg and fuse it with the vector leg."
