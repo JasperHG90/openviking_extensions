@@ -1,0 +1,49 @@
+memory_type: observations
+description: |
+  Synthesized observations: claims drawn from several memories that no single
+  memory states on its own. Written by ov-ext's reflection sweep, never by
+  extraction. Kept apart from entity memory because a synthesized claim and an
+  extracted fact warrant different trust -- when reflection is wrong, you need
+  to be able to tell which lines to doubt.
+directory: "viking://user/{{ user_space }}/memories/observations"
+filename_template: "{{ topic|lower }}/{{ name|lower }}.md"
+enabled: true
+embedding_template: |-
+  {{ topic }}
+
+  {{ name }}
+
+  {{ content }}
+
+overview_template: |-
+  # Observations Overview
+  {% if items %}**Topic:** {{ items[0].file_content.topic|default(directory_name, true) }}{% endif %}
+  {% for item in items %}
+  - [{{ item.file_content.name|default(item.file_name, true) }}](./{{ item.file_name }})
+  {% endfor %}
+
+fields:
+  - name: topic
+    type: string
+    description: |
+      What the observation is about, lowercase with underscores, max 3 words.
+      Groups related observations into one folder.
+    merge_op: immutable
+
+  - name: name
+    type: string
+    description: |
+      Short title for this observation, lowercase with underscores, max 5 words.
+    merge_op: immutable
+
+  - name: content
+    type: string
+    description: |
+      The observation, as Markdown. One H1 restating the title, then a short
+      paragraph stating the claim, then an H2 "Evidence" whose bullets each
+      quote a supporting memory.
+
+      State only what the cited memories support. Every claim here is traceable
+      to a `derived_from` link whose match_text is the quote, so a sentence with
+      no quote behind it does not belong.
+    merge_op: patch

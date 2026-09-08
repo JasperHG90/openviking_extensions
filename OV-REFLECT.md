@@ -44,7 +44,7 @@ One search, two LLM calls, one write pass. Not seven phases — a function.
 | 8 | OV's link repair on delete is **better than memex's**: `_inherit_deleted_link_relations` walks links *and* backlinks, remaps endpoints, and fixes the file at the far end of each edge. `_resolve_replacement_uri` follows chains with a cycle guard | `memory_updater.py:1266`, `:168` |
 | 9 | But it fires on the **delete path only**, and `delete_replacements` lives on the transient `ResolvedOperations` — nothing persists A→B→C | `dataclass.py:352` |
 | 10 | OV tracks **no usage statistics**. No `retrieval_count`, `mention_count`, `last_retrieved_at`. The `last_accessed_at` in `privacy/models.py` is consent metadata | `service/search_service.py` |
-| 11 | `HybridRetriever` is already in every search's hot path and already maps level-suffixed URIs back — the counting seam | `ov_retrieval/retriever.py:150` |
+| 11 | `HybridRetriever` is already in every search's hot path and already maps level-suffixed URIs back — the counting seam | `ov_ext/retrieval/retriever.py:150` |
 
 ## Decisions and the forks behind them
 
@@ -62,9 +62,11 @@ One search, two LLM calls, one write pass. Not seven phases — a function.
 4. **Change detection on L2, scope from L1** — because of finding 5.
 5. **Cross-peer linking is an observation, not a link.** The ask was "repo A
    and repo B are solving the same problem", which is a candidate whose
-   evidence spans two peers. Enforced mechanically: reject any observation
-   whose evidence doesn't cite ≥2 distinct top-level paths. *(Rejected: generic
-   memory↔memory association, which degenerates.)*
+   evidence spans two peers. The engine counts distinct top-level paths across
+   an observation's evidence and tags the ones spanning several; a dedicated
+   cross-peer pass sets `require_cross_peer` and drops the rest. A blanket
+   filter would reject ordinary single-project observations, which are also
+   wanted. *(Rejected: generic memory↔memory association, which degenerates.)*
 6. **Port contradiction detection; skip the Beta posterior.** No confidence
    column on OV memories, and adding one costs a MinIO write per delta.
    `StoredLink.weight` already carries contestedness — compute it from the
@@ -87,9 +89,10 @@ One search, two LLM calls, one write pass. Not seven phases — a function.
    second LLM stack in a process already patching OV.)*
 10. **One package.** The retrieval counter must live in the retriever, and
     reflection's tags feed MMR's tag-similarity leg — already mutually
-    dependent. *(Rename to `ov-ext` deferred: it changes the
-    `--match ov-retrieval-v*` tag pattern, which resets `git describe` version
-    discovery. That's a release decision, not a feature one.)*
+    dependent. **Done** — `ov-retrieval` is now `ov-ext`, with `retrieval/` and
+    `reflect/` as subsystems under one `install()`. `git describe` matches both
+    tag prefixes so the version line continues from v0.3.0. Nothing here goes
+    to PyPI, so the name change costs nothing downstream.
 11. **Salience proxy** for memex's formula: urgency = changed-since-watermark;
     importance = inbound link count (free, already stored); resonance = a
     counter in `HybridRetriever`, kept in the ov-postgres schema. *(Deferred
@@ -148,7 +151,7 @@ Measured, not estimated. Ports from memex:
 (458), `confidence.py` (256), `trends.py` (119), `entity_locks.py` (54) — is
 not in v1.
 
-Provenance goes in `src/ov_retrieval/reflect/PROVENANCE.md`: a file → source
+Provenance goes in `src/ov_ext/reflect/PROVENANCE.md`: a file → source
 path → verbatim/adapted/new → line-count table, plus the divergences above.
 Per-file headers on the ported files.
 
@@ -195,8 +198,6 @@ Per-file headers on the ported files.
 
 **Open questions**
 
-- [ ] Rename `ov-retrieval` → `ov-ext`. Is it published to PyPI? Needs a
-      deprecation shim if so, plus a tag-prefix migration.
 - [ ] In-place edit staleness: OV repairs links on delete but not on rewrite.
       Cheap fix — after a reflection edit, re-verify each inbound link's
       `match_text` still appears; drop or flag the rest. Not yet specced.

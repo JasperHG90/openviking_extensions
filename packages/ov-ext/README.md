@@ -10,10 +10,11 @@ because the subsystems already depend on each other.
 | Subsystem | What it adds |
 |---|---|
 | [`retrieval`](#retrieval) | A lexical leg fused into vector search, an MMR diversity pass, and a pooled reranker |
+| [`reflect`](#reflect) | A sweep that re-reads recent memory, writes observations with cited evidence, and flags contradictions |
 
 Settings are per subsystem and read from the environment — `OV_RETRIEVAL_` for
-retrieval. The prefixes name the subsystem rather than the package, so they
-survive this package being renamed again.
+retrieval, `OV_REFLECT_` for reflection. The prefixes name the subsystem rather
+than the package, so they survive this package being renamed again.
 
 > Renamed from `ov-retrieval` at v0.3.0. The version line continues unbroken:
 > `git describe` matches both tag prefixes until an `ov-ext-v*` tag overtakes
@@ -260,6 +261,76 @@ span now records the exception and its own status is set to error, while the
 `retrieve` span stays OK — the caller did get an answer, and saying the whole
 request failed would be a lie.
 
+## Reflect
+
+Extraction sees one window and writes what that window says. Nothing goes back
+over it, so a pattern spread across ten memories written on ten days is never
+noticed, and two memories that contradict each other sit side by side
+unremarked. OpenViking names the seam for this — `session/memory/core`
+documents a `ConsolidationExtractContextProvider` — and ships only the abstract
+base.
+
+One sweep:
+
+```
+changed = query_L2(updated_at > watermark)     # URIs only
+for dir, uris in group_by_parent(changed):
+    scope = read_L1(dir)                       # background, never cited
+    mems  = rows(uris) + neighbours() + tail_sample()
+    obs   = propose(scope, mems)               # model call 1
+    con   = contradict(mems)                   # model call 2
+    obs   = verify_quotes(obs, mems)           # code, no model
+    write(obs, con)
+```
+
+Two model calls over one gathered batch, so contradiction detection costs one
+extra call rather than a second pipeline.
+
+**Nothing is written on the model's word.** Every quote must appear verbatim in
+the memory it cites, checked by substring in code — a second model asked "is
+this true?" shares the first one's blind spots, a substring check does not. A
+citation outside the range it was shown is a fabrication and is dropped. An
+observation left with fewer than `MIN_EVIDENCE` verified quotes is discarded,
+which is what stops the model restating one memory and calling it a synthesis.
+
+Observations land as their own memory type, one `derived_from` link per quote
+with the quote as `match_text`. That is not a structure invented here:
+OpenViking's link vocabulary already defines `derived_from` for summary facts
+and already contracts `match_text` to appear verbatim. Verification is what
+makes reflection's links legal rather than merely plausible.
+
+Reads run against the vector index, never the document store — the L2 rows
+carry the memory text already, so a sweep finds its changes, gathers evidence
+and verifies every quote without opening a file. Only conclusions are written.
+
+Registering reflection does not start it. A sweep runs when a cron or a CLI
+calls it, because something that writes to memory unattended should do so
+because someone decided it should.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `OV_REFLECT_ENABLED` | `false` | Register the memory type. Off until you turn it on |
+| `OV_REFLECT_DRY_RUN` | `false` | Read, prompt and verify; report what it would write |
+| `OV_REFLECT_BATCH_LIMIT` | `50` | Most changed memories per sweep |
+| `OV_REFLECT_NEIGHBOUR_LIMIT` | `8` | Semantic neighbours per changed memory |
+| `OV_REFLECT_TAIL_SAMPLE` | `3` | Memories drawn from the far end of the store |
+| `OV_REFLECT_MIN_EVIDENCE` | `2` | Verified quotes an observation needs to survive |
+| `OV_REFLECT_REQUIRE_CROSS_PEER` | `false` | Keep only observations spanning several projects |
+| `OV_REFLECT_CONTRADICTIONS` | `true` | Ask which memories are in tension |
+| `OV_REFLECT_OBSERVATIONS_ROOT` | `viking://~/memories/observations` | Where observations are written |
+| `OV_REFLECT_STATE_PATH` | `viking://~/resources/reflect/watermark.json` | Where the watermark lives |
+
+Turn `DRY_RUN` on first. It exercises the whole sweep and reports counts —
+proposed, written, and why the rest were dropped — without touching the store,
+which is how you find out what a prompt change does before it reaches memory.
+
+`TAIL_SAMPLE` is the one not to set to zero. Without it every memory the model
+sees was selected for resembling something it already believes, and reflection
+converges on confirming itself.
+
+Ported from memex. `src/ov_ext/reflect/PROVENANCE.md` is the itemized
+accounting of what came across and what deliberately did not.
+
 ## Layout
 
 | Module | Depends on OpenViking? |
@@ -270,9 +341,15 @@ request failed would be a lie.
 | `retrieval.diversity` | No — pure functions |
 | `retrieval.rerank` | Patches OpenViking's rerank client |
 | `retrieval.retriever`, `retrieval.patch` | Yes |
+| `reflect.models`, `.citations`, `.verify`, `.prompts`, `.watermark` | No — pure |
+| `reflect.engine` | No — talks to the protocols in `reflect.ports` |
+| `reflect.viking`, `reflect.register` | Yes — the only OpenViking-shaped code |
 
 The algorithms are deliberately free of OpenViking imports, so they are
-testable without a server, a database, or a model.
+testable without a server, a database, or a model. Reflection keeps the same
+split: the engine runs against `reflect.ports`, so the whole sweep is tested
+against in-memory stand-ins, and everything OpenViking-shaped is confined to
+`reflect.viking`.
 
 ## Testing
 

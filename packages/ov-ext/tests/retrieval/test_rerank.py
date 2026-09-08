@@ -16,7 +16,7 @@ import pytest
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from openviking.retrieve.hierarchical_retriever import HierarchicalRetriever
 from openviking_cli.retrieve.types import QueryResult
-from test_retriever import FakeQuery
+from .test_retriever import FakeQuery
 
 from ov_ext.retrieval.config import HybridSettings
 from ov_ext.observability import _tracer

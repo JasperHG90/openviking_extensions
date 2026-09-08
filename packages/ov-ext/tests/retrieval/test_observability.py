@@ -27,7 +27,7 @@ from ov_ext.observability import annotate, record_error, traced, traced_sync
 # `restore_base_class` is imported for its effect as a fixture rather than to
 # be called: it is autouse, and pytest finds it in this module's namespace, so
 # the stub `make_retriever` puts on OpenViking's base class is undone here too.
-from test_retriever import (  # noqa: F401
+from .test_retriever import (  # noqa: F401
     FakeQuery,
     FakeStore,
     ctx,
