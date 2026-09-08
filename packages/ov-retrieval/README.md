@@ -164,12 +164,38 @@ similarity matrix is computed, and no over-fetch happens — retrieval behaves
 exactly as it would without this installed. Useful while a collection is still
 backfilling its bodies, or to A/B a ranking complaint.
 
+## Tracing
+
+Each pass emits an OpenTelemetry span, so a trace shows where retrieval spent
+its time and — more usefully — which passes declined to run.
+
+| Span | Says |
+|---|---|
+| `ov_retrieval.retrieve` | `limit`, `pool`, which passes are enabled, candidates in, results out |
+| `ov_retrieval.keyword_search` | the outcome: `ok`, `not_implemented`, `backend_lacks_keyword_search`, `keyword_search_failed` |
+| `ov_retrieval.fuse_keywords` | vector candidates, keyword hits, fused count |
+| `ov_retrieval.diversify` | candidates, embedding pairs, tag pairs, selected |
+| `ov_retrieval.embedding_similarity` | URIs asked about, pairs returned |
+
+There is nothing to configure. OpenViking's server installs the global tracer
+from `server.observability.traces` in `ov.conf`, and these spans join whatever
+trace it already has open, nested under the request that caused them. With
+tracing off they are non-recording and cost close to nothing.
+
+This matters most for the failure paths. Every pass here degrades to "do
+nothing" rather than to an error, so a keyword leg raising on every query used
+to look exactly like one that ran and matched nothing. The `keyword_search`
+span now records the exception and its own status is set to error, while the
+`retrieve` span stays OK — the caller did get an answer, and saying the whole
+request failed would be a lie.
+
 ## Layout
 
 | Module | Depends on OpenViking? |
 |---|---|
 | `fusion` | No — pure functions |
 | `diversity` | No — pure functions |
+| `observability` | No — OpenTelemetry API only |
 | `retriever`, `install` | Yes |
 
 The algorithms are deliberately free of OpenViking imports, so they are

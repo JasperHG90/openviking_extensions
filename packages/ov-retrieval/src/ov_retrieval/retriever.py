@@ -30,6 +30,7 @@ from openviking_cli.retrieve.types import MatchedContext, QueryResult, TypedQuer
 from .config import HybridSettings
 from .diversity import blend_similarity, mmr_select, tag_similarity_matrix
 from .fusion import rrf_fuse
+from .observability import annotate, record_error, traced
 
 __all__ = ["HybridRetriever"]
 
@@ -55,6 +56,7 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
         super().__init__(**kwargs)
         self._settings = settings or HybridSettings()
 
+    @traced("ov_retrieval.retrieve")
     async def retrieve(
         self,
         query: TypedQuery,
@@ -100,11 +102,29 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
         # so correcting it would mean reimplementing the method this class
         # exists to avoid reimplementing.
         pool = max(limit * settings.pool_factor, limit) if active else limit
+        annotate(
+            {
+                "ov_retrieval.limit": limit,
+                "ov_retrieval.pool": pool,
+                "ov_retrieval.keyword_enabled": settings.keyword_enabled,
+                "ov_retrieval.mmr_enabled": settings.mmr_enabled,
+            }
+        )
 
         result = await super().retrieve(query, ctx, limit=pool, **kwargs)
         contexts: list[MatchedContext] = list(result.matched_contexts)
+        annotate({"ov_retrieval.candidates": len(contexts)})
         if len(contexts) <= 1:
-            return self._finish(result, contexts, limit)
+            # Nothing to fuse and nothing to diversify: one candidate is
+            # already its own ranking.
+            early = self._finish(result, contexts, limit)
+            annotate(
+                {
+                    "ov_retrieval.outcome": "too_few_candidates",
+                    "ov_retrieval.results": len(early.matched_contexts),
+                }
+            )
+            return early
 
         text = (getattr(query, "query", "") or "").strip()
         if settings.keyword_enabled and text:
@@ -122,7 +142,9 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
         if settings.mmr_enabled and settings.mmr_lambda < 1.0:
             contexts = await self._diversify(contexts, limit=limit)
 
-        return self._finish(result, contexts, limit)
+        finished = self._finish(result, contexts, limit)
+        annotate({"ov_retrieval.results": len(finished.matched_contexts)})
+        return finished
 
     @classmethod
     def _stored_uri(cls, context: MatchedContext) -> str:
@@ -177,6 +199,7 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
         result.matched_contexts = ranked
         return result
 
+    @traced("ov_retrieval.fuse_keywords")
     async def _fuse_keywords(
         self,
         contexts: list[MatchedContext],
@@ -211,7 +234,14 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
             context_type=context_type,
             target_directories=target_directories,
         )
+        annotate(
+            {
+                "ov_retrieval.vector_candidates": len(contexts),
+                "ov_retrieval.keyword_hits": len(keyword_uris),
+            }
+        )
         if not keyword_uris:
+            annotate({"ov_retrieval.outcome": "no_keyword_hits"})
             return contexts
 
         # Fuse on the *stored* URI, which both legs agree on. A context's own
@@ -238,8 +268,10 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
             len(keyword_uris),
             len(fused),
         )
+        annotate({"ov_retrieval.fused": len(fused), "ov_retrieval.outcome": "fused"})
         return [by_uri[uri] for uri, _ in fused]
 
+    @traced("ov_retrieval.keyword_search")
     async def _keyword_uris(
         self,
         *,
@@ -270,6 +302,7 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
         search = getattr(store, "search_by_keywords", None)
         if build_scope is None or search is None:
             logger.debug("hybrid: backend has no scoped keyword search; vector only")
+            annotate({"ov_retrieval.outcome": "backend_lacks_keyword_search"})
             return []
 
         try:
@@ -289,18 +322,25 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
             )
         except NotImplementedError:
             # The built-in local backend cannot vectorise text and says so.
+            # Expected, so it is annotated rather than recorded as an error.
             logger.debug("hybrid: backend does not implement keyword search")
+            annotate({"ov_retrieval.outcome": "not_implemented"})
             return []
-        except Exception:
+        except Exception as exc:
             # A degraded ranking beats a failed search: the vector leg already
-            # has an answer.
+            # has an answer. Recorded on the span so the failure is visible --
+            # nothing propagates for the tracer to catch by itself.
             logger.warning("hybrid: keyword leg failed; vector only", exc_info=True)
+            record_error(exc, "keyword_search_failed")
             return []
 
         # Returned as stored, with no level suffix reconstructed. The caller
         # keys the fusion on the stored URI for the same reason.
-        return [str(row["uri"]) for row in rows or [] if row.get("uri")]
+        uris = [str(row["uri"]) for row in rows or [] if row.get("uri")]
+        annotate({"ov_retrieval.keyword_hits": len(uris), "ov_retrieval.outcome": "ok"})
+        return uris
 
+    @traced("ov_retrieval.diversify")
     async def _diversify(
         self, contexts: list[MatchedContext], *, limit: int
     ) -> list[MatchedContext]:
@@ -338,7 +378,17 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
         tags = tag_similarity_matrix(
             {context.uri: context.search_tags or [] for context in contexts}
         )
+        annotate(
+            {
+                "ov_retrieval.candidates": len(contexts),
+                "ov_retrieval.embedding_pairs": len(embedding),
+                "ov_retrieval.tag_pairs": len(tags),
+            }
+        )
         if not embedding and not tags:
+            # Neither signal is available, so every candidate looks equally
+            # novel and MMR would only reproduce the input order.
+            annotate({"ov_retrieval.outcome": "no_similarity_signal"})
             return contexts
 
         similarity = blend_similarity(
@@ -347,14 +397,22 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
             embedding_weight=settings.mmr_embedding_weight,
             entity_weight=settings.mmr_entity_weight,
         )
-        return mmr_select(
+        selected = mmr_select(
             contexts,
             key=lambda context: context.uri,
             similarity=similarity,
             lambda_=settings.mmr_lambda,
             limit=limit,
         )
+        annotate(
+            {
+                "ov_retrieval.selected": len(selected),
+                "ov_retrieval.outcome": "diversified",
+            }
+        )
+        return selected
 
+    @traced("ov_retrieval.embedding_similarity")
     async def _embedding_similarity(
         self, uris: list[str]
     ) -> dict[tuple[str, str], float]:
@@ -374,14 +432,21 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
             Similarity per URI pair in both orderings, or empty when the
             backend offers no such method.
         """
+        annotate({"ov_retrieval.uris": len(uris)})
         adapter = getattr(self.vector_store, "_shared_adapter", None)
         similarity = getattr(adapter, "pairwise_similarity", None)
         if similarity is None:
+            annotate({"ov_retrieval.outcome": "backend_lacks_similarity"})
             return {}
         try:
             # By URI, not by row id: a retrieval result carries the URI, and
             # the backend picks one representative row per URI.
-            return await asyncio.to_thread(similarity, uris, field="uri")
-        except Exception:
+            pairs: dict[tuple[str, str], float] = await asyncio.to_thread(
+                similarity, uris, field="uri"
+            )
+        except Exception as exc:
             logger.warning("hybrid: similarity failed; skipping diversity", exc_info=True)
+            record_error(exc, "similarity_failed")
             return {}
+        annotate({"ov_retrieval.pairs": len(pairs), "ov_retrieval.outcome": "ok"})
+        return pairs
