@@ -181,8 +181,8 @@ async def retrieve(
     """Run a hybrid retrieval and return the matched contexts."""
     from openviking_cli.retrieve.types import TypedQuery
 
-    from ov_retrieval.config import HybridSettings
-    from ov_retrieval.retriever import HybridRetriever
+    from ov_ext.retrieval.config import HybridSettings
+    from ov_ext.retrieval.retriever import HybridRetriever
 
     retriever = HybridRetriever(
         settings=HybridSettings(**settings),

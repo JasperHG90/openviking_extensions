@@ -337,7 +337,7 @@ indexing them stays expressible:
 query. Its only caller of `search_by_keywords` is grep, and grep never routes
 here (see [What this does not do](#what-this-does-not-do)). Bodies become
 searchable through this backend's own API, or through
-[`ov-retrieval`](../ov-retrieval), which adds a keyword leg to OpenViking's
+[`ov-ext`](../ov-ext), which adds a keyword leg to OpenViking's
 retrieval and fuses it with the vector ranking. Without one of those, the index
 is built and nothing queries it.
 

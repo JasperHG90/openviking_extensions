@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from ov_retrieval.diversity import (
+from ov_ext.retrieval.diversity import (
     blend_similarity,
     jaccard_similarity,
     mmr_select,

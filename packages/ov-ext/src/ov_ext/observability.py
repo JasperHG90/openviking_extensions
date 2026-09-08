@@ -1,13 +1,18 @@
-"""OpenTelemetry spans for hybrid retrieval.
+"""OpenTelemetry spans, shared by every ov-ext subsystem.
 
 There is nothing to configure here, which is the point. OpenViking's server
 installs a process-global ``TracerProvider`` at startup -- ``app.py`` calls
 ``init_tracer_from_server_config`` from ``server.observability.traces`` -- and
-:func:`ov_retrieval.install` patches the retriever inside that same process. A
+:func:`ov_ext.install` patches the retriever inside that same process. A
 span opened through the OpenTelemetry *API* therefore joins the trace the
 server already has open, so the keyword leg and the diversity pass appear
 underneath the request that caused them, with no endpoint, exporter or service
 name of our own.
+
+Each subsystem namespaces its own spans and attributes -- ``ov_ext.retrieval.*``,
+``ov_ext.reflect.*`` -- by passing the full dotted name at each call site. The
+one exception is :func:`record_error`, which builds an attribute name rather
+than receiving one, so it takes the namespace as an argument.
 
 Nothing here imports OpenViking. The global provider is the whole contract,
 which keeps this independent of where OpenViking happens to keep its tracer.
@@ -55,7 +60,7 @@ def _tracer() -> trace.Tracer:
     """
     from . import __version__
 
-    return trace.get_tracer("ov_retrieval", __version__)
+    return trace.get_tracer("ov_ext", __version__)
 
 
 def traced(
@@ -75,7 +80,7 @@ def traced(
     ----------
     name :
         Span name. Use the dotted method path, for example
-        ``ov_retrieval.retrieve``.
+        ``ov_ext.retrieve``.
 
     Returns
     -------
@@ -152,7 +157,7 @@ def annotate(attributes: Mapping[str, AttributeValue]) -> None:
     """Add attributes to the span currently open.
 
     Takes a mapping rather than keyword arguments because every name here is
-    dotted -- ``ov_retrieval.pool`` is not a Python identifier.
+    dotted -- ``ov_ext.pool`` is not a Python identifier.
 
     A no-op when nothing is recording, which is what makes it safe to call
     unconditionally: with no provider installed the current span is the API's
@@ -163,27 +168,30 @@ def annotate(attributes: Mapping[str, AttributeValue]) -> None:
         span.set_attribute(key, value)
 
 
-def record_error(exc: BaseException, outcome: str) -> None:
+def record_error(exc: BaseException, outcome: str, namespace: str) -> None:
     """Record a swallowed exception on the current span and mark it failed.
 
-    This package catches its own failures and returns a degraded ranking, so
-    nothing propagates for the tracer to notice on its own. Without this a
-    keyword leg that raised on every query would look, in a trace, exactly like
-    one that ran and matched nothing.
+    Every subsystem here catches its own failures and degrades rather than
+    raising, so nothing propagates for the tracer to notice on its own. Without
+    this a keyword leg that raised on every query would look, in a trace,
+    exactly like one that ran and matched nothing.
 
     The status lands on the span for the operation that actually failed, not on
-    the retrieval as a whole: the caller did get an answer, and marking the
-    whole request failed would be a lie.
+    the request as a whole: the caller did get an answer, and marking the whole
+    request failed would be a lie.
 
     Parameters
     ----------
     exc :
         The caught exception, recorded as a span event with its traceback.
     outcome :
-        Short reason, used as the status description and recorded as
-        ``ov_retrieval.outcome``.
+        Short reason, used as the status description and as the attribute value.
+    namespace :
+        Subsystem prefix, for example ``ov_ext.retrieval``. The outcome is
+        recorded as ``{namespace}.outcome``, matching the names that subsystem's
+        :func:`annotate` calls already use.
     """
     span = trace.get_current_span()
     span.record_exception(exc)
     span.set_status(Status(StatusCode.ERROR, outcome))
-    span.set_attribute("ov_retrieval.outcome", outcome)
+    span.set_attribute(f"{namespace}.outcome", outcome)

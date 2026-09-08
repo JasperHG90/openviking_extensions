@@ -16,8 +16,8 @@ resolution-markers = [
 
 [manifest]
 members = [
+    "ov-ext",
     "ov-postgres",
-    "ov-retrieval",
 ]
 
 [[package]]
@@ -2672,42 +2672,8 @@ wheels = [
 ]
 
 [[package]]
-name = "ov-postgres"
-source = { editable = "packages/ov-postgres" }
-dependencies = [
-    { name = "opentelemetry-api" },
-    { name = "openviking" },
-    { name = "psycopg", extra = ["binary", "pool"] },
-    { name = "pydantic" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "mypy" },
-    { name = "pytest" },
-    { name = "ruff" },
-    { name = "testcontainers" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "opentelemetry-api", specifier = ">=1.14" },
-    { name = "openviking", specifier = ">=0.4.16,<0.5" },
-    { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.1" },
-    { name = "pydantic", specifier = ">=2" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "mypy", specifier = ">=1.11" },
-    { name = "pytest", specifier = ">=7" },
-    { name = "ruff", specifier = ">=0.6" },
-    { name = "testcontainers", extras = ["postgres"], specifier = ">=4" },
-]
-
-[[package]]
-name = "ov-retrieval"
-source = { editable = "packages/ov-retrieval" }
+name = "ov-ext"
+source = { editable = "packages/ov-ext" }
 dependencies = [
     { name = "opentelemetry-api" },
     { name = "openviking" },
@@ -2741,6 +2707,40 @@ dev = [
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "pytest-asyncio", specifier = ">=1.4.0" },
     { name = "testcontainers", specifier = ">=4.15.0" },
+]
+
+[[package]]
+name = "ov-postgres"
+source = { editable = "packages/ov-postgres" }
+dependencies = [
+    { name = "opentelemetry-api" },
+    { name = "openviking" },
+    { name = "psycopg", extra = ["binary", "pool"] },
+    { name = "pydantic" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "mypy" },
+    { name = "pytest" },
+    { name = "ruff" },
+    { name = "testcontainers" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "opentelemetry-api", specifier = ">=1.14" },
+    { name = "openviking", specifier = ">=0.4.16,<0.5" },
+    { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.1" },
+    { name = "pydantic", specifier = ">=2" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "mypy", specifier = ">=1.11" },
+    { name = "pytest", specifier = ">=7" },
+    { name = "ruff", specifier = ">=0.6" },
+    { name = "testcontainers", extras = ["postgres"], specifier = ">=4" },
 ]
 
 [[package]]

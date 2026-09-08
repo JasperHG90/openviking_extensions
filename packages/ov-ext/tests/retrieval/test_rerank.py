@@ -18,14 +18,14 @@ from openviking.retrieve.hierarchical_retriever import HierarchicalRetriever
 from openviking_cli.retrieve.types import QueryResult
 from test_retriever import FakeQuery
 
-from ov_retrieval.config import HybridSettings
-from ov_retrieval.observability import _tracer
-from ov_retrieval.rerank import (
+from ov_ext.retrieval.config import HybridSettings
+from ov_ext.observability import _tracer
+from ov_ext.retrieval.rerank import (
     _PooledRequests,
     install_pooled_rerank,
     uninstall_pooled_rerank,
 )
-from ov_retrieval.retriever import HybridRetriever, _rerank_budget
+from ov_ext.retrieval.retriever import HybridRetriever, _rerank_budget
 
 _OPENAI_RERANK = "openviking.models.rerank.openai_rerank"
 
@@ -93,7 +93,7 @@ def test_the_shim_carries_the_trace_context(spans: InMemorySpanExporter) -> None
     shim = _PooledRequests(session, requests)  # type: ignore[arg-type]
     headers: dict[str, str] = {"Authorization": "Bearer x"}
 
-    with _tracer().start_as_current_span("ov_retrieval.parent"):
+    with _tracer().start_as_current_span("ov_ext.retrieval.parent"):
         shim.post(url="https://rerank.example/v1", headers=headers, json={})
 
     assert "traceparent" in headers
@@ -112,10 +112,10 @@ def test_the_shim_records_how_many_documents_it_sent(
     shim.post(url="https://rerank.example/v1", headers={}, json={"documents": ["a", "b"]})
 
     call = next(
-        s for s in spans.get_finished_spans() if s.name == "ov_retrieval.rerank_call"
+        s for s in spans.get_finished_spans() if s.name == "ov_ext.retrieval.rerank_call"
     )
     assert call.attributes is not None
-    assert call.attributes["ov_retrieval.documents"] == 2
+    assert call.attributes["ov_ext.retrieval.documents"] == 2
 
 
 def test_the_shim_sends_a_request_call_through_the_session_too() -> None:
@@ -158,7 +158,7 @@ def test_a_request_call_carries_the_trace_context(spans: InMemorySpanExporter) -
     shim = _PooledRequests(FakeSession(), requests)  # type: ignore[arg-type]
     headers: dict[str, str] = {"X-Date": "20260908T000000Z"}
 
-    with _tracer().start_as_current_span("ov_retrieval.parent"):
+    with _tracer().start_as_current_span("ov_ext.retrieval.parent"):
         shim.request(method="POST", url="https://rerank.example/api", headers=headers)
 
     assert "traceparent" in headers
@@ -191,10 +191,10 @@ def test_a_nested_dashscope_body_still_reports_its_batch_size(
     )
 
     call = next(
-        s for s in spans.get_finished_spans() if s.name == "ov_retrieval.rerank_call"
+        s for s in spans.get_finished_spans() if s.name == "ov_ext.retrieval.rerank_call"
     )
     assert call.attributes is not None
-    assert call.attributes["ov_retrieval.documents"] == 3
+    assert call.attributes["ov_ext.retrieval.documents"] == 3
 
 
 def test_the_shim_falls_through_to_the_real_module() -> None:
@@ -236,7 +236,7 @@ def test_the_packages_uninstall_also_unpools() -> None:
     nothing otherwise notices if `uninstall()` stops calling it and leaves both
     modules patched with the session open.
     """
-    from ov_retrieval.install import install, uninstall
+    from ov_ext.retrieval.patch import install, uninstall
 
     module = importlib.import_module(_OPENAI_RERANK)
     original = module.requests
@@ -285,7 +285,7 @@ def test_uninstalling_closes_the_pooled_session(
 
 def test_install_turns_pooling_on(monkeypatch: pytest.MonkeyPatch) -> None:
     """The only thing that makes this feature happen in a real server."""
-    from ov_retrieval.install import install, uninstall
+    from ov_ext.retrieval.patch import install, uninstall
 
     monkeypatch.delenv("OV_RETRIEVAL_RERANK_POOLING", raising=False)
     module = importlib.import_module(_OPENAI_RERANK)
@@ -300,7 +300,7 @@ def test_install_honours_pooling_being_switched_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A setting nobody can turn off is not a setting."""
-    from ov_retrieval.install import install, uninstall
+    from ov_ext.retrieval.patch import install, uninstall
 
     monkeypatch.setenv("OV_RETRIEVAL_RERANK_POOLING", "false")
     module = importlib.import_module(_OPENAI_RERANK)
@@ -430,9 +430,11 @@ async def test_the_exhausted_budget_is_recorded_not_silent(
     finally:
         _rerank_budget.reset(token)
 
-    span = next(s for s in spans.get_finished_spans() if s.name == "ov_retrieval.rerank")
+    span = next(
+        s for s in spans.get_finished_spans() if s.name == "ov_ext.retrieval.rerank"
+    )
     assert span.attributes is not None
-    assert span.attributes["ov_retrieval.outcome"] == "rerank_budget_spent"
+    assert span.attributes["ov_ext.retrieval.outcome"] == "rerank_budget_spent"
 
 
 @pytest.mark.asyncio

@@ -76,8 +76,8 @@ def install(settings: HybridSettings | None = None) -> None:
     if current is None:
         raise RuntimeError(
             f"{_MODULE}.{_ATTRIBUTE} is missing. This OpenViking version does "
-            "not lay out its retriever where ov-retrieval expects; upgrade or "
-            "pin ov-retrieval rather than running unpatched."
+            "not lay out its retriever where ov-ext expects; upgrade or "
+            "pin ov-ext rather than running unpatched."
         )
     if not isinstance(current, type):
         raise RuntimeError(
@@ -99,7 +99,7 @@ def install(settings: HybridSettings | None = None) -> None:
     # it as the original, and leave uninstall() restoring a patch instead of
     # OpenViking's class.
     if issubclass(current, HybridRetriever):
-        logger.debug("ov-retrieval: already installed")
+        logger.debug("ov-ext: already installed")
         return
 
     _original = current
@@ -117,7 +117,7 @@ def install(settings: HybridSettings | None = None) -> None:
     _ConfiguredHybridRetriever.__qualname__ = HybridRetriever.__qualname__
 
     setattr(module, _ATTRIBUTE, _ConfiguredHybridRetriever)
-    logger.info("ov-retrieval: hybrid retrieval installed over %s", current.__name__)
+    logger.info("ov-ext: hybrid retrieval installed over %s", current.__name__)
 
 
 def uninstall() -> None:
@@ -139,4 +139,4 @@ def uninstall() -> None:
     module = importlib.import_module(_MODULE)
     setattr(module, _ATTRIBUTE, _original)
     _original = None
-    logger.info("ov-retrieval: restored OpenViking's retriever")
+    logger.info("ov-ext: restored OpenViking's retriever")

@@ -10,7 +10,7 @@ on:
         required: true
         options:
           - ov-postgres
-          - ov-retrieval
+          - ov-ext
           - ovx
           - ov-skills
           - ov-clip

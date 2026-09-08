@@ -77,8 +77,8 @@ jobs:
               - uv.lock
               - .pre-commit-config.yaml
               - .github/**
-            ov-retrieval:
-              - packages/ov-retrieval/**
+            ov-ext:
+              - packages/ov-ext/**
               - pyproject.toml
               - uv.lock
               - .pre-commit-config.yaml
@@ -112,7 +112,7 @@ jobs:
           CHANGED: ${{ steps.filter.outputs.changes }}
         run: |
           set -euo pipefail
-          ALL_PYTHON='["ov-postgres", "ov-retrieval", "ovx"]'
+          ALL_PYTHON='["ov-postgres", "ov-ext", "ovx"]'
           # ov-skills ships markdown and bash, so it takes the shell template:
           # its installer has to work on the bash 3.2 macOS still ships.
           ALL_SHELL='["ov-skills"]'

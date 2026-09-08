@@ -12,9 +12,9 @@ from collections.abc import Iterator
 
 import pytest
 
-from ov_retrieval import install as install_module
-from ov_retrieval.install import install, uninstall
-from ov_retrieval.retriever import HybridRetriever
+from ov_ext.retrieval import patch as install_module
+from ov_ext.retrieval.patch import install, uninstall
+from ov_ext.retrieval.retriever import HybridRetriever
 
 MODULE = "openviking.retrieve.hierarchical_retriever"
 ATTRIBUTE = "HierarchicalRetriever"

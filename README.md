@@ -7,7 +7,7 @@ Packages that extend [OpenViking](https://github.com/volcengine/OpenViking), col
 | Package | Language | Description |
 | --- | --- | --- |
 | [`ov-postgres`](packages/ov-postgres/) | Python | PostgreSQL + pgvector backend for OpenViking's vector store |
-| [`ov-retrieval`](packages/ov-retrieval/) | Python | Adds a keyword leg and a diversity pass to OpenViking's retrieval |
+| [`ov-ext`](packages/ov-ext/) | Python | Extensions installed into OpenViking's server in one call: hybrid retrieval today, reflection next |
 | [`ovx`](packages/ovx/) | Python | Run `ov` against a named profile, without leaving an API key on disk |
 | [`ov-skills`](packages/ov-skills/) | Markdown + Bash | `/handoff`, `/continue`, `/learnings`, `/ingest` for Claude Code, opencode, and Hermes |
 | [`ov-dash`](packages/ov-dash/) | TypeScript | A dashboard over OpenViking that logs people in with OIDC and holds their API key server-side |
@@ -20,7 +20,7 @@ Each package has its own README with install and usage instructions.
 ```
 packages/
   ov-postgres/     Python package (uv workspace member)
-  ov-retrieval/    Python package (uv workspace member)
+  ov-ext/    Python package (uv workspace member)
   ovx/             Python package with a Typer CLI (standalone uv project)
   ov-skills/       Agent skills with a Python test suite (standalone uv project)
   ov-dash/         Node service and Svelte client (npm, its own toolchain)

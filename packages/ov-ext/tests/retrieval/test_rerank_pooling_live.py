@@ -23,7 +23,7 @@ from typing import Any
 import pytest
 from openviking.models.rerank.openai_rerank import OpenAIRerankClient
 
-from ov_retrieval.rerank import install_pooled_rerank, uninstall_pooled_rerank
+from ov_ext.retrieval.rerank import install_pooled_rerank, uninstall_pooled_rerank
 
 
 class _CountingServer(ThreadingHTTPServer):
@@ -227,12 +227,12 @@ def test_pooling_carries_the_trace_context_to_the_service(
     Asserted against the header the server actually received, not the dict the
     client passed, so it covers the whole path rather than the injection call.
     """
-    from ov_retrieval.observability import _tracer
+    from ov_ext.observability import _tracer
 
     install_pooled_rerank()
     client = client_for(rerank_server)
 
-    with _tracer().start_as_current_span("ov_retrieval.retrieve"):
+    with _tracer().start_as_current_span("ov_ext.retrieval.retrieve"):
         client.rerank_batch("query", ["a document"])
 
     assert rerank_server.traceparents, "the server saw no request at all"

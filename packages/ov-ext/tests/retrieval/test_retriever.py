@@ -16,8 +16,8 @@ import pytest
 from openviking.retrieve.hierarchical_retriever import HierarchicalRetriever
 from openviking_cli.retrieve.types import MatchedContext, QueryResult
 
-from ov_retrieval.config import HybridSettings
-from ov_retrieval.retriever import HybridRetriever
+from ov_ext.retrieval.config import HybridSettings
+from ov_ext.retrieval.retriever import HybridRetriever
 
 pytestmark = pytest.mark.asyncio
 

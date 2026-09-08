@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from ov_retrieval.fusion import RRF_K, rrf_fuse
+from ov_ext.retrieval.fusion import RRF_K, rrf_fuse
 
 
 def test_agreement_between_rankers_beats_a_single_strong_showing() -> None:

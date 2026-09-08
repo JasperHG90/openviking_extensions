@@ -65,7 +65,7 @@ from typing import Any
 import requests
 from opentelemetry.propagate import inject
 
-from .observability import annotate, traced_sync
+from ..observability import annotate, traced_sync
 
 __all__ = ["install_pooled_rerank", "uninstall_pooled_rerank"]
 
@@ -169,7 +169,7 @@ class _PooledRequests:
         self._session = session
         self._real = real
 
-    @traced_sync("ov_retrieval.rerank_call")
+    @traced_sync("ov_ext.retrieval.rerank_call")
     def post(self, *args: Any, **kwargs: Any) -> requests.Response:
         """Post through the pooled session, carrying the current trace context.
 
@@ -181,7 +181,7 @@ class _PooledRequests:
         self._prepare(kwargs)
         return self._session.post(*args, **kwargs)
 
-    @traced_sync("ov_retrieval.rerank_call")
+    @traced_sync("ov_ext.retrieval.rerank_call")
     def request(self, *args: Any, **kwargs: Any) -> requests.Response:
         """Send through the pooled session, carrying the current trace context.
 
@@ -214,7 +214,7 @@ class _PooledRequests:
             inject(headers)
         count = _document_count(kwargs.get("json"))
         if count is not None:
-            annotate({"ov_retrieval.documents": count})
+            annotate({"ov_ext.retrieval.documents": count})
 
     def __getattr__(self, name: str) -> Any:
         """Fall through to the real ``requests`` module."""
@@ -246,7 +246,7 @@ def install_pooled_rerank(*, pool_maxsize: int = 32) -> bool:
     global _session
 
     if _original:
-        logger.debug("ov-retrieval: rerank pooling already installed")
+        logger.debug("ov-ext: rerank pooling already installed")
         return False
 
     session = requests.Session()
@@ -267,11 +267,11 @@ def install_pooled_rerank(*, pool_maxsize: int = 32) -> bool:
             # A provider this OpenViking build does not ship. Skipped rather
             # than raised: the other module may still be there, and reranking
             # works unpooled regardless.
-            logger.debug("ov-retrieval: %s absent; not pooling it", name)
+            logger.debug("ov-ext: %s absent; not pooling it", name)
             continue
         real = getattr(module, "requests", None)
         if real is None:
-            logger.debug("ov-retrieval: %s has no `requests` to patch", name)
+            logger.debug("ov-ext: %s has no `requests` to patch", name)
             continue
         _original[name] = real
         module.requests = _PooledRequests(session, real)  # type: ignore[attr-defined]
@@ -280,7 +280,7 @@ def install_pooled_rerank(*, pool_maxsize: int = 32) -> bool:
     if patched:
         _session = session
         logger.info(
-            "ov-retrieval: rerank calls now pooled for %s",
+            "ov-ext: rerank calls now pooled for %s",
             ", ".join(sorted(_original)),
         )
     else:

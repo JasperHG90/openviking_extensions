@@ -1,6 +1,26 @@
-# ov-retrieval
+# ov-ext
 
-Hybrid fusion and diversity re-ranking for OpenViking.
+Extensions to OpenViking, installed into its server process in one call.
+
+OpenViking has no plugin mechanism, so every extension here reaches into the
+running server the same way: `ov_ext.install()` runs once at startup and each
+subsystem patches or registers what it needs. One package rather than several
+because the subsystems already depend on each other.
+
+| Subsystem | What it adds |
+|---|---|
+| [`retrieval`](#retrieval) | A lexical leg fused into vector search, an MMR diversity pass, and a pooled reranker |
+
+Settings are per subsystem and read from the environment — `OV_RETRIEVAL_` for
+retrieval. The prefixes name the subsystem rather than the package, so they
+survive this package being renamed again.
+
+> Renamed from `ov-retrieval` at v0.3.0. The version line continues unbroken:
+> `git describe` matches both tag prefixes until an `ov-ext-v*` tag overtakes
+> the old ones. Imports moved from `ov_retrieval.x` to `ov_ext.retrieval.x`,
+> and span names from `ov_retrieval.*` to `ov_ext.retrieval.*`.
+
+## Retrieval
 
 OpenViking retrieves by vector similarity, then optionally re-scores with a
 cross-encoder. That leaves two gaps. An exact term the embedding misses — an
@@ -8,7 +28,7 @@ identifier, an acronym, a rare proper noun — stays missed, because nothing
 searches lexically. And five near-identical documents fill five of your ten
 slots, because nothing measures how much a result repeats the one above it.
 
-This package adds a keyword leg fused by **reciprocal rank fusion**, and a
+This subsystem adds a keyword leg fused by **reciprocal rank fusion**, and a
 **maximal marginal relevance** pass that trades a little relevance for less
 redundancy. Both algorithms are ported from
 [memex](https://github.com/JasperHG90/memex), whose retrieval engine already
@@ -30,7 +50,7 @@ Each ranking contributes `weight / (k + rank)`, so agreement between rankers is
 what lifts an item rather than a strong showing in any single one.
 
 ```python
-from ov_retrieval import rrf_fuse
+from ov_ext.retrieval import rrf_fuse
 
 fused = rrf_fuse(
     {"vector": ["a", "b", "c"], "keyword": ["b", "a", "d"]},
@@ -55,7 +75,7 @@ live. For the PostgreSQL backend that is one `pgvector` query
 database.
 
 ```python
-from ov_retrieval import blend_similarity, mmr_select, tag_similarity_matrix
+from ov_ext.retrieval import blend_similarity, mmr_select, tag_similarity_matrix
 
 similarity = blend_similarity(
     adapter.pairwise_similarity([d.uri for d in docs]),   # cosine, from the DB
@@ -80,8 +100,8 @@ its retriever inline — so this package ships its own entry point. Swap one
 command for the other:
 
 ```bash
-openviking-server --config /etc/ov.conf      # vector only
-ov-retrieval-server --config /etc/ov.conf    # keyword leg + diversity
+openviking-server --config /etc/ov.conf      # stock
+ov-ext-server --config /etc/ov.conf          # every subsystem installed
 ```
 
 Arguments pass through untouched, subcommands included. The wrapper installs
@@ -92,12 +112,13 @@ nothing about your data changes, so switching is reversible either way.
 
 ## Configuration
 
-Every setting is an environment variable prefixed `OV_RETRIEVAL_`. There is no
-config file: the settings belong to this package, and putting them in
-`ov.conf` would mean OpenViking's own schema having to know about them.
+Retrieval's settings are environment variables prefixed `OV_RETRIEVAL_`.
+There is no config file: the settings belong to this package, and putting
+them in `ov.conf` would mean OpenViking's own schema having to know about
+them.
 
 ```bash
-OV_RETRIEVAL_MMR_LAMBDA=0.5 ov-retrieval-server --config /etc/ov.conf
+OV_RETRIEVAL_MMR_LAMBDA=0.5 ov-ext-server --config /etc/ov.conf
 ```
 
 | Variable | Default | What it does |
@@ -185,7 +206,7 @@ Two settings address that:
 
 Past the cap, candidates keep their vector scores — the same degradation
 OpenViking already applies when reranking fails, so the worst case is a ranking
-it considers acceptable rather than an error. The `ov_retrieval.rerank` span
+it considers acceptable rather than an error. The `ov_ext.retrieval.rerank` span
 records `rerank_budget_spent` when it bites, because a search that quietly
 stopped reranking half way looks exactly like one that never had a reranker.
 
@@ -219,13 +240,13 @@ its time and — more usefully — which passes declined to run.
 
 | Span | Says |
 |---|---|
-| `ov_retrieval.retrieve` | `limit`, `pool`, which passes are enabled, candidates in, results out |
-| `ov_retrieval.keyword_search` | the outcome: `ok`, `not_implemented`, `backend_lacks_keyword_search`, `keyword_search_failed` |
-| `ov_retrieval.fuse_keywords` | vector candidates, keyword hits, fused count |
-| `ov_retrieval.diversify` | candidates, embedding pairs, tag pairs, selected |
-| `ov_retrieval.embedding_similarity` | URIs asked about, pairs returned |
-| `ov_retrieval.rerank` | documents scored, or `rerank_budget_spent` |
-| `ov_retrieval.rerank_call` | one HTTP call to the rerank service; batch size when the body is JSON |
+| `ov_ext.retrieval.retrieve` | `limit`, `pool`, which passes are enabled, candidates in, results out |
+| `ov_ext.retrieval.keyword_search` | the outcome: `ok`, `not_implemented`, `backend_lacks_keyword_search`, `keyword_search_failed` |
+| `ov_ext.retrieval.fuse_keywords` | vector candidates, keyword hits, fused count |
+| `ov_ext.retrieval.diversify` | candidates, embedding pairs, tag pairs, selected |
+| `ov_ext.retrieval.embedding_similarity` | URIs asked about, pairs returned |
+| `ov_ext.retrieval.rerank` | documents scored, or `rerank_budget_spent` |
+| `ov_ext.retrieval.rerank_call` | one HTTP call to the rerank service; batch size when the body is JSON |
 
 There is nothing to configure. OpenViking's server installs the global tracer
 from `server.observability.traces` in `ov.conf`, and these spans join whatever
@@ -243,11 +264,12 @@ request failed would be a lie.
 
 | Module | Depends on OpenViking? |
 |---|---|
-| `fusion` | No — pure functions |
-| `diversity` | No — pure functions |
-| `observability` | No — OpenTelemetry API only |
-| `rerank` | Patches OpenViking's rerank client |
-| `retriever`, `install` | Yes |
+| `install` | Yes — the one entry point, fans out to each subsystem |
+| `observability` | No — OpenTelemetry API only, shared by every subsystem |
+| `retrieval.fusion` | No — pure functions |
+| `retrieval.diversity` | No — pure functions |
+| `retrieval.rerank` | Patches OpenViking's rerank client |
+| `retrieval.retriever`, `retrieval.patch` | Yes |
 
 The algorithms are deliberately free of OpenViking imports, so they are
 testable without a server, a database, or a model.

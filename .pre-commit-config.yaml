@@ -33,8 +33,8 @@ repos:
         args: [--config-file=packages/ov-postgres/pyproject.toml]
 
       - id: mypy
-        name: mypy (ov-retrieval)
-        files: ^packages/ov-retrieval/(src|tests)/
+        name: mypy (ov-ext)
+        files: ^packages/ov-ext/(src|tests)/
         additional_dependencies:
           # opentelemetry-sdk is here for the tests, which assert on exported
           # spans; src imports the API alone.
@@ -45,7 +45,7 @@ repos:
           - pytest>=7
           # `rerank` imports requests to pool the rerank client's connection.
           - types-requests>=2.31
-        args: [--config-file=packages/ov-retrieval/pyproject.toml]
+        args: [--config-file=packages/ov-ext/pyproject.toml]
 
       - id: mypy
         name: mypy (ovx)
@@ -77,12 +77,12 @@ repos:
         files: ^packages/ov-postgres/
         types: [python]
 
-      - id: pytest-unit-ov-retrieval
-        name: pytest (ov-retrieval, unit)
-        entry: uv run --directory packages/ov-retrieval pytest
+      - id: pytest-unit-ov-ext
+        name: pytest (ov-ext, unit)
+        entry: uv run --directory packages/ov-ext pytest
         language: system
         pass_filenames: false
-        files: ^packages/ov-retrieval/
+        files: ^packages/ov-ext/
         types: [python]
 
       - id: pytest-unit-ovx

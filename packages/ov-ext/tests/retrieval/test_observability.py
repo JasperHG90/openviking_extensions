@@ -12,7 +12,7 @@ import pytest
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import StatusCode
 
-from ov_retrieval.observability import annotate, record_error, traced, traced_sync
+from ov_ext.observability import annotate, record_error, traced, traced_sync
 
 # Marked per test rather than with a module-level `pytestmark`, and explicit
 # rather than relying on `asyncio_mode = "auto"`: pytest reads that setting
@@ -39,19 +39,19 @@ from test_retriever import (  # noqa: F401
 class Stub:
     """A traced object standing in for the retriever."""
 
-    @traced("ov_retrieval.stub")
+    @traced("ov_ext.fake.stub")
     async def work(self, value: int = 1) -> int:
         """Return ``value`` doubled, annotating what it saw."""
-        annotate({"ov_retrieval.pairs": value})
+        annotate({"ov_ext.fake.pairs": value})
         return value * 2
 
-    @traced("ov_retrieval.degrades")
+    @traced("ov_ext.fake.degrades")
     async def degrades(self) -> list[str]:
         """Swallow a failure the way this package's real methods do."""
         try:
             raise RuntimeError("backend fell over")
         except RuntimeError as exc:
-            record_error(exc, "keyword_search_failed")
+            record_error(exc, "keyword_search_failed", "ov_ext.fake")
             return []
 
 
@@ -62,7 +62,7 @@ async def test_a_traced_method_opens_one_span_named_after_it(
     """The span carries the name given to the decorator, not the method's."""
     await Stub().work()
 
-    assert [span.name for span in spans.get_finished_spans()] == ["ov_retrieval.stub"]
+    assert [span.name for span in spans.get_finished_spans()] == ["ov_ext.fake.stub"]
 
 
 @pytest.mark.asyncio
@@ -82,7 +82,7 @@ async def test_annotate_adds_to_the_span_that_is_open(
 
     span = spans.get_finished_spans()[0]
     assert span.attributes is not None
-    assert span.attributes["ov_retrieval.pairs"] == 7
+    assert span.attributes["ov_ext.fake.pairs"] == 7
 
 
 def test_annotate_outside_a_span_does_nothing(spans: InMemorySpanExporter) -> None:
@@ -91,7 +91,7 @@ def test_annotate_outside_a_span_does_nothing(spans: InMemorySpanExporter) -> No
     This is the same code path taken in production when tracing is off, where
     the current span is the API's invalid one.
     """
-    annotate({"ov_retrieval.pairs": 1})
+    annotate({"ov_ext.fake.pairs": 1})
 
     assert spans.get_finished_spans() == ()
 
@@ -107,7 +107,7 @@ async def test_a_swallowed_failure_still_marks_its_own_span_failed(
     assert span.status.status_code is StatusCode.ERROR
     assert [event.name for event in span.events] == ["exception"]
     assert span.attributes is not None
-    assert span.attributes["ov_retrieval.outcome"] == "keyword_search_failed"
+    assert span.attributes["ov_ext.fake.outcome"] == "keyword_search_failed"
 
 
 def test_traced_refuses_a_sync_method() -> None:
@@ -118,7 +118,7 @@ def test_traced_refuses_a_sync_method() -> None:
     with pytest.raises(TypeError, match="sync"):
         # Deliberately the wrong type: the point is the runtime guard, and
         # mypy correctly objects to the very call this test exists to make.
-        @traced("ov_retrieval.wrong")  # type: ignore[arg-type]
+        @traced("ov_ext.fake.wrong")  # type: ignore[arg-type]
         def plain(self: object) -> None:
             """Never decorated successfully."""
 
@@ -133,7 +133,7 @@ def test_traced_sync_refuses_an_async_function() -> None:
         # mypy accepts this: a coroutine function satisfies `Callable[P, R]`
         # with R bound to the coroutine. Which is exactly why the guard has to
         # exist at runtime -- the type system will not catch this mistake.
-        @traced_sync("ov_retrieval.wrong")
+        @traced_sync("ov_ext.fake.wrong")
         async def coroutine() -> None:
             """Never decorated successfully."""
 
@@ -143,13 +143,13 @@ def test_traced_sync_opens_a_span_and_returns_the_value(
 ) -> None:
     """The rerank client's HTTP call is sync, and still has to be traced."""
 
-    @traced_sync("ov_retrieval.sync_work")
+    @traced_sync("ov_ext.fake.sync_work")
     def work(value: int) -> int:
         """Double a number inside a span."""
         return value * 2
 
     assert work(21) == 42
-    assert [s.name for s in spans.get_finished_spans()] == ["ov_retrieval.sync_work"]
+    assert [s.name for s in spans.get_finished_spans()] == ["ov_ext.fake.sync_work"]
 
 
 @pytest.mark.asyncio
@@ -162,13 +162,15 @@ async def test_retrieve_records_the_shape_of_the_work(
 
     await retriever.retrieve(FakeQuery(), ctx=None, limit=2)
 
-    top = next(s for s in spans.get_finished_spans() if s.name == "ov_retrieval.retrieve")
+    top = next(
+        s for s in spans.get_finished_spans() if s.name == "ov_ext.retrieval.retrieve"
+    )
     assert top.attributes is not None
-    assert top.attributes["ov_retrieval.limit"] == 2
-    assert top.attributes["ov_retrieval.pool"] == 8
-    assert top.attributes["ov_retrieval.keyword_enabled"] is True
-    assert top.attributes["ov_retrieval.candidates"] == 3
-    assert top.attributes["ov_retrieval.results"] == 2
+    assert top.attributes["ov_ext.retrieval.limit"] == 2
+    assert top.attributes["ov_ext.retrieval.pool"] == 8
+    assert top.attributes["ov_ext.retrieval.keyword_enabled"] is True
+    assert top.attributes["ov_ext.retrieval.candidates"] == 3
+    assert top.attributes["ov_ext.retrieval.results"] == 2
 
 
 @pytest.mark.asyncio
@@ -185,10 +187,12 @@ async def test_a_single_candidate_still_reports_its_result_count(
 
     await retriever.retrieve(FakeQuery(), ctx=None, limit=5)
 
-    top = next(s for s in spans.get_finished_spans() if s.name == "ov_retrieval.retrieve")
+    top = next(
+        s for s in spans.get_finished_spans() if s.name == "ov_ext.retrieval.retrieve"
+    )
     assert top.attributes is not None
-    assert top.attributes["ov_retrieval.outcome"] == "too_few_candidates"
-    assert top.attributes["ov_retrieval.results"] == 1
+    assert top.attributes["ov_ext.retrieval.outcome"] == "too_few_candidates"
+    assert top.attributes["ov_ext.retrieval.results"] == 1
 
 
 @pytest.mark.asyncio
@@ -202,15 +206,15 @@ async def test_the_passes_nest_under_the_retrieval(
     await retriever.retrieve(FakeQuery(), ctx=None, limit=3)
 
     finished = {span.name: span for span in spans.get_finished_spans()}
-    top = finished["ov_retrieval.retrieve"]
+    top = finished["ov_ext.retrieval.retrieve"]
     assert {
-        "ov_retrieval.fuse_keywords",
-        "ov_retrieval.keyword_search",
-        "ov_retrieval.diversify",
+        "ov_ext.retrieval.fuse_keywords",
+        "ov_ext.retrieval.keyword_search",
+        "ov_ext.retrieval.diversify",
     } <= set(finished)
     top_context = top.get_span_context()
     assert top_context is not None
-    for name in ("ov_retrieval.fuse_keywords", "ov_retrieval.diversify"):
+    for name in ("ov_ext.retrieval.fuse_keywords", "ov_ext.retrieval.diversify"):
         parent = finished[name].parent
         assert parent is not None
         assert parent.span_id == top_context.span_id
@@ -232,12 +236,12 @@ async def test_a_failing_keyword_leg_is_visible_without_failing_the_retrieval(
 
     assert [m.uri for m in result.matched_contexts] == ["a", "b"]
     finished = {span.name: span for span in spans.get_finished_spans()}
-    keyword = finished["ov_retrieval.keyword_search"]
+    keyword = finished["ov_ext.retrieval.keyword_search"]
     assert keyword.status.status_code is StatusCode.ERROR
     assert keyword.attributes is not None
-    assert keyword.attributes["ov_retrieval.outcome"] == "keyword_search_failed"
+    assert keyword.attributes["ov_ext.retrieval.outcome"] == "keyword_search_failed"
     # The caller got results, so the retrieval itself did not fail.
-    assert finished["ov_retrieval.retrieve"].status.status_code is StatusCode.UNSET
+    assert finished["ov_ext.retrieval.retrieve"].status.status_code is StatusCode.UNSET
 
 
 @pytest.mark.asyncio
@@ -254,10 +258,14 @@ async def test_a_backend_without_keyword_search_says_so(
     await retriever.retrieve(FakeQuery(), ctx=None, limit=2)
 
     keyword = next(
-        s for s in spans.get_finished_spans() if s.name == "ov_retrieval.keyword_search"
+        s
+        for s in spans.get_finished_spans()
+        if s.name == "ov_ext.retrieval.keyword_search"
     )
     assert keyword.attributes is not None
-    assert keyword.attributes["ov_retrieval.outcome"] == "backend_lacks_keyword_search"
+    assert (
+        keyword.attributes["ov_ext.retrieval.outcome"] == "backend_lacks_keyword_search"
+    )
 
 
 @pytest.mark.asyncio
@@ -273,7 +281,7 @@ async def test_diversity_without_a_similarity_signal_says_so(
     await retriever.retrieve(FakeQuery(), ctx=None, limit=2)
 
     diversify = next(
-        s for s in spans.get_finished_spans() if s.name == "ov_retrieval.diversify"
+        s for s in spans.get_finished_spans() if s.name == "ov_ext.retrieval.diversify"
     )
     assert diversify.attributes is not None
-    assert diversify.attributes["ov_retrieval.outcome"] == "no_similarity_signal"
+    assert diversify.attributes["ov_ext.retrieval.outcome"] == "no_similarity_signal"

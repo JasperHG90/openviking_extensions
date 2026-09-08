@@ -5,17 +5,17 @@ requires = ["hatchling>=1.27", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
-name = "ov-retrieval"
+name = "ov-ext"
 dynamic = ["version"]
-description = "Hybrid fusion and diversity re-ranking for OpenViking retrieval"
+description = "Extensions to OpenViking: hybrid retrieval, and reflection over memory"
 readme = "README.md"
-# ov_retrieval imports and links against openviking, which is AGPL-3.0.
+# ov_ext imports and links against openviking, which is AGPL-3.0.
 # openviking declares AGPL-3.0 with no "or later", and a combined work
 # cannot widen that.
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
-keywords = ["openviking", "retrieval", "rrf", "mmr", "hybrid-search"]
+keywords = ["openviking", "retrieval", "rrf", "mmr", "hybrid-search", "reflection", "memory"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -55,7 +55,7 @@ dependencies = [
 [project.scripts]
 # OpenViking has no plugin mechanism, so the patch needs somewhere to run.
 # Swapping `openviking-server` for this keeps that visible in the process list.
-ov-retrieval-server = "ov_retrieval.__main__:main"
+ov-ext-server = "ov_ext.__main__:main"
 
 [project.urls]
 Homepage = "https://github.com/JasperHG90/openviking_extensions"
@@ -65,7 +65,7 @@ Issues = "https://github.com/JasperHG90/openviking_extensions/issues"
 # no number to forget to bump. Tags carry the package name -- this repo holds
 # several packages, and a bare v* tag cannot say which one it releases.
 # setuptools-scm's default tag_regex already strips a "<name>-" prefix, so
-# "ov-retrieval-v0.1.0" parses as 0.1.0 without extra config.
+# "ov-ext-v0.1.0" parses as 0.1.0 without extra config.
 [tool.hatch.version]
 source = "vcs"
 # The git repository sits two levels above this package. Only git checkouts
@@ -76,15 +76,22 @@ raw-options.root = "../.."
 # --match is load-bearing, not tidiness: without it `git describe` returns the
 # newest tag of *any* package in the repo, so a build here would take
 # ov-postgres's version.
+#
+# Both prefixes, because this package was called ov-retrieval up to v0.3.0.
+# Repeated --match is an OR, so `git describe` still reaches the pre-rename
+# tags and the version line continues from where it left off instead of
+# restarting at 0.0.0. Drop the old pattern once an ov-ext-v* tag exists that
+# is newer than every ov-retrieval-v* one.
 raw-options.git_describe_command = [
-    "git", "describe", "--dirty", "--tags", "--long", "--match", "ov-retrieval-v*",
+    "git", "describe", "--dirty", "--tags", "--long",
+    "--match", "ov-ext-v*", "--match", "ov-retrieval-v*",
 ]
 
 [tool.hatch.build.hooks.vcs]
-version-file = "src/ov_retrieval/_version.py"
+version-file = "src/ov_ext/_version.py"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/ov_retrieval"]
+packages = ["src/ov_ext"]
 
 # Without this the sdist sweeps in everything not gitignored -- editor config,
 # the lockfile, unrelated project files. Name what belongs in a source release.

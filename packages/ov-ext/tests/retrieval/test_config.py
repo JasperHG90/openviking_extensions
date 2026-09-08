@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from ov_retrieval.config import ENV_PREFIX, HybridSettings
+from ov_ext.retrieval.config import ENV_PREFIX, HybridSettings
 
 
 def test_defaults_have_both_passes_on() -> None:
