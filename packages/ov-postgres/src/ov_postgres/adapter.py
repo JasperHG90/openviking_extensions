@@ -31,6 +31,7 @@ from psycopg_pool import ConnectionPool
 from . import ddl
 from .collection import PgVectorCollection
 from .config import DSN_ENV_VARS, PgVectorParams, VectorDBConfigLike, resolve_dsn
+from .observability import DB_SYSTEM, annotate, traced
 from .schema import CollectionSchema
 
 logger = logging.getLogger(__name__)
@@ -212,6 +213,7 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
                 )
             return self._pool
 
+    @traced("ov_postgres.bootstrap")
     def _bootstrap(self) -> None:
         """Create the extension, helper functions and registry tables.
 
@@ -223,8 +225,19 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
         RuntimeError
             If ``create_extension`` is disabled and the extension is absent.
         """
+        annotate(
+            {
+                "db.system.name": DB_SYSTEM,
+                "db.namespace": self._params.db_schema,
+                "ov_postgres.create_extension": self._params.create_extension,
+            }
+        )
         with self._lock:
             if self._bootstrapped:
+                # Bootstrap runs once per adapter; later callers wait on the
+                # lock and return. Worth distinguishing in a trace from the
+                # call that did the work.
+                annotate({"ov_postgres.outcome": "already_bootstrapped"})
                 return
             pool = self._get_pool()
             with pool.connection() as conn, conn.cursor() as cur:
@@ -247,12 +260,27 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
                 )
             self._pgvector_version = ddl.parse_extension_version(str(row[0]))
             logger.debug("pgvector version detected: %s", self._pgvector_version)
+            annotate(
+                {
+                    "ov_postgres.pgvector_version": str(row[0]),
+                    "ov_postgres.outcome": "bootstrapped",
+                }
+            )
             self._bootstrapped = True
 
+    @traced("ov_postgres.load_collection")
     def _load_existing_collection_if_needed(self) -> None:
         """Bind to an already-created collection, if the registry knows one."""
+        annotate(
+            {
+                "db.system.name": DB_SYSTEM,
+                "db.namespace": self._params.db_schema,
+                "db.operation.name": "SELECT",
+            }
+        )
         with self._lock:
             if self._collection is not None:
+                annotate({"ov_postgres.outcome": "already_loaded"})
                 return
             self._bootstrap()
             pool = self._get_pool()
@@ -288,6 +316,7 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
                 CollectionSchema.from_meta(meta), table_name
             )
 
+    @traced("ov_postgres.create_collection")
     def _create_backend_collection(self, meta: dict[str, Any]) -> Collection:
         """Create the collection table and record it in the registry.
 
@@ -301,6 +330,13 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
         Collection
             A handle wrapping the new table.
         """
+        annotate(
+            {
+                "db.system.name": DB_SYSTEM,
+                "db.namespace": self._params.db_schema,
+                "db.operation.name": "CREATE TABLE",
+            }
+        )
         self._bootstrap()
         coll_schema = CollectionSchema.from_meta(meta)
         table_name = self._table_name()

@@ -2675,6 +2675,7 @@ wheels = [
 name = "ov-postgres"
 source = { editable = "packages/ov-postgres" }
 dependencies = [
+    { name = "opentelemetry-api" },
     { name = "openviking" },
     { name = "psycopg", extra = ["binary", "pool"] },
     { name = "pydantic" },
@@ -2690,6 +2691,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "opentelemetry-api", specifier = ">=1.14" },
     { name = "openviking", specifier = ">=0.4.16,<0.5" },
     { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.1" },
     { name = "pydantic", specifier = ">=2" },
@@ -2707,6 +2709,7 @@ dev = [
 name = "ov-retrieval"
 source = { editable = "packages/ov-retrieval" }
 dependencies = [
+    { name = "opentelemetry-api" },
     { name = "openviking" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
@@ -2723,6 +2726,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "opentelemetry-api", specifier = ">=1.14" },
     { name = "openviking", specifier = ">=0.4.16,<0.5" },
     { name = "pydantic", specifier = ">=2" },
     { name = "pydantic-settings", specifier = ">=2" },

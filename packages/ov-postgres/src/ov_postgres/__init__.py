@@ -20,6 +20,7 @@ __all__ = [
     "PgVectorCollection",
     "PgVectorCollectionAdapter",
     "UnsupportedFilterError",
+    "__version__",
 ]
 
 try:  # populated by hatch-vcs at build time

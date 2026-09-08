@@ -10,6 +10,7 @@ import threading
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Literal, overload
 
+from opentelemetry.util.types import AttributeValue
 from openviking.storage.vectordb.collection.collection import ICollection
 from openviking.storage.vectordb.collection.result import (
     AggregateResult,
@@ -28,6 +29,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from . import ddl
 from .filters import FilterCompiler, parse_datetime_to_epoch_ms
+from .observability import DB_SYSTEM, annotate, traced
 from .schema import (
     GEO_LAT_SUFFIX,
     GEO_LON_SUFFIX,
@@ -253,6 +255,14 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         self._compiler = FilterCompiler(
             coll_schema, tz_policy=tz_policy, db_schema=db_schema
         )
+        # Stamped onto every span this collection opens, so a trace says which
+        # table was queried without each method repeating itself. Built once:
+        # none of it changes over the collection's life.
+        self._span_attributes: Mapping[str, AttributeValue] = {
+            "db.system.name": DB_SYSTEM,
+            "db.namespace": db_schema,
+            "db.collection.name": table_name,
+        }
 
     @property
     def _qualified(self) -> Statement:
@@ -437,6 +447,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                     return cur.fetchall()
                 return None
 
+    @traced("ov_postgres.update")
     def update(
         self, fields: dict[str, Any] | None = None, description: str | None = None
     ) -> bool:
@@ -454,6 +465,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         bool
             Always ``True``; a failure raises instead.
         """
+        annotate({"db.operation.name": "UPDATE"})
         with self._lock:
             meta = dict(self._schema.raw)
             if description is not None:
@@ -471,6 +483,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 self._schema.description = description
         return True
 
+    @traced("ov_postgres.get_meta_data")
     def get_meta_data(self) -> dict[str, Any]:
         """Return the collection metadata recorded in the registry.
 
@@ -480,6 +493,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             The stored schema, or the in-memory copy if the registry row is
             missing.
         """
+        annotate({"db.operation.name": "SELECT"})
         row = self._execute(
             sql.SQL("SELECT meta FROM {} WHERE name = %s").format(
                 self._registry(ddl.REGISTRY_COLLECTIONS)
@@ -503,6 +517,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             except Exception:  # pragma: no cover - shutdown best effort
                 logger.debug("Failed to close pgvector pool", exc_info=True)
 
+    @traced("ov_postgres.drop")
     def drop(self) -> bool:
         """Drop the table and forget the collection and its indexes.
 
@@ -511,6 +526,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         bool
             Always ``True``; a failure raises instead.
         """
+        annotate({"db.operation.name": "DROP TABLE"})
         self._check_open()
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
@@ -531,6 +547,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 )
         return True
 
+    @traced("ov_postgres.create_index")
     def create_index(self, index_name: str, meta_data: dict[str, Any]) -> _IndexHandle:
         """Create the ANN, scalar and full-text indexes for this collection.
 
@@ -538,6 +555,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         index settings.  Postgres has no such grouping, so the bundle is
         recorded in the registry and its parts are created as real indexes.
         """
+        annotate({"db.operation.name": "CREATE INDEX"})
         self._check_open()
         vector_meta = meta_data.get("VectorIndex", {}) or {}
         distance = str(vector_meta.get("Distance") or self._distance)
@@ -634,6 +652,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             self._index_generation += 1
         return _IndexHandle(index_name, meta_data)
 
+    @traced("ov_postgres.has_index")
     def has_index(self, index_name: str) -> bool:
         """Return whether an index bundle of this name is registered.
 
@@ -647,6 +666,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         bool
             True when the bundle exists.
         """
+        annotate({"db.operation.name": "SELECT"})
         row = self._execute(
             sql.SQL(
                 "SELECT 1 AS present FROM {} WHERE collection = %s AND index_name = %s"
@@ -674,6 +694,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             return None
         return _IndexHandle(index_name, meta)
 
+    @traced("ov_postgres.get_index_meta_data")
     def get_index_meta_data(self, index_name: str) -> dict[str, Any] | None:
         """Return the stored metadata for an index bundle.
 
@@ -687,6 +708,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         dict[str, Any] | None
             The stored metadata, or ``None`` when the bundle is unknown.
         """
+        annotate({"db.operation.name": "SELECT"})
         row = self._execute(
             sql.SQL(
                 "SELECT meta FROM {} WHERE collection = %s AND index_name = %s"
@@ -699,6 +721,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         meta = row["meta"]
         return meta if isinstance(meta, dict) else json.loads(meta)
 
+    @traced("ov_postgres.list_indexes")
     def list_indexes(self) -> list[str]:
         """Return the names of every registered index bundle.
 
@@ -707,6 +730,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         list[str]
             Bundle names for this collection.
         """
+        annotate({"db.operation.name": "SELECT"})
         rows = self._execute(
             sql.SQL("SELECT index_name FROM {} WHERE collection = %s").format(
                 self._registry(ddl.REGISTRY_INDEXES)
@@ -716,6 +740,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         )
         return [row["index_name"] for row in rows or []]
 
+    @traced("ov_postgres.update_index")
     def update_index(
         self,
         index_name: str,
@@ -738,6 +763,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         bool
             Always ``True``; a failure raises instead.
         """
+        annotate({"db.operation.name": "UPDATE"})
         meta = self.get_index_meta_data(index_name) or {}
         if scalar_index is not None:
             meta["ScalarIndex"] = scalar_index
@@ -751,6 +777,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         )
         return True
 
+    @traced("ov_postgres.drop_index")
     def drop_index(self, index_name: str) -> bool:
         """Forget an index bundle.
 
@@ -767,6 +794,9 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         bool
             Always ``True``; a failure raises instead.
         """
+        # DELETE, not DROP INDEX: this forgets the registry row and leaves the
+        # physical index alone, as the docstring below says.
+        annotate({"db.operation.name": "DELETE"})
         self._execute(
             sql.SQL("DELETE FROM {} WHERE collection = %s AND index_name = %s").format(
                 self._registry(ddl.REGISTRY_INDEXES)
@@ -775,6 +805,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         )
         return True
 
+    @traced("ov_postgres.upsert_data")
     def upsert_data(
         self, data_list: list[dict[str, Any]], ttl: int = 0
     ) -> UpsertDataResult:
@@ -804,6 +835,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         ValueError
             If a record omits the primary key.
         """
+        annotate({"db.operation.name": "INSERT", "ov_postgres.records": len(data_list)})
         if not data_list:
             return UpsertDataResult(ids=[])
         if ttl:
@@ -811,6 +843,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
 
         self._check_open()
         columns, rows, ids, vectorless = self._replacement_rows(data_list)
+        annotate({"ov_postgres.vectorless": len(vectorless)})
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
                 # Checked inside the writing transaction: on its own connection
@@ -843,6 +876,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             conflict,
         )
 
+    @traced("ov_postgres.update_data")
     def update_data(self, data_list: list[dict[str, Any]]) -> UpdateResult:
         """Update only the columns present in each record.
 
@@ -868,6 +902,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             so a caller cannot use update as a silent insert on one backend
             and get a no-op on the other.
         """
+        annotate({"db.operation.name": "UPDATE", "ov_postgres.records": len(data_list)})
         if not data_list:
             return UpdateResult(ok=True, ids=[], updated_count=0)
 
@@ -967,6 +1002,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         ordered = [key for key in keys if key in written]
         return UpdateResult(ok=True, ids=ordered, updated_count=len(ordered))
 
+    @traced("ov_postgres.delete_data")
     def delete_data(self, primary_keys: list[Any]) -> bool:
         """Delete rows by primary key.
 
@@ -980,6 +1016,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         bool
             Always ``True``; a failure raises instead.
         """
+        annotate({"db.operation.name": "DELETE", "ov_postgres.keys": len(primary_keys)})
         if not primary_keys:
             return True
         keys = self._lookup_keys(primary_keys)
@@ -1002,6 +1039,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         )
         return True
 
+    @traced("ov_postgres.backfill_defaults")
     def backfill_defaults(self, *, batch_size: int = 5000) -> int:
         """Set the engine default on every column left NULL by an older write.
 
@@ -1030,6 +1068,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         int
             Number of rows updated.
         """
+        annotate({"db.operation.name": "UPDATE"})
         self._check_open()
         batch = int(batch_size)
         if batch < 1:
@@ -1051,6 +1090,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             predicates.append(sql.SQL("{} IS NULL").format(column))
 
         if not assignments:
+            annotate({"ov_postgres.rows": 0})
             return 0
 
         pk = sql.Identifier(self._schema.primary_key.name)
@@ -1074,8 +1114,10 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 repaired = int(cur.rowcount)
             total += repaired
             if repaired < batch:
+                annotate({"ov_postgres.rows": total})
                 return total
 
+    @traced("ov_postgres.delete_all_data")
     def delete_all_data(self) -> bool:
         """Remove every row, leaving the table and its indexes in place.
 
@@ -1084,9 +1126,11 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         bool
             Always ``True``; a failure raises instead.
         """
+        annotate({"db.operation.name": "TRUNCATE"})
         self._execute(sql.SQL("TRUNCATE TABLE {}").format(self._qualified))
         return True
 
+    @traced("ov_postgres.fetch_data")
     def fetch_data(self, primary_keys: list[Any]) -> FetchDataInCollectionResult:
         """Fetch whole records by primary key.
 
@@ -1100,6 +1144,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         FetchDataInCollectionResult
             The records found, plus the keys that matched nothing.
         """
+        annotate({"db.operation.name": "SELECT", "ov_postgres.keys": len(primary_keys)})
         if not primary_keys:
             return FetchDataInCollectionResult(items=[], ids_not_exist=[])
         keys = self._lookup_keys(primary_keys)
@@ -1133,6 +1178,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         ]
         return FetchDataInCollectionResult(items=items, ids_not_exist=missing)
 
+    @traced("ov_postgres.search_by_vector")
     def search_by_vector(
         self,
         index_name: str,
@@ -1175,6 +1221,16 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         if dense_vector is None and sparse_vector is None:
             raise ValueError("search_by_vector requires a dense or sparse vector")
 
+        annotate(
+            {
+                "db.operation.name": "SELECT",
+                "ov_postgres.limit": limit,
+                "ov_postgres.offset": offset,
+                "ov_postgres.dense": dense_vector is not None,
+                "ov_postgres.sparse": sparse_vector is not None,
+                "ov_postgres.filtered": filters is not None,
+            }
+        )
         score_expr, score_params = self._score_expression(dense_vector, sparse_vector)
         predicate, filter_params = self._compiler.compile(filters)
         columns = self._output_columns(output_fields)
@@ -1217,6 +1273,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             fetch="all",
             setup=self._iterative_scan_setup(),
         )
+        annotate({"ov_postgres.rows": len(rows)})
         # Floored whenever a dense vector was asked for, hybrid included. The
         # dense half of a hybrid score is fabricated for a row with no
         # embedding -- `coalesce(..., 0.0)` is the best possible value for l2
@@ -1226,6 +1283,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             rows, columns, floor_vectorless=dense_vector is not None
         )
 
+    @traced("ov_postgres.search_by_id")
     def search_by_id(
         self,
         index_name: str,
@@ -1236,11 +1294,20 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         output_fields: list[str] | None = None,
     ) -> SearchResult:
         """Find neighbours of an existing row, excluding the row itself."""
+        annotate(
+            {
+                "db.operation.name": "SELECT",
+                "ov_postgres.limit": limit,
+                "ov_postgres.offset": offset,
+                "ov_postgres.filtered": filters is not None,
+            }
+        )
         vector_field = self._schema.vector_field
         if vector_field is None:
             raise ValueError("Collection has no vector field")
         # The engine returns an empty result for these rather than raising.
         if id is None or (isinstance(id, str) and not id.strip()):
+            annotate({"ov_postgres.outcome": "no_usable_id"})
             return SearchResult(data=[])
         key = self._lookup_key(id)
         if key is None:
@@ -1276,6 +1343,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             output_fields=output_fields,
         )
 
+    @traced("ov_postgres.search_by_keywords")
     def search_by_keywords(
         self,
         index_name: str,
@@ -1312,7 +1380,17 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 seen_terms.add(text)
                 terms.append(text)
                 modes.append(mode)
+        annotate(
+            {
+                "db.operation.name": "SELECT",
+                "ov_postgres.limit": limit,
+                "ov_postgres.offset": offset,
+                "ov_postgres.terms": len(terms),
+                "ov_postgres.filtered": filters is not None,
+            }
+        )
         if not terms:
+            annotate({"ov_postgres.outcome": "no_terms"})
             return SearchResult(data=[])
         if len(terms) > _MAX_KEYWORD_TERMS:
             raise ValueError(
@@ -1343,6 +1421,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 "search_by_keywords: no text fields available on collection %s",
                 self._name,
             )
+            annotate({"ov_postgres.outcome": "no_text_fields"})
             return SearchResult(data=[])
 
         tsvector = ddl.tsvector_expr(specs, self._text_search_config, self._db_schema)
@@ -1384,8 +1463,10 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         # WHERE clause's copy of the same terms.
         params = [*terms, *filter_params, *terms, limit, offset]
         rows = self._execute(statement, params, fetch="all")
+        annotate({"ov_postgres.rows": len(rows), "ov_postgres.outcome": "ok"})
         return self._rows_to_search_result(rows, columns)
 
+    @traced("ov_postgres.pairwise_similarity")
     def pairwise_similarity(
         self, values: Sequence[object], *, field: str | None = None
     ) -> dict[tuple[object, object], float]:
@@ -1430,8 +1511,10 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             If ``field`` is not a column of this collection. Never interpolate
             an unchecked name into SQL.
         """
+        annotate({"db.operation.name": "SELECT", "ov_postgres.candidates": len(values)})
         vector_field = self._schema.vector_field
         if vector_field is None or len(values) < 2:
+            annotate({"ov_postgres.outcome": "nothing_to_compare"})
             return {}
 
         name = field or self._schema.primary_key.name
@@ -1476,6 +1559,8 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             similarity = float(row["similarity"])
             matrix[(row["ref_a"], row["ref_b"])] = similarity
             matrix[(row["ref_b"], row["ref_a"])] = similarity
+        # Pairs, not entries: the matrix holds both orderings of each.
+        annotate({"ov_postgres.pairs": len(rows), "ov_postgres.outcome": "ok"})
         return matrix
 
     def search_by_multimodal(
@@ -1505,6 +1590,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             "call search_by_vector with caller-provided vectors"
         )
 
+    @traced("ov_postgres.search_by_random")
     def search_by_random(
         self,
         index_name: str,
@@ -1533,6 +1619,14 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         SearchResult
             Randomly ordered rows; scores are not meaningful and are zero.
         """
+        annotate(
+            {
+                "db.operation.name": "SELECT",
+                "ov_postgres.limit": limit,
+                "ov_postgres.offset": offset,
+                "ov_postgres.filtered": filters is not None,
+            }
+        )
         predicate, filter_params = self._compiler.compile(filters)
         columns = self._output_columns(output_fields)
         include_extra = not output_fields
@@ -1545,8 +1639,10 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             pred=predicate,
         )
         rows = self._execute(statement, [*filter_params, limit, offset], fetch="all")
+        annotate({"ov_postgres.rows": len(rows)})
         return self._rows_to_search_result(rows, columns)
 
+    @traced("ov_postgres.search_by_scalar")
     def search_by_scalar(
         self,
         index_name: str,
@@ -1587,6 +1683,14 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         ValueError
             If ``field`` is not declared in the schema.
         """
+        annotate(
+            {
+                "db.operation.name": "SELECT",
+                "ov_postgres.limit": limit,
+                "ov_postgres.offset": offset,
+                "ov_postgres.filtered": filters is not None,
+            }
+        )
         spec = self._schema.by_name(field)
         if spec is None:
             raise ValueError(f"Unknown sort field: {field!r}")
@@ -1635,6 +1739,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             pk=sql.Identifier(self._schema.primary_key.name),
         )
         rows = self._execute(statement, [*filter_params, limit, offset], fetch="all")
+        annotate({"ov_postgres.rows": len(rows)})
 
         # The scalar sort key doubles as the score, matching the local backend.
         result = self._rows_to_search_result(rows, columns, score_key=None)
@@ -1645,6 +1750,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 item.fields.pop(field, None)
         return result
 
+    @traced("ov_postgres.aggregate_data")
     def aggregate_data(
         self,
         index_name: str,
@@ -1679,6 +1785,13 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         ValueError
             If ``op`` is not ``"count"``, or ``field`` is undeclared.
         """
+        annotate(
+            {
+                "db.operation.name": "SELECT",
+                "ov_postgres.grouped": field is not None,
+                "ov_postgres.filtered": filters is not None,
+            }
+        )
         if op != "count":
             raise ValueError(f"Unsupported aggregate op: {op!r}")
 
@@ -1715,6 +1828,9 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 fetch="one",
             )
             total = int(row["total"]) if row else 0
+            # One bucket, `_total`. Recorded here as well as on the grouped
+            # path, which returns before reaching the annotate below.
+            annotate({"ov_postgres.groups": 1, "ov_postgres.rows": total})
             return AggregateResult(agg={"_total": total}, op=op, field=None)
 
         spec = self._schema.by_name(field)
@@ -1765,6 +1881,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         agg: dict[str, Any] = {}
         for bucket, total in buckets:
             agg[null_key if bucket is None else str(bucket)] = total
+        annotate({"ov_postgres.groups": len(agg)})
         return AggregateResult(agg=agg, op=op, field=field)
 
     def _has_vector_expression(self) -> Statement:
@@ -1999,6 +2116,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 break
         return resolved
 
+    @traced("ov_postgres.ensure_indexes")
     def ensure_indexes(self) -> list[str]:
         """Bring the collection's indexes in line with what this version expects.
 
@@ -2035,6 +2153,11 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         list[str]
             Names of indexes that were created or rebuilt.
         """
+        # Named SELECT up front and corrected below only if an index is really
+        # built. Reconciliation usually finds nothing to do -- it runs at every
+        # startup -- and claiming CREATE INDEX on that path made a quiet boot
+        # look like index churn.
+        annotate({"db.operation.name": "SELECT"})
         self._check_open()
         wanted = self._reconcilable_index_statements()
 
@@ -2143,7 +2266,11 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 self._table,
                 ", ".join(sorted(skipped)),
             )
-        return sorted(set(changed))
+        built = sorted(set(changed))
+        if built:
+            annotate({"db.operation.name": "CREATE INDEX"})
+        annotate({"ov_postgres.indexes_built": len(built)})
+        return built
 
     def _reconcilable_index_statements(self) -> list[ddl.IndexStatement]:
         """Return the scalar and full-text index statements for this collection.

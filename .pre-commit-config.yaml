@@ -23,6 +23,10 @@ repos:
         name: mypy (ov-postgres)
         files: ^packages/ov-postgres/(src|tests)/
         additional_dependencies:
+          # opentelemetry-sdk is here for the tests, which assert on exported
+          # spans; src imports the API alone.
+          - opentelemetry-api>=1.14
+          - opentelemetry-sdk>=1.14
           - psycopg[binary,pool]>=3.1
           - pydantic>=2
           - pytest>=7
@@ -32,6 +36,10 @@ repos:
         name: mypy (ov-retrieval)
         files: ^packages/ov-retrieval/(src|tests)/
         additional_dependencies:
+          # opentelemetry-sdk is here for the tests, which assert on exported
+          # spans; src imports the API alone.
+          - opentelemetry-api>=1.14
+          - opentelemetry-sdk>=1.14
           - pydantic>=2
           - pydantic-settings>=2
           - pytest>=7

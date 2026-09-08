@@ -33,6 +33,13 @@ dependencies = [
     # the minor version is where breakage lands. Raise it once a version has
     # been tested against this suite.
     "openviking>=0.4.16,<0.5",
+    # Spans only -- no SDK, no exporter. OpenViking's server installs the
+    # global TracerProvider and owns the endpoint; this package just emits
+    # into whatever is already there, and records nothing when that is
+    # nothing. Declared even though openviking already requires it: this
+    # package imports it directly, and a transitive dependency is not a
+    # promise.
+    "opentelemetry-api>=1.14",
     "psycopg[binary,pool]>=3.1",
     "pydantic>=2",
 ]

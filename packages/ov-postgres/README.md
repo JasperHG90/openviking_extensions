@@ -447,6 +447,41 @@ Every key goes under `custom_params`. Unknown keys are **rejected at startup**, 
 | `connect_timeout` | `10.0` | Seconds to wait for a connection |
 | `application_name` | `openviking` | Reported to PostgreSQL |
 
+### Tracing
+
+Every collection method that runs SQL emits an OpenTelemetry span, named after
+the method — `ov_postgres.search_by_vector`, `ov_postgres.upsert_data`,
+`ov_postgres.ensure_indexes`, and so on. Each carries `db.system.name`,
+`db.namespace`, `db.collection.name` and a `db.operation.name` naming the
+statement, so a trace says which table was queried and how, plus what the call
+was asked for and what came back:
+
+```
+ov_postgres.search_by_vector
+  db.collection.name = ov_context     ov_postgres.limit    = 10
+  db.operation.name  = SELECT         ov_postgres.dense    = true
+  db.namespace       = public         ov_postgres.filtered = true
+                                      ov_postgres.rows     = 7
+```
+
+There is nothing to configure here, and this package installs no exporter of
+its own. OpenViking's server installs the global tracer from
+`server.observability.traces` in `ov.conf`, and these spans join whatever trace
+it already has open — so a slow query appears underneath the request that
+caused it. With tracing off the spans are non-recording and cost close to
+nothing.
+
+Adapter startup is traced too, as `ov_postgres.bootstrap`, and is the one
+exception to the paragraph above. It runs a batch of DDL — `CREATE EXTENSION`,
+`CREATE TABLE`, `CREATE FUNCTION` — before any collection exists, so it names
+neither a collection nor a single operation. It reports `db.namespace`, the
+detected pgvector version, and whether it did the work or found it already
+done.
+
+Spans stop at the method boundary rather than wrapping each statement. For
+per-statement detail, an operator can add
+`opentelemetry-instrumentation-psycopg` without any change here.
+
 ## How it maps
 
 One collection becomes one table, with a real typed column per declared field.
