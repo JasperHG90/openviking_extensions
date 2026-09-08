@@ -64,6 +64,8 @@ describe("who is calling", () => {
       signedIn: true,
       // Nothing here holds the session, so the page must not offer to end it.
       canSignOut: false,
+      // Nothing expires here, so the Account page shows no time.
+      expiresAt: null,
       viewer: {
         sub: "jasper",
         name: "jasper",

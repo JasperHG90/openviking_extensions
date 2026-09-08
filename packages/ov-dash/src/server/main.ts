@@ -61,6 +61,12 @@ async function main(): Promise<void> {
       `ov-dash listening on http://${config.HOST}:${info.port} ` +
         `(auth=${config.AUTH_MODE}, keys=${config.KEY_SOURCE}, ov=${config.OV_URL})`,
     );
+    // Said at boot because it is a property of the deployment, not of the code:
+    // sessions live in this process, so a second replica would sign people out
+    // at random and a restart signs everyone out at once.
+    console.log(
+      "sessions are held in memory: run one process, and expect a restart to sign everybody out",
+    );
   });
 }
 

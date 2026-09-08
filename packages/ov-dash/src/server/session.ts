@@ -1,23 +1,29 @@
 /**
- * Browser sessions, carried in a signed cookie.
+ * Browser sessions.
  *
- * The cookie holds an identity and nothing else. A person's OpenViking API key
- * never reaches the browser: the server resolves it per request from the
- * identity in this cookie, so a stolen cookie is worth a session, not a
- * credential that outlives one.
+ * The cookie names a session; it is not the session. It carries a signed,
+ * unguessable id and nothing else — no identity, no credential — and the thing
+ * it names lives in {@link SessionStore} on the server.
  *
- * The payload is signed rather than encrypted. Its contents — a name, an email,
- * an account — are already known to the person holding it; what matters is that
- * they cannot change them, and a signature gives that.
+ * That is what makes signing out mean something. The cookie used to carry the
+ * session itself, so ending one meant asking the browser to forget it: any copy
+ * taken beforehand kept working until it expired. Now the server drops the
+ * entry and every copy dies with it.
+ *
+ * The login cookie below is the exception and stays self-contained: it holds
+ * PKCE state for the few seconds of a redirect, is useless to anyone who is not
+ * mid-login, and keeping it stateless means a restart in the middle of a
+ * sign-in is survivable.
  */
 
 import { hkdfSync } from "node:crypto";
 import type { Context } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
-import { EncryptJWT, SignJWT, jwtDecrypt, jwtVerify } from "jose";
+import { SignJWT, jwtVerify } from "jose";
 import { z } from "zod";
 import type { Viewer } from "../shared/schemas";
 import type { Config } from "./env";
+import type { Session, SessionStore } from "./store";
 
 const ISSUER = "ov-dash";
 
@@ -41,13 +47,8 @@ const LOGIN_AUDIENCE = "ov-dash/login";
 /** How long a half-finished login may sit before the callback is refused. */
 const LOGIN_TTL_SECONDS = 600;
 
-const sessionClaimsSchema = z.object({
-  sub: z.string(),
-  name: z.string(),
-  email: z.string(),
-  account: z.string(),
-  user: z.string(),
-});
+/** All the cookie says: which session this is. */
+const sessionClaimsSchema = z.object({ sid: z.string().min(1) });
 
 /**
  * The state a login carries across the redirect to the provider and back.
@@ -66,12 +67,12 @@ export type LoginState = z.infer<typeof loginClaimsSchema>;
 /**
  * Derive a purpose-specific key from the configured secret.
  *
- * The signing key and the credential-encryption key used to be the same
- * secret fed to two algorithms — one raw, one through a bare SHA-256. Same
- * input, no domain separation, and `SESSION_SECRET` has a length floor but no
- * entropy requirement, so a passphrase-shaped secret plus one captured cookie
- * is an offline guess that ends in a live OpenViking token. HKDF gives each
- * use its own key, so breaking one tells you nothing about the other.
+ * `SESSION_SECRET` has a length floor but no entropy requirement, so a
+ * passphrase-shaped secret is allowed. Feeding it to an algorithm raw makes a
+ * captured cookie an offline guessing target; HKDF puts a derivation in the
+ * way. The purpose string is what keeps a future second use from sharing this
+ * key — today both cookies are signed with the same one and told apart by
+ * their audience.
  */
 function derive(config: Config, purpose: string, bytes = 32): Uint8Array {
   return new Uint8Array(
@@ -130,43 +131,101 @@ function cookieOptions(config: Config, maxAge: number) {
   };
 }
 
-/** Write the signed-in cookie for `viewer`. */
-export async function startSession(
+/** Name a session in the cookie. The id is all that travels. */
+async function writeCookie(
   c: Context,
   config: Config,
-  viewer: Viewer,
+  sid: string,
+  ttlSeconds: number,
 ): Promise<void> {
-  const token = await sign(
-    config,
-    { ...viewer },
-    SESSION_AUDIENCE,
-    config.SESSION_TTL_SECONDS,
-  );
-  setCookie(
-    c,
-    config.SESSION_COOKIE_NAME,
-    token,
-    cookieOptions(config, config.SESSION_TTL_SECONDS),
-  );
+  const token = await sign(config, { sid }, SESSION_AUDIENCE, ttlSeconds);
+  setCookie(c, config.SESSION_COOKIE_NAME, token, cookieOptions(config, ttlSeconds));
 }
 
 /**
- * Read the current viewer.
+ * Read the session id out of the cookie.
  *
- * @returns The viewer, or null when the cookie is absent, expired, or fails
- *   its signature check.
+ * The signature is checked before the id is used, so a forged or tampered
+ * cookie never reaches the store. The id is unguessable on its own; the
+ * signature is what makes a garbage cookie cheap to reject.
  */
-export async function readSession(c: Context, config: Config): Promise<Viewer | null> {
+async function readSid(c: Context, config: Config): Promise<string | null> {
   const token = getCookie(c, config.SESSION_COOKIE_NAME);
   if (!token) return null;
   const payload = await verify(config, token, SESSION_AUDIENCE);
   if (!payload) return null;
   const parsed = sessionClaimsSchema.safeParse(payload);
-  return parsed.success ? parsed.data : null;
+  return parsed.success ? parsed.data.sid : null;
 }
 
-/** Drop the session cookie. */
-export function endSession(c: Context, config: Config): void {
+/**
+ * Replace whatever session this browser was already holding.
+ *
+ * Signing in again overwrites the cookie, so the previous id becomes something
+ * the person can never present and the sign-out button can never reach — while
+ * the entry behind it stays live for its whole TTL. Anyone holding a copy of
+ * the *old* cookie would keep working through a sign-out, which is the exact
+ * hole the store was added to close. So the old one goes as the new one is made.
+ */
+async function replacePrevious(
+  c: Context,
+  config: Config,
+  store: SessionStore,
+): Promise<void> {
+  const previous = await readSid(c, config);
+  if (previous) store.drop(previous);
+}
+
+/**
+ * Start a session that carries an identity.
+ *
+ * Used where the credential is resolved per request from configuration, so
+ * there is nothing to hold but who this is.
+ *
+ * @param store - Where the session lives.
+ * @param viewer - Who it is for.
+ */
+export async function startSession(
+  c: Context,
+  config: Config,
+  store: SessionStore,
+  viewer: Viewer,
+): Promise<void> {
+  await replacePrevious(c, config, store);
+  const ttl = config.SESSION_TTL_SECONDS;
+  const sid = store.create(viewer, Math.floor(Date.now() / 1000) + ttl);
+  await writeCookie(c, config, sid, ttl);
+}
+
+/**
+ * Read the current session.
+ *
+ * @returns The session, or null when the cookie is absent, forged, expired, or
+ *   names a session that has been signed out.
+ */
+export async function readSession(
+  c: Context,
+  config: Config,
+  store: SessionStore,
+): Promise<Session | null> {
+  const sid = await readSid(c, config);
+  return sid ? store.read(sid) : null;
+}
+
+/**
+ * End the session.
+ *
+ * Drops the entry first and clears the cookie second. The clearing is a
+ * courtesy to the browser that asked; the drop is what actually ends it, for
+ * every copy of that cookie at once.
+ */
+export async function endSession(
+  c: Context,
+  config: Config,
+  store: SessionStore,
+): Promise<void> {
+  const sid = await readSid(c, config);
+  if (sid) store.drop(sid);
   deleteCookie(c, config.SESSION_COOKIE_NAME, { path: "/" });
 }
 
@@ -205,87 +264,62 @@ export async function takeLogin(c: Context, config: Config): Promise<LoginState 
 }
 
 /**
- * The audience for a session that carries a credential, kept distinct from the
- * plain identity session so one can never be read as the other.
- */
-const CREDENTIAL_AUDIENCE = "ov-dash/credential";
-
-/**
- * Encryption key for the credential cookie.
- *
- * A256GCM needs exactly 32 bytes and `SESSION_SECRET` is any length, so it is
- * hashed rather than truncated — truncating would quietly throw away entropy
- * from a long secret.
- */
-function encryptionKey(config: Config): Uint8Array {
-  return derive(config, "credential-encryption");
-}
-
-/**
  * Start a session that carries an OpenViking credential.
  *
- * Encrypted, not merely signed. The other session cookie holds an identity the
- * person already knows; this one holds a token that speaks to OpenViking as
- * them, so its contents must not be readable by anything that gets hold of the
- * cookie — including the browser it is stored in.
+ * The token never reaches the browser at all — not even encrypted. It sits in
+ * the store beside the identity it speaks for, and the cookie names the pair.
  *
  * @param c - The request context.
  * @param config - Validated configuration.
+ * @param store - Where the session lives.
  * @param viewer - Identity the credential speaks for.
  * @param token - The OpenViking credential.
  * @param expiresAt - Unix seconds the credential expires, when it says so. The
- *   cookie never outlives the token it carries.
+ *   session never outlives the token it carries.
  */
 export async function startCredentialSession(
   c: Context,
   config: Config,
+  store: SessionStore,
   viewer: Viewer,
   token: string,
   expiresAt: number | null,
 ): Promise<void> {
   const now = Math.floor(Date.now() / 1000);
-  const budget = expiresAt ? Math.max(0, expiresAt - now) : config.SESSION_TTL_SECONDS;
+  // `!== null`, not truthiness: an `exp` of 0 is a token from 1970, and reading
+  // it as "no expiry given" would give it a full-length session.
+  const budget =
+    expiresAt !== null ? Math.max(0, expiresAt - now) : config.SESSION_TTL_SECONDS;
   const ttl = Math.min(config.SESSION_TTL_SECONDS, budget);
   if (ttl <= 0) {
     // A typed error, so this surfaces as "sign in again" rather than as the
     // generic 500 a bare Error falls through to.
-    throw new SessionError("that credential has already expired — sign in again", 401);
+    throw new SessionError(
+      "that credential has already expired \u2014 sign in again",
+      401,
+    );
   }
 
-  const jwe = await new EncryptJWT({ ...viewer, ov: token })
-    .setProtectedHeader({ alg: "dir", enc: "A256GCM" })
-    .setIssuedAt()
-    .setIssuer(ISSUER)
-    .setAudience(CREDENTIAL_AUDIENCE)
-    .setExpirationTime(`${ttl}s`)
-    .encrypt(encryptionKey(config));
-
-  setCookie(c, config.SESSION_COOKIE_NAME, jwe, cookieOptions(config, ttl));
+  await replacePrevious(c, config, store);
+  const sid = store.create(viewer, now + ttl, token);
+  await writeCookie(c, config, sid, ttl);
 }
 
 /**
- * Read a credential session.
+ * Read a session that carries a credential.
  *
- * @returns The viewer and their OpenViking credential, or null when the cookie
- *   is absent, expired, or does not decrypt.
+ * @returns The viewer, their OpenViking credential, and the unix second the
+ *   session ends at. Null when there is no session, or when the one named
+ *   carries no credential — an identity session must never be mistaken for a
+ *   credential one, and here that is a property of the stored entry rather than
+ *   of how the cookie was labelled.
  */
 export async function readCredentialSession(
   c: Context,
   config: Config,
-): Promise<{ viewer: Viewer; token: string } | null> {
-  const cookie = getCookie(c, config.SESSION_COOKIE_NAME);
-  if (!cookie) return null;
-
-  try {
-    const { payload } = await jwtDecrypt(cookie, encryptionKey(config), {
-      issuer: ISSUER,
-      audience: CREDENTIAL_AUDIENCE,
-    });
-    const viewer = sessionClaimsSchema.safeParse(payload);
-    const token = payload.ov;
-    if (!viewer.success || typeof token !== "string" || !token) return null;
-    return { viewer: viewer.data, token };
-  } catch {
-    return null;
-  }
+  store: SessionStore,
+): Promise<{ viewer: Viewer; token: string; expiresAt: number } | null> {
+  const session = await readSession(c, config, store);
+  if (!session?.token) return null;
+  return { viewer: session.viewer, token: session.token, expiresAt: session.expiresAt };
 }

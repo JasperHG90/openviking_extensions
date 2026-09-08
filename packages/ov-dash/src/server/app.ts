@@ -49,12 +49,15 @@ import {
   startSession,
   takeLogin,
 } from "./session";
+import { SessionStore } from "./store";
 import { VaultError, signIn } from "./vault";
 
 /** Everything a request handler needs, built once at boot. */
 export interface Services {
   config: Config;
   keys: KeyResolver;
+  /** The sessions this process is holding. Signing out deletes from here. */
+  sessions: SessionStore;
   /** Resolved lazily: a provider that is down at boot should not stop the app. */
   oidc: () => Promise<OidcClient>;
 }
@@ -82,10 +85,12 @@ const MAX_UPLOAD_BYTES = 256 * 1024 * 1024;
 /** Build the services from config, memoizing the OIDC discovery. */
 export function buildServices(config: Config): Services {
   const keys = new KeyResolver(config);
+  const sessions = new SessionStore();
   let discovered: Promise<OidcClient> | null = null;
   return {
     config,
     keys,
+    sessions,
     oidc: () => {
       if (!discovered) {
         discovered = OidcClient.discover(config).catch((error: unknown) => {
@@ -101,30 +106,30 @@ export function buildServices(config: Config): Services {
 }
 
 /**
- * Work out who is calling.
- *
- * In `oidc` and `vault-userpass` modes this is the signed cookie the sign-in
- * wrote. In `trusted-header` mode it is whatever the authenticating proxy
- * injected, read fresh each request. In `dev` mode it is a fixed identity.
- */
-async function currentViewer(c: Context, config: Config): Promise<Viewer | null> {
-  return (await resolveCaller(c, config))?.viewer ?? null;
-}
-
-/**
  * Who is calling, and the credential they arrived with.
  *
- * Returned together because in `vault-userpass` both live in one encrypted
- * cookie, and reading it twice left a window where the JWE could expire
- * between the two reads.
+ * In `oidc` and `vault-userpass` modes this comes from the cookie the sign-in
+ * wrote. In `trusted-header` mode it is whatever the authenticating proxy
+ * injected, read fresh each request. In `dev` mode it is a fixed identity.
+ *
+ * Identity and credential are returned together because in `vault-userpass`
+ * both live in one stored session, and reading it twice left a window where the
+ * session could expire between the two reads.
  */
 async function resolveCaller(
   c: Context,
   config: Config,
-): Promise<{ viewer: Viewer; credential?: string } | null> {
+  store: SessionStore,
+): Promise<{ viewer: Viewer; credential?: string; expiresAt?: number | null } | null> {
   if (config.AUTH_MODE === "vault-userpass") {
-    const session = await readCredentialSession(c, config);
-    return session ? { viewer: session.viewer, credential: session.token } : null;
+    const session = await readCredentialSession(c, config, store);
+    return session
+      ? {
+          viewer: session.viewer,
+          credential: session.token,
+          expiresAt: session.expiresAt,
+        }
+      : null;
   }
 
   if (config.AUTH_MODE === "dev") {
@@ -162,8 +167,8 @@ async function resolveCaller(
     };
   }
 
-  const viewer = await readSession(c, config);
-  return viewer ? { viewer } : null;
+  const session = await readSession(c, config, store);
+  return session ? { viewer: session.viewer, expiresAt: session.expiresAt } : null;
 }
 
 /** Build the app. Exported separately from `main` so tests can mount it. */
@@ -212,7 +217,7 @@ export function createApp(services: Services) {
 
     const client = await services.oidc();
     const viewer = await client.exchange(code, pending.verifier, pending.nonce);
-    await startSession(c, config, viewer);
+    await startSession(c, config, services.sessions, viewer);
     return c.redirect(pending.returnTo);
   });
 
@@ -223,7 +228,7 @@ export function createApp(services: Services) {
     sameOriginOnly(config),
     csrf({ origin: originOf(config) }),
     async (c) => {
-      endSession(c, config);
+      await endSession(c, config, services.sessions);
       return c.body(null, 204);
     },
   );
@@ -257,6 +262,7 @@ export function createApp(services: Services) {
       await startCredentialSession(
         c,
         config,
+        services.sessions,
         credential.viewer,
         credential.token,
         credential.expiresAt,
@@ -283,11 +289,16 @@ export function createApp(services: Services) {
   });
 
   app.get("/api/session", async (c) => {
-    const viewer = await currentViewer(c, config);
+    const caller = await resolveCaller(c, config, services.sessions);
     const cookieBacked =
       config.AUTH_MODE === "oidc" || config.AUTH_MODE === "vault-userpass";
-    const state: SessionState = viewer
-      ? { signedIn: true, viewer, canSignOut: cookieBacked }
+    const state: SessionState = caller
+      ? {
+          signedIn: true,
+          viewer: caller.viewer,
+          canSignOut: cookieBacked,
+          expiresAt: caller.expiresAt ?? null,
+        }
       : {
           signedIn: false,
           loginUrl: "/auth/login",
@@ -321,9 +332,13 @@ export function createApp(services: Services) {
   app.use("/api/*", sameOriginOnly(config, EXPENSIVE_GETS));
 
   app.use("/api/*", async (c, next) => {
+    // Asking who you are must not require being somebody, or the client's
+    // re-read after a 401 would answer 401 and loop. Registration order already
+    // spares this route — the handler above returns before this runs — so the
+    // line is what keeps that true if the two are ever reordered.
     if (c.req.path === "/api/session") return next();
 
-    const caller = await resolveCaller(c, config);
+    const caller = await resolveCaller(c, config, services.sessions);
     if (!caller) {
       return c.json(
         { error: { code: "UNAUTHENTICATED", message: "not signed in" } },
@@ -332,11 +347,11 @@ export function createApp(services: Services) {
     }
     const { viewer, credential } = caller;
     c.set("viewer", viewer);
-    // Read once, not twice. Decrypting the credential cookie again here left a
-    // window where the JWE could expire between the two reads, dropping the
-    // request through to the key resolver — which in this mode has no per-user
-    // key to find, so an expired session surfaced as a confusing NO_KEY rather
-    // than "sign in again".
+    // Read once, not twice. Looking the session up again here left a window
+    // where it could expire between the two reads, dropping the request through
+    // to the key resolver — which in this mode has no per-user key to find, so
+    // an expired session surfaced as a confusing NO_KEY rather than "sign in
+    // again".
     c.set("ov", await OvClient.forViewer(config, services.keys, viewer, credential));
     return next();
   });

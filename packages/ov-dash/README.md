@@ -1,40 +1,107 @@
 # ov-dash
 
-A dashboard over OpenViking. People sign in with OIDC; the dashboard holds each
-person's OpenViking API key server-side and calls OpenViking as them.
+A dashboard over OpenViking. People sign in with their Vault username and
+password; the dashboard keeps the credential that sign-in produces on the
+server and calls OpenViking as them. The browser never holds one.
 
 ## Why it exists
 
-OpenViking resolves identity from the API key alone. There is no header and no
-claim that changes who it thinks you are, so under `auth_mode: "oidc"` the
+OpenViking resolves identity from the credential alone. There is no header and
+no claim that changes who it thinks you are, so under `auth_mode: "oidc"` the
 browser half of the service does not work: Web Studio's credential page has
 nothing to offer, and every write surface needs a bearer token that Vault's
 provider will only mint through a browser redirect and will not refresh.
 
-This dashboard closes that gap without forking anything. The server stays on
-`api_key`. A person proves who they are to the dashboard with OIDC; the
-dashboard looks up the key that *is* that person and uses it. The browser never
-holds a credential.
+This dashboard closes that gap without forking anything. A person proves who
+they are to Vault through the dashboard, and the dashboard mints the token
+OpenViking accepts on their behalf — the same thing the `ov` CLI does, done
+server-side so nobody needs the CLI.
 
-## How a request works
+## Two ways to hold a credential
+
+Which one a deployment uses is set by `AUTH_MODE`, and they are genuinely
+different — the Account page says which one is in force rather than assuming.
+
+**`vault-userpass` (what `.env.example` ships, and what the lab cluster needs;
+the schema's own default is `oidc`, so set this explicitly).** The sign-in
+form posts a Vault username and password. The dashboard logs into Vault with
+them, mints an OpenViking identity token from `identity/oidc/token/<role>`,
+hands the Vault login token straight back with `revoke-self`, and keeps the
+minted token in memory. The password is used once and never
+stored. **No API key exists anywhere in this mode**, so `KEY_SOURCE` is not
+read and nothing needs one.
+
+The session ends at whichever runs out first, the minted token's own `exp` or
+`SESSION_TTL_SECONDS`, and nothing renews it — refreshing would need the
+password back. The cookie is written with that shorter lifetime, so the cookie
+and the token it carries never disagree, and the Account page shows the time.
+
+**`oidc` / `trusted-header` / `dev`.** Identity arrives from a provider, a
+proxy, or configuration, and the dashboard resolves a *key* for that person on
+every request from `KEY_SOURCE` — Vault KV, a static map, or one environment
+variable. This is where the API-key story applies.
+
+## How a Vault sign-in works
 
 1. The browser asks for a page. There is no session, so it lands on Sign in.
-2. `/auth/login` builds an authorization URL with PKCE, a state and a nonce, and
+2. The form posts to `/auth/vault-login`, guarded like every other
+   state-changing route — without that, a page on another origin could have the
+   browser accept a `Set-Cookie` for an account the attacker controls.
+3. The dashboard logs into Vault's userpass mount with those credentials.
+4. It mints an identity token for that person. The role decides the audience,
+   the claims and the lifetime, so the dashboard asks for none of them.
+5. It revokes the Vault login token. It existed for the mint and nothing later
+   uses it; left alone Vault would keep it alive for its whole lease, and the
+   sign-out button cannot reach it.
+6. The identity is read back out of the minted token — `ov_account` and
+   `ov_user` — because that is who OpenViking will answer as, and therefore the
+   only trustworthy source for who this session is.
+7. Token and identity go into the session store, and the browser is given a
+   cookie naming it. Every later request looks the session up and calls
+   OpenViking with the token the server is holding.
+
+Signing out deletes the session. The cookie names a session the server holds,
+so dropping the entry kills every copy of that cookie at once — not just the
+browser that asked. The minted token stays valid until it expires (a signed JWT,
+and Vault offers no way to withdraw one early), but nothing can present it as
+that person once the session is gone.
+
+### The sessions live in this process
+
+The cookie carries an unguessable id and nothing else — no identity, no
+credential. Everything it names is held in memory by the server.
+
+That is what makes sign-out mean something. When the cookie *was* the session,
+ending one meant asking a browser to forget it, and any copy taken beforehand —
+off a shared machine, out of a synced profile, from a proxy log — kept working
+until it expired.
+
+Two consequences, both deliberate:
+
+- **A restart signs everybody out.** The honest cost of holding no database. It
+  fails closed, and the price is a sign-in after a deploy.
+- **Run one process.** Two replicas each keep their own sessions, so a person
+  would be signed out whenever the load balancer sent them to the other one.
+  Scaling out needs a shared store, not this.
+
+## How an OIDC sign-in works
+
+1. `/auth/login` builds an authorization URL with PKCE, a state and a nonce, and
    stashes all three in a short-lived signed cookie.
-3. The provider authenticates the person and redirects back to
+2. The provider authenticates the person and redirects back to
    `/auth/callback` with a code.
-4. The dashboard swaps the code for an ID token, verifies its signature against
+3. The dashboard swaps the code for an ID token, verifies its signature against
    the provider's JWKS, and checks the nonce came back unchanged.
-5. A claim from that token becomes the OpenViking user (`email-local` by
+4. A claim from that token becomes the OpenViking user (`email-local` by
    default: `jasper@example.com` → `jasper`). That identity goes into a signed
    session cookie — an identity, never a credential.
-6. Every later request resolves that user's API key from Vault and calls
+5. Every later request resolves that user's key from `KEY_SOURCE` and calls
    OpenViking with it.
 
-The session deliberately outlives the ID token. Vault's provider advertises no
-refresh grant, so its token dies in about an hour; the dashboard only needs it
-to learn who someone is. Tying the session to it would sign people out hourly
-and buy nothing.
+The session deliberately outlives the ID token here. Vault's provider advertises
+no refresh grant, so its token dies in about an hour; the dashboard only needs
+it to learn who someone is. Tying the session to it would sign people out
+hourly and buy nothing.
 
 ## What it shows
 
@@ -137,7 +204,7 @@ double encoding without a decode loop.
 ## Run it
 
 ```bash
-cp .env.example .env      # fill in OV_URL, SESSION_SECRET, the OIDC client
+cp .env.example .env      # fill in OV_URL, SESSION_SECRET, VAULT_ADDR
 docker compose up --build
 ```
 
@@ -155,11 +222,49 @@ so the login redirect and the cookie behave as they will in production.
 
 ## Gates
 
+There is a `justfile`. `just` on its own lists everything; the recipes below
+are the ones you want most.
+
+```bash
+just gates      # what CI runs: tsc, svelte-check, biome, vitest — through prek,
+                # so the versions match the ones pinned in .pre-commit-config.yaml
+just test       # the fast offline suite alone
+just image      # build the container
+just push       # publish it, multi-arch, to GHCR
+```
+
+Under `just gates` are the same three npm scripts, if you would rather run one:
+
 ```bash
 npm run check   # tsc, then svelte-check
 npm run lint    # biome
-npm test        # vitest
+npm test        # vitest, fast and offline
 ```
+
+The unit suite stubs `fetch`, which proves the dashboard sends what we think it
+sends and nothing about what Vault does with it. Three of the claims this design
+rests on are Vault's behaviour, not ours — that `revoke-self` really kills the
+login token, that the minted identity token survives that revocation, and that
+the role's template produces the `ov_account`/`ov_user` claims identity is read
+from. A stub answers whatever it is told to, so those are checked against a real
+Vault instead:
+
+```bash
+just test-integration   # starts the Vault if it is not already up
+```
+
+or by hand:
+
+```bash
+docker run -d --name ovdash-vault -p 18200:8200 \
+  -e VAULT_DEV_ROOT_TOKEN_ID=root hashicorp/vault:latest
+npm run test:integration
+```
+
+It configures the mount, entity, alias and role itself, and is idempotent, so
+re-running against the same container is fine. Point it elsewhere with
+`VAULT_TEST_ADDR` and `VAULT_TEST_ROOT_TOKEN`. Kept out of `npm test` because
+that runs on every commit and has to stay offline.
 
 Biome is scoped to TypeScript; Svelte components are type-checked by
 `svelte-check`, since Biome 1.x only half-parses `.svelte` and wants to reformat

@@ -7,6 +7,17 @@
   const session = $derived(app.session?.signedIn ? app.session : null);
   const viewer = $derived(session?.viewer ?? null);
   const canSignOut = $derived(session?.canSignOut ?? false);
+  const expiresAt = $derived(session?.expiresAt ?? null);
+
+  /** When the session ends, in this browser's own locale and time zone. */
+  const expiry = $derived(
+    expiresAt === null
+      ? ""
+      : new Date(expiresAt * 1000).toLocaleString(undefined, {
+          dateStyle: "medium",
+          timeStyle: "short",
+        }),
+  );
 
   let busy = $state(false);
 
@@ -29,7 +40,10 @@
 {#if viewer}
   <div class="pp">
     <div class="r"><span class="k">Name</span><span class="v">{viewer.name}</span></div>
-    <div class="r"><span class="k">Email</span><span class="v">{viewer.email}</span></div>
+    <!-- A Vault sign-in carries no address, so the row would label an empty space. -->
+    {#if viewer.email}
+      <div class="r"><span class="k">Email</span><span class="v">{viewer.email}</span></div>
+    {/if}
     <div class="r">
       <span class="k">OpenViking user</span>
       <span class="v mono">{viewer.user}</span>
@@ -38,15 +52,17 @@
       <span class="k">Account</span>
       <span class="v mono">{viewer.account}</span>
     </div>
-  </div>
-
-  <div class="callout c-teal">
-    <span class="ci"><Icon name="key" /></span>
-    <p>
-      Your OpenViking API key stays on the server. The dashboard looks it up for
-      each request from the identity above, so it is never sent to your browser
-      and never appears in a page you could copy it out of.
-    </p>
+    <!--
+      A time, and nothing about where it comes from. What a session is made of
+      is the operator's business and it is in the README; the only part of it
+      anyone here can act on is when they will have to sign in again.
+    -->
+    {#if expiry}
+      <div class="r">
+        <span class="k">Signed in until</span>
+        <span class="v">{expiry}</span>
+      </div>
+    {/if}
   </div>
 
   {#if canSignOut}
@@ -58,20 +74,12 @@
     </p>
   {:else}
     <!--
-      No button, because there is nothing here that could end the session. It
-      would clear a cookie neither of these modes reads, and leave the person
-      signed in — which is what it did before this said so.
+      No button, because nothing here could end the session: the identity
+      arrives with every request. A button that cleared a cookie nobody reads
+      would leave the person signed in and looking for the reason.
     -->
-    <div class="callout c-sheet">
-      <span class="ci"><Icon name="user" /></span>
-      <p>
-        This dashboard is not holding your session — your identity arrives with
-        every request, from the proxy in front of it or from its own
-        configuration. Signing out is done wherever you signed in.
-      </p>
-    </div>
+    <p class="pdesc" style="margin-top:24px">You sign out where you signed in.</p>
   {/if}
-
 {:else}
   <p class="pdesc">You are not signed in.</p>
 {/if}

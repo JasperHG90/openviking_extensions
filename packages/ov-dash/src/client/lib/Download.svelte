@@ -8,7 +8,7 @@
    */
   import { api } from "./api";
   import Icon from "./Icon.svelte";
-  import { toast } from "./state.svelte";
+  import { app, toast } from "./state.svelte";
 
   interface Props {
     uri: string;
@@ -21,10 +21,24 @@
   let ticked = $state(false);
   let timer: ReturnType<typeof setTimeout> | undefined;
 
-  function start(event: MouseEvent): void {
+  async function start(event: MouseEvent): Promise<void> {
     // Rows are links; a download must not also navigate.
     event.preventDefault();
     event.stopPropagation();
+
+    /*
+     * Every other call answers a dead session by putting the sign-in page back
+     * up. This one cannot: the download streams through a hidden iframe, which
+     * reports nothing — a 401 there is a "Downloading…" toast followed by
+     * silence. So the session is checked first, which is cheap and, unlike the
+     * iframe, has an answer to read.
+     */
+    const session = await api.session().catch(() => null);
+    if (session && !session.signedIn) {
+      app.session = session;
+      toast("Your session ended — sign in again to download this.");
+      return;
+    }
 
     const frame = document.createElement("iframe");
     frame.hidden = true;

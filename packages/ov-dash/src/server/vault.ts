@@ -235,6 +235,60 @@ export function credentialFrom(token: string): VaultCredential {
 }
 
 /**
+ * How long to wait for a revoke before giving up on it.
+ *
+ * Not `OV_TIMEOUT_MS`, which is a minute — raised so OpenViking's slow grep can
+ * finish. Nothing in the sign-in's answer depends on this call, so a Vault that
+ * accepts the login and then blackholes the revoke would otherwise turn a
+ * successful sign-in into a minute of staring at a spinner.
+ */
+const REVOKE_TIMEOUT_MS = 3_000;
+
+/**
+ * Hand the Vault session token back.
+ *
+ * The login token exists for exactly one call — the mint — and a *service*
+ * token stays alive for its whole lease afterwards, which on a stock userpass
+ * mount is weeks. Nothing in the session uses it again and the sign-out button
+ * cannot reach it, so a dashboard people sign into from anywhere would leave
+ * one live Vault token behind per sign-in, each outliving the session that
+ * created it. A batch token has nothing server-side to revoke, and Vault
+ * refuses the call with a 400; that is expected rather than a fault.
+ *
+ * Best effort. A token that outlives its use is untidy; refusing somebody a
+ * session they have already earned is worse, so a failure here is logged and
+ * the sign-in continues.
+ *
+ * @param config - Supplies the Vault address.
+ * @param vaultToken - The token to revoke.
+ */
+export async function revokeSelf(config: Config, vaultToken: string): Promise<void> {
+  try {
+    const response = await fetch(`${base(config)}/v1/auth/token/revoke-self`, {
+      method: "POST",
+      headers: headers(config, vaultToken),
+      redirect: "manual",
+      signal: AbortSignal.timeout(REVOKE_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+      // Vault says "batch tokens cannot be revoked" when the mount issues
+      // those, and warning about that on every sign-in trains an operator to
+      // ignore the log. Matched on what Vault said, not on the 400 alone: a
+      // misconfigured namespace or mount is also a 400, and that one is worth
+      // hearing about.
+      const why = await detail(response);
+      if (!/batch token/i.test(why)) {
+        console.warn(
+          `vault would not revoke the sign-in token: HTTP ${response.status} ${why}`.trim(),
+        );
+      }
+    }
+  } catch (error) {
+    console.warn(`could not revoke the sign-in token: ${(error as Error).message}`);
+  }
+}
+
+/**
  * Sign in and mint in one step.
  *
  * @param config - Validated configuration.
@@ -248,5 +302,11 @@ export async function signIn(
   password: string,
 ): Promise<VaultCredential> {
   const vaultToken = await login(config, username, password);
-  return mint(config, vaultToken);
+  try {
+    return await mint(config, vaultToken);
+  } finally {
+    // In a finally, not after the mint: a mint that throws leaves the same live
+    // token behind as one that succeeds.
+    await revokeSelf(config, vaultToken);
+  }
 }

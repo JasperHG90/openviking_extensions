@@ -46,6 +46,31 @@ export class ApiError extends Error {
 }
 
 /**
+ * What to do when the server stops recognising this session.
+ *
+ * A Vault sign-in mints a token with a fixed lifetime and nothing renews it —
+ * the password that would is never stored. So sessions end while people are
+ * still looking at the page, and on a dashboard reached from anywhere that is
+ * the ordinary way they end, not an edge case. The shell reads `/api/session`
+ * once at boot, so without this the page stayed signed-in-looking and answered
+ * every click with a toast. The shell registers a handler here instead.
+ */
+let onSessionEnd: () => void = () => {};
+
+/** Register what happens when the session ends. Called once, by the shell. */
+export function whenSessionEnds(handler: () => void): void {
+  onSessionEnd = handler;
+}
+
+/** Act on a 401 wherever one arrives, not only where it was expected. */
+function noticeSessionEnd(status: number): void {
+  if (status !== 401) return;
+  // Everything cached was read as somebody the server no longer knows.
+  invalidate();
+  onSessionEnd();
+}
+
+/**
  * Fetch and parse one route.
  *
  * The return type is the schema's *output*, which matters wherever a field has
@@ -65,6 +90,7 @@ async function call<S extends z.ZodTypeAny>(
   });
 
   if (!response.ok) {
+    noticeSessionEnd(response.status);
     const body: unknown = await response.json().catch(() => null);
     const parsed = apiErrorSchema.safeParse(body);
     throw new ApiError(
@@ -131,8 +157,11 @@ export const api = {
       method: "DELETE",
       credentials: "same-origin",
     });
-    if (!response.ok)
+    if (!response.ok) {
+      // Not routed through `call`, so the 401 has to be noticed here too.
+      noticeSessionEnd(response.status);
       throw new ApiError("could not forget that", "DELETE_FAILED", response.status);
+    }
     // The memory is gone upstream, so every view that counted it is now wrong.
     invalidate("memories");
     invalidate("home");

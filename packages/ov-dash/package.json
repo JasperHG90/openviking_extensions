@@ -2,7 +2,7 @@
   "name": "ov-dash",
   "version": "0.0.0",
   "private": true,
-  "description": "A dashboard over OpenViking that logs people in with OIDC and holds their API key server-side",
+  "description": "A dashboard over OpenViking that signs people in through Vault and keeps their credential server-side",
   "license": "AGPL-3.0-only",
   "type": "module",
   "engines": {
@@ -20,7 +20,8 @@
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:integration": "vitest run --config vitest.integration.config.ts"
   },
   "dependencies": {
     "@hono/node-server": "^1.13.7",

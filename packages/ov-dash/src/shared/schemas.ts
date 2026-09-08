@@ -42,6 +42,14 @@ export const sessionStateSchema = z.discriminatedUnion("signedIn", [
      * reads would be a button that lies.
      */
     canSignOut: z.boolean(),
+    /**
+     * Unix seconds this session ends at, or null when nothing here knows.
+     *
+     * Nothing renews it: the minted token cannot be refreshed without the
+     * password, which is never stored. That time is when signing in again
+     * starts being necessary.
+     */
+    expiresAt: z.number().nullable(),
   }),
 ]);
 export type SessionState = z.infer<typeof sessionStateSchema>;

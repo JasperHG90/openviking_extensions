@@ -8,6 +8,7 @@ import {
   startSession,
   takeLogin,
 } from "../src/server/session";
+import { SessionStore } from "../src/server/store";
 import type { Viewer } from "../src/shared/schemas";
 
 const config = loadConfig({
@@ -31,18 +32,18 @@ const VIEWER: Viewer = {
 };
 
 /** Mount a tiny app that writes a session, then reads it back. */
-function app() {
+function app(store = new SessionStore()) {
   const instance = new Hono();
   instance.get("/in", async (c) => {
-    await startSession(c, config, VIEWER);
+    await startSession(c, config, store, VIEWER);
     return c.text("ok");
   });
   instance.get("/who", async (c) => {
-    const viewer = await readSession(c, config);
-    return c.json(viewer);
+    const session = await readSession(c, config, store);
+    return c.json(session);
   });
-  instance.get("/out", (c) => {
-    endSession(c, config);
+  instance.get("/out", async (c) => {
+    await endSession(c, config, store);
     return c.text("ok");
   });
   return instance;
@@ -61,7 +62,10 @@ describe("sessions", () => {
     expect(cookie).toContain(config.SESSION_COOKIE_NAME);
 
     const who = await instance.request("/who", { headers: { cookie } });
-    expect(await who.json()).toEqual(VIEWER);
+    const body = (await who.json()) as { viewer: Viewer; expiresAt: number };
+    expect(body.viewer).toEqual(VIEWER);
+    // Read off the stored session, so the Account page can say when this ends.
+    expect(body.expiresAt).toBeGreaterThan(Math.floor(Date.now() / 1000));
   });
 
   it("marks the cookie HttpOnly and SameSite=Lax", async () => {
@@ -73,17 +77,39 @@ describe("sessions", () => {
     expect(header).toMatch(/SameSite=Lax/i);
   });
 
-  it("never puts a credential in the cookie", async () => {
+  it("puts nothing in the cookie but the session's name", async () => {
     const response = await app().request("/in");
     const header = response.headers.get("set-cookie") ?? "";
     const [, payload] = (header.split(";")[0] ?? "").split(".");
     const claims = JSON.parse(
       Buffer.from(payload ?? "", "base64url").toString("utf8"),
     ) as Record<string, unknown>;
+
+    // It used to carry the whole identity. Now `sid` names a session the server
+    // holds, which is what lets signing out actually end one.
     expect(Object.keys(claims).sort()).toEqual(
-      ["account", "aud", "email", "exp", "iat", "iss", "name", "sub", "user"].sort(),
+      ["aud", "exp", "iat", "iss", "sid"].sort(),
     );
-    expect(JSON.stringify(claims)).not.toContain("ov_");
+    const json = JSON.stringify(claims);
+    expect(json).not.toContain(VIEWER.email);
+    expect(json).not.toContain(VIEWER.account);
+    expect(json).not.toContain("ov_");
+  });
+
+  it("signs out for good, not just for the browser that asked", async () => {
+    const instance = app();
+    const cookie = cookieFrom(await instance.request("/in"));
+    expect(
+      await (await instance.request("/who", { headers: { cookie } })).json(),
+    ).not.toBeNull();
+
+    await instance.request("/out", { headers: { cookie } });
+
+    // The same cookie, replayed. A copy taken before the sign-out is exactly
+    // this request, and it must now be worth nothing.
+    expect(
+      await (await instance.request("/who", { headers: { cookie } })).json(),
+    ).toBeNull();
   });
 
   it("rejects a tampered cookie", async () => {

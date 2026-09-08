@@ -46,6 +46,17 @@
   --gold: #C9A63F;
   --rose: #CE7166;
 
+  /*
+   * The sign-in page's lamplight, and the seal it falls on.
+   *
+   * Kept here rather than in the component because they are the same accent
+   * seen at three strengths, and both faces of the room have to agree.
+   */
+  --lamp-1: rgba(224, 166, 75, 0.1);
+  --lamp-2: rgba(224, 166, 75, 0.035);
+  --seal-ring: rgba(224, 166, 75, 0.38);
+  --seal-hair: rgba(224, 166, 75, 0.15);
+
   --fd: "Newsreader", Georgia, "Times New Roman", serif;
   --f: "Instrument Sans", ui-sans-serif, system-ui, -apple-system, sans-serif;
   --fm: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -93,6 +104,12 @@
     --accent-quiet: rgba(169, 112, 15, 0.11);
     --accent-line: rgba(169, 112, 15, 0.3);
 
+    /* Daylight, not lamplight: on paper the pool almost disappears. */
+    --lamp-1: rgba(169, 112, 15, 0.07);
+    --lamp-2: rgba(169, 112, 15, 0.02);
+    --seal-ring: rgba(169, 112, 15, 0.34);
+    --seal-hair: rgba(169, 112, 15, 0.14);
+
     --sage: #5B7A48;
     --clay: #A8542F;
     --slate: #4F708F;
@@ -122,6 +139,12 @@
   --accent-ink: #8A5A08;
   --accent-quiet: rgba(169, 112, 15, 0.11);
   --accent-line: rgba(169, 112, 15, 0.3);
+
+  /* Daylight, not lamplight: on paper the pool almost disappears. */
+  --lamp-1: rgba(169, 112, 15, 0.07);
+  --lamp-2: rgba(169, 112, 15, 0.02);
+  --seal-ring: rgba(169, 112, 15, 0.34);
+  --seal-hair: rgba(169, 112, 15, 0.14);
 
   --sage: #5B7A48;
   --clay: #A8542F;
@@ -1140,4 +1163,17 @@ mark {
   .pp .k {
     width: 118px;
   }
+}
+
+/*
+ * The moment before the session is known.
+ *
+ * Neither the shell nor the sign-in page can be drawn yet — one needs a viewer
+ * and the other needs to know which sign-in this deployment uses — so this
+ * holds the window for the one request it takes to find out.
+ */
+.boot {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
 }

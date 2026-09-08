@@ -137,11 +137,17 @@ const schema = z
     /**
      * How long a signed-in browser stays signed in.
      *
-     * Deliberately independent of the ID token's lifetime. Vault's provider
-     * advertises no refresh grant, so its token dies in about an hour; the
-     * dashboard only needs the token to learn who someone is, and calls
-     * OpenViking with the server-held API key afterwards. Tying the session to
-     * the token would sign people out hourly for no gain in safety.
+     * It means two different things, because the two modes hold two different
+     * things. Under `vault-userpass` the cookie carries the credential, so this
+     * is a ceiling on it: the session ends at whichever runs out first, this or
+     * the minted token's own `exp`.
+     *
+     * Under `oidc` the cookie carries only an identity, and this is deliberately
+     * independent of the ID token's lifetime. Vault's provider advertises no
+     * refresh grant, so its token dies in about an hour; the dashboard only
+     * needs it to learn who someone is, and resolves a key per request
+     * afterwards. Tying the session to it would sign people out hourly for no
+     * gain in safety.
      */
     SESSION_TTL_SECONDS: z.coerce.number().int().positive().default(28_800),
     SESSION_COOKIE_NAME: z.string().default("ovdash_session"),
