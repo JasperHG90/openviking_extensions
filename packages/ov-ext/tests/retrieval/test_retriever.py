@@ -120,10 +120,6 @@ def make_retriever(
             # rerank config; none is reached once its `retrieve` is stubbed.
             self._settings = HybridSettings(**overrides)
             self.vector_store = store
-            # Present, and truthy, because the final pass refuses to reorder
-            # without one. Never called: the tests that reach the service
-            # patch the base `_rerank_scores` over it.
-            self._rerank_client = object()
             self.base_limit: int | None = None
 
     async def base_retrieve(
@@ -528,7 +524,6 @@ async def test_the_final_pass_is_not_charged_to_the_descent_ceiling(
     class _Stubbed(HybridRetriever):
         def __init__(self) -> None:
             self._settings = HybridSettings(rerank_max_calls=1)
-            self._rerank_client = object()
 
     token = _rerank_budget.set(0)
     try:
@@ -554,7 +549,6 @@ async def test_the_final_pass_keeps_the_fused_order_when_scoring_fails(
     class _Stubbed(HybridRetriever):
         def __init__(self) -> None:
             self._settings = HybridSettings()
-            self._rerank_client = object()
 
     result = await _Stubbed()._rerank_pool(
         [ctx("a", abstract="x"), ctx("b", abstract="y")], text="q"
@@ -572,7 +566,6 @@ async def test_a_pool_of_blank_abstracts_costs_no_rerank_call(
     class _Stubbed(HybridRetriever):
         def __init__(self) -> None:
             self._settings = HybridSettings()
-            self._rerank_client = object()
 
     result = await _Stubbed()._rerank_pool([ctx("a"), ctx("b")], text="q")
 
@@ -634,10 +627,89 @@ async def test_the_final_pass_keeps_the_fused_order_when_the_service_declines(
     class _Stubbed(HybridRetriever):
         def __init__(self) -> None:
             self._settings = HybridSettings()
-            self._rerank_client = object()
 
     result = await _Stubbed()._rerank_pool(fused_pool(), text="intermediate certificate")
 
     assert [m.uri for m in result] == ["buried", "decoy"], (
         "a declined rerank must not be read as a ranking"
+    )
+
+
+async def test_the_cap_does_not_let_the_final_pass_bury_what_it_held_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partial rerank must not be sorted as though it were a whole one.
+
+    The cap picks by vector score, so what it holds back is precisely what the
+    keyword leg promoted. Sorting the whole pool by the merged list would then
+    compare a rerank score against a cosine: it buried ``promoted`` from first
+    to last and lifted ``d``, which nothing ever judged, from last to first.
+    Found by adversarial review.
+    """
+    seen: list[list[str]] = []
+
+    async def base_rerank(
+        self: Any, query: str, documents: list[str], fallback_scores: list[float]
+    ) -> list[float]:
+        seen.append(list(documents))
+        return [9.0] * len(documents)
+
+    monkeypatch.setattr(HierarchicalRetriever, "_rerank_scores", base_rerank)
+
+    class _Stubbed(HybridRetriever):
+        def __init__(self) -> None:
+            self._settings = HybridSettings(rerank_max_documents=2)
+
+    pool = [
+        ctx("promoted", abstract="the keyword hit", score=0.10),
+        ctx("b", abstract="b filler", score=0.80),
+        ctx("c", abstract="c filler", score=0.70),
+        ctx("d", abstract="d filler", score=0.60),
+    ]
+
+    result = await _Stubbed()._rerank_pool(pool, text="q")
+    order = [m.uri for m in result]
+
+    assert seen == [["b filler", "c filler"]], (
+        "the cap sends the strongest by vector score"
+    )
+    assert order[0] == "promoted", "what the cap held back must keep its fused place"
+    assert order[-1] == "d", (
+        "a candidate nothing judged must not be promoted over one judged"
+    )
+
+
+async def test_blank_abstracts_are_not_ranked_against_a_scored_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shipped defaults, and ordinary while a collection is backfilling.
+
+    Upstream scores only the non-blank documents and leaves the rest on their
+    cosines. Sorting the pool by that mixture made the answer depend on where
+    the cross-encoder's output range happened to sit against cosine -- here a
+    real match with a low rerank score fell below two candidates carrying no
+    text at all. Found by adversarial review.
+    """
+
+    async def base_rerank(
+        self: Any, query: str, documents: list[str], fallback_scores: list[float]
+    ) -> list[float]:
+        return [0.2] * len(documents)
+
+    monkeypatch.setattr(HierarchicalRetriever, "_rerank_scores", base_rerank)
+
+    class _Stubbed(HybridRetriever):
+        def __init__(self) -> None:
+            self._settings = HybridSettings()
+
+    pool = [
+        ctx("relevant", abstract="a real abstract", score=0.10),
+        ctx("blank-a", abstract="", score=0.90),
+        ctx("blank-b", abstract="   ", score=0.80),
+    ]
+
+    result = await _Stubbed()._rerank_pool(pool, text="q")
+
+    assert [m.uri for m in result] == ["relevant", "blank-a", "blank-b"], (
+        "an unjudged blank must not outrank the one candidate that was judged"
     )

@@ -589,3 +589,28 @@ async def test_the_default_document_cap_sends_every_document(
     await retriever._rerank_scores("q", ["a", "b", "c"], [0.1, 0.2, 0.3])
 
     assert seen[0][0] == ["a", "b", "c"], "the default must send everything"
+
+
+@pytest.mark.asyncio
+async def test_the_cap_spends_its_allowance_on_documents_that_carry_text(
+    monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
+) -> None:
+    """Blanks are dropped before the cap applies, not after.
+
+    Capping first fills the allowance by vector score, which here is both
+    blanks -- so the request goes out empty while the ceiling has already been
+    charged for it. Found by adversarial review.
+    """
+    retriever, seen = make_recording_retriever(monkeypatch, rerank_max_documents=2)
+
+    token = _rerank_budget.set(5)
+    try:
+        await retriever._rerank_scores("q", ["real text", "", "   "], [0.1, 0.9, 0.8])
+        remaining = _rerank_budget.get()
+    finally:
+        _rerank_budget.reset(token)
+
+    assert seen[0][0] == ["real text"], (
+        "the allowance must go to text the service can read"
+    )
+    assert remaining == 4, "and the call it was charged for must have carried something"

@@ -282,12 +282,34 @@ The honest caveat is that the result then mixes two scales, and a strong vector
 score can outrank a weak rerank score. Upstream already mixes them for documents
 it skips, so this widens an existing looseness rather than introducing one.
 
+Blanks are dropped **before** the cap applies. Capping first would let a
+backfilling subtree fill the whole allowance with documents the service ignores,
+sending an empty request that the call ceiling has already been charged for.
+
 ### The final pass
 
-`RERANK_FINAL` adds one call after fusion. It exists because nothing else ever
-scores the pool *as a whole*: the descent judges a directory of siblings at a
-time, so the candidates the keyword leg promoted, and any left on vector scores
-by a cap, reach the answer unjudged.
+`RERANK_FINAL` adds one call after fusion. It exists because the descent judges
+a directory of siblings at a time and never sees the pool it ends up with, so
+the candidates the keyword leg promoted, and any left on vector scores by a
+spent call ceiling, reach the answer unjudged.
+
+**`RERANK_MAX_DOCUMENTS` applies to this pass too**, and the interaction is the
+most important thing to know about either setting. The cap selects by vector
+score, so what it holds back is precisely what the keyword leg promoted — its
+whole job is lifting documents the embedding ranked low. So the pass reorders
+**only the candidates it actually scored, among the positions they already
+held**; anything it did not see keeps its place.
+
+That restriction is not fussiness. Sorting the whole pool by the merged scores
+compares a rerank score against a cosine, two numbers that share a range and
+nothing else. Measured on a four-candidate pool with `MAX_DOCUMENTS=2`, it took
+a keyword-promoted document from first to last and lifted a document nothing had
+ever judged from last to first — an answer that was neither the fused order nor
+the vector order, and strictly worse than leaving the pass off.
+
+The same applies when abstracts are missing. A pool mixing blank and real
+abstracts gets only its real ones scored, and the blanks would otherwise be
+ranked against them on cosine alone.
 
 It runs before the diversity pass, and that order is load-bearing —
 `mmr_select` reads relevance from a candidate's position rather than its score,
