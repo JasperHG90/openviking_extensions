@@ -89,8 +89,23 @@ export const fileDetailSchema = z.object({
   node: nodeSchema,
   /** L2 content. Empty for binaries the server declined to inline. */
   content: z.string(),
-  /** L0 abstract, when OpenViking has one. */
+  /**
+   * What OpenViking says about this file, read out of its folder's overview.
+   *
+   * Empty when the overview holds no description for it — either because the
+   * folder has not been summarised yet, or because OpenViking truncated the
+   * overview before it reached this file.
+   */
   abstract: z.string(),
+  /**
+   * The folder's own summary.
+   *
+   * Carried separately so the page can label it as the folder's rather than
+   * pass it off as the file's. OpenViking answers `abstract(fileUri)` with
+   * exactly this, which is why showing it unlabelled read as a description of
+   * whichever file was open.
+   */
+  folderSummary: z.string().default(""),
   /** True when content was withheld because the file is not text. */
   binary: z.boolean(),
 });

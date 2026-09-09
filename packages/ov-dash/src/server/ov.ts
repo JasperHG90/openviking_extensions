@@ -148,6 +148,25 @@ export function relativeTo(root: string, uri: string): string {
   return uri.startsWith(base) ? uri.slice(base.length) : uri;
 }
 
+/** How a viking uri starts, and the shortest one there can be. */
+const SCHEME = "viking://";
+
+/**
+ * The folder a uri sits in.
+ *
+ * A uri with nothing above it answers with itself, so a caller walking upward
+ * stops rather than producing `viking:/` and asking OpenViking about it.
+ */
+export function parentOf(uri: string): string {
+  const trimmed = uri.replace(/\/+$/, "");
+  // Stripping the trailing slashes off a bare `viking://` eats the scheme's
+  // own, and the guard below would then hand back `viking:` — further from a
+  // usable uri than what came in.
+  if (trimmed.length < SCHEME.length) return uri;
+  const cut = trimmed.lastIndexOf("/");
+  return cut < SCHEME.length ? trimmed : trimmed.slice(0, cut);
+}
+
 /**
  * One person's view of OpenViking.
  *
@@ -331,6 +350,21 @@ export class OvClient {
   async abstract(uri: string): Promise<string> {
     try {
       return usefulAbstract(await this.sdk.abstract(uri));
+    } catch {
+      return "";
+    }
+  }
+
+  /**
+   * Read a folder's overview (L1).
+   *
+   * Same contract as `abstract`: a folder OpenViking has not summarised yet
+   * has none, and a page that wanted the descriptions inside it should still
+   * render without them.
+   */
+  async overview(uri: string): Promise<string> {
+    try {
+      return (await this.sdk.overview(uri)).trim();
     } catch {
       return "";
     }

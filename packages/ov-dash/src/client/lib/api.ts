@@ -15,7 +15,6 @@ import {
   type MemoryGroup,
   type Opened,
   type SearchMode,
-  type SearchResponse,
   type SessionState,
   type Tree,
   type UploadResult,
@@ -197,6 +196,9 @@ export const api = {
 
   /** The URL a download link points at. Files stream; folders arrive zipped. */
   downloadUrl: (uri: string) => `/api/download?uri=${encodeURIComponent(uri)}`,
+
+  /** Where an image's own bytes are, for an `<img>` in the reading pane. */
+  imageUrl: (uri: string) => `/api/image?uri=${encodeURIComponent(uri)}`,
 };
 
 export type {
@@ -206,7 +208,6 @@ export type {
   FileDetail,
   Home,
   MemoryGroup,
-  SearchResponse,
   SessionState,
   Tree,
 };

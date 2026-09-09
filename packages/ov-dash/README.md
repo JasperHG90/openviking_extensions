@@ -109,25 +109,57 @@ hourly and buy nothing.
 |---|---|
 | Home | recursive `fs/ls`, plus memory and session counts |
 | Files | one recursive `fs/ls`, hierarchy built client-side |
-| Folder / File | `fs/ls`, `fs/stat`, `content/read`, `content/abstract` |
-| Search | `search/find` (meaning), `search/grep` (exact words), or both |
+| Folder / File | `fs/ls`, `fs/stat`, `content/read`, `content/abstract`, `content/overview` |
+| Search | `search/find` |
 | Memories | files under `<scope>/memories`, grouped by category |
 | Sessions | `sessions` |
 | Add a file | `resources` import, via a private temp file |
 
 Downloads use `content/download`. A folder has no archive endpoint upstream, so
-the server fetches each file and zips them.
+the server fetches each file and zips them. `/api/image` serves the same bytes
+under a real image type so the reading pane can show a picture rather than a
+download button.
 
-### The three search modes are real
+The type is chosen from the file's *name*, so be clear about what keeps that
+safe. Nothing reads the bytes: a file called `evil.png` holding markup is still
+served as `image/png`. What stops the browser acting on it is
+`x-content-type-options: nosniff`, backed by `default-src 'none'; sandbox`. The
+raster-only allowlist is a second line — it keeps `.svg`, which is a document
+that can carry script, from being offered a type at all — but the headers are
+the control. Removing either would look harmless and would not be.
 
-"By meaning" is the vector face; "Exact words" is grep; "Hybrid" runs both and
-merges them by reciprocal rank. Each result says how it got there, including
-which words an exact hit matched.
+### A file's description does not come from its own abstract
 
-An earlier design queried Postgres directly for the keyword half, which would
+OpenViking keeps no abstract per file. Ask it for one and it answers with the
+*folder's* abstract — byte for byte the same string for every file in the
+folder, so the pane used to caption every file with the same words. The
+per-file description is written into the folder's overview instead, as a `###`
+section named after the file and a line under Quick Navigation, and
+`src/server/overview.ts` reads it back out of there. The folder's own abstract
+still comes down, labelled as the folder's, for files the overview says nothing
+about.
+
+Sometimes it says nothing about a file that OpenViking did describe. A
+generated overview is capped at 4000 characters (`semantic.overview_max_chars`,
+default in OpenViking's own `openviking_cli/utils/config/parser_config.py`) and
+`SemanticProcessor._truncate_generated_text` trims it at a sentence boundary —
+no ellipsis, no marker. On a folder of four files that cut lands inside the
+Detailed Description and the last three entries simply are not there, while the
+front matter still reports every entry as sampled. Quick Navigation sits above
+the cut and usually survives it, which is why it is the fallback.
+
+### Search is the vector face alone
+
+`search/find`, the same search `ov search` runs. The page used to offer grep
+and a hybrid of the two, which put a mode decision in front of every query and
+charged twenty seconds for choosing wrong — `search/grep` takes about that per
+term, against under a second for everything else. The server still exposes all
+three modes; nothing in the UI asks for the other two.
+
+An earlier design queried Postgres directly for a keyword half, which would
 have put a tenant filter in hand-written SQL — one mistake away from showing one
-person another's files. `search/grep` removes that risk: OpenViking answers as
-whoever the key says, so there is no scope filter to get wrong.
+person another's files. Going through OpenViking removes that risk: it answers
+as whoever the key says, so there is no scope filter to get wrong.
 
 ## Configure
 
@@ -327,8 +359,8 @@ timeout.test.ts` now puts a delay in front of the stub so the unit is checked.
 
 **`search/grep` takes about twenty seconds per term.** Everything else answers
 in under a second. A 30s budget therefore timed out exact search alone, so the
-default is now 60s. Hybrid search over two scopes takes ~45s and is the slowest
-thing here by a wide margin.
+default is now 60s. That measurement is why the UI now searches by meaning
+alone; the timeout stays at 60s because the server still offers grep.
 
 **Multi-scope `find` returns nothing at `limit >= 20`.** Passing both scopes as
 an array answers correctly at `limit <= 10` and returns zero above it, while

@@ -15,6 +15,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
 
 COPY tsconfig.json vite.config.ts svelte.config.js index.html ./
+COPY public ./public
 COPY src ./src
 
 RUN npm run build:client && npm run build:server

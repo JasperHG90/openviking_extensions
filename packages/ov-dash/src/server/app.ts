@@ -14,6 +14,7 @@ import { Hono } from "hono";
 import type { Context, MiddlewareHandler } from "hono";
 import { csrf } from "hono/csrf";
 import { HTTPException } from "hono/http-exception";
+import { inlineImageType } from "../shared/media";
 import type {
   FileDetail,
   Home,
@@ -37,8 +38,10 @@ import {
   inBatches,
   isTextKind,
   kindOf,
+  parentOf,
   relativeTo,
 } from "./ov";
+import { describeFile } from "./overview";
 import {
   SessionError,
   endSession,
@@ -81,6 +84,15 @@ const MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024;
 
 /** Most bytes accepted from one upload. */
 const MAX_UPLOAD_BYTES = 256 * 1024 * 1024;
+
+/**
+ * Most bytes one image may buffer to be shown inline.
+ *
+ * Far below the download limit on purpose. This one is held in memory to
+ * decorate a page, and a picture nobody can wait for is worse than a download
+ * button — past this, the reader gets the button.
+ */
+const MAX_INLINE_IMAGE_BYTES = 25 * 1024 * 1024;
 
 /** Build the services from config, memoizing the OIDC discovery. */
 export function buildServices(config: Config): Services {
@@ -328,7 +340,7 @@ export function createApp(services: Services) {
   // state and false about cost: one search can be sixteen twenty-second greps,
   // and one folder download half a gigabyte. Those are worth a hostile page's
   // while in exactly the modes whose identity is ambient.
-  const EXPENSIVE_GETS = new Set(["/api/search", "/api/download"]);
+  const EXPENSIVE_GETS = new Set(["/api/search", "/api/download", "/api/image"]);
   app.use("/api/*", sameOriginOnly(config, EXPENSIVE_GETS));
 
   app.use("/api/*", async (c, next) => {
@@ -488,12 +500,12 @@ export function createApp(services: Services) {
     const node = await ov.stat(uri);
     const text = isTextKind(node.kind);
 
-    const [content, abstract] = await Promise.all([
+    const [content, described] = await Promise.all([
       text ? ov.read(uri) : Promise.resolve(""),
-      ov.abstract(uri),
+      describeFileIn(ov, node),
     ]);
 
-    const detail: FileDetail = { node, content, abstract, binary: !text };
+    const detail: FileDetail = { node, content, ...described, binary: !text };
     return c.json(detail);
   });
 
@@ -527,14 +539,64 @@ export function createApp(services: Services) {
     }
 
     const text = isTextKind(node.kind);
-    const [content, abstract] = await Promise.all([
+    const [content, described] = await Promise.all([
       text ? ov.read(uri) : Promise.resolve(""),
-      ov.abstract(uri),
+      describeFileIn(ov, node),
     ]);
     return c.json({
       kind: "file",
-      file: { node, content, abstract, binary: !text },
+      file: { node, content, ...described, binary: !text },
     } satisfies Opened);
+  });
+
+  /**
+   * Serve an image's bytes for the reading pane to show them.
+   *
+   * Separate from `/api/download`, which answers as an octet-stream so the
+   * browser saves it. This one answers with a real image type, picked from the
+   * name — `inlineImageType` covers raster formats alone, so a `.svg` is never
+   * offered a type at all.
+   *
+   * That allowlist is not the control that makes this safe, and it is worth
+   * being clear about which one is: nothing here reads the bytes, so a file
+   * named `evil.png` holding markup is still served as `image/png`. What stops
+   * the browser acting on it is `nosniff`, which forbids reinterpreting the
+   * declared type, backed by a policy that lets the response fetch nothing.
+   * Removing either of those headers would look harmless and would not be.
+   */
+  app.get("/api/image", async (c) => {
+    const ov = c.get("ov");
+    const uri = requireUri(c);
+    const node = await ov.stat(uri);
+
+    const type = node.isDir ? undefined : inlineImageType(node.kind);
+    if (!type) {
+      throw new OvError(
+        `${node.name} is not an image the reader can show`,
+        400,
+        "INVALID_ARGUMENT",
+      );
+    }
+    const tooBig = () =>
+      new OvError(
+        `${node.name} is larger than ${Math.round(MAX_INLINE_IMAGE_BYTES / 1_000_000)} MB — download it instead`,
+        413,
+        "TOO_LARGE",
+      );
+
+    // Checked twice, because the declared size is not always a size:
+    // `entrySchema` defaults it to 0, so a `stat` that omits the field would
+    // walk a file of any length straight past a check made only up front.
+    if (node.size > MAX_INLINE_IMAGE_BYTES) throw tooBig();
+    const bytes = await ov.download(uri);
+    if (bytes.length > MAX_INLINE_IMAGE_BYTES) throw tooBig();
+
+    return c.body(bytes as unknown as ArrayBuffer, 200, {
+      "content-type": type,
+      "content-disposition": "inline",
+      "x-content-type-options": "nosniff",
+      "content-security-policy": "default-src 'none'; sandbox",
+    });
   });
 
   app.get("/api/download", async (c) => {
@@ -998,6 +1060,30 @@ export function resolveTarget(config: Config, viewer: Viewer, requested: string)
     );
   }
   return target;
+}
+
+/**
+ * Say what one file is, and what folder it sits in.
+ *
+ * OpenViking keeps no abstract per file. `abstract(fileUri)` answers with the
+ * folder's abstract instead — the same string for every file in the folder —
+ * so the pane used to show a folder blurb under whichever file was open, and
+ * an image that OpenViking had genuinely described looked undescribed.
+ *
+ * The per-file description lives in the folder's overview, so that is what is
+ * read here. The folder's abstract still comes back, but separately, for the
+ * pane to label as the folder's when the file has nothing of its own.
+ */
+async function describeFileIn(
+  ov: OvClient,
+  node: Node,
+): Promise<{ abstract: string; folderSummary: string }> {
+  const folder = parentOf(node.uri);
+  const [overview, folderSummary] = await Promise.all([
+    ov.overview(folder),
+    ov.abstract(folder),
+  ]);
+  return { abstract: describeFile(overview, node.name), folderSummary };
 }
 
 /** Require a `uri` query parameter that names a Viking resource. */

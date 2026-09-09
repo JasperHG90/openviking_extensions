@@ -95,19 +95,12 @@
     api
       .tree()
       .then((result) => {
+        // Everything shut. Seeding the first two levels open was meant to show
+        // the shape of the workspace, and on a real tree it opened hundreds of
+        // rows — the top of the list scrolled away before you could read it.
+        // A closed tree is one screen you choose your way into; Expand all is
+        // still there for the times you want the whole thing.
         tree = result;
-        // Open the first two levels: enough to see the shape of the workspace
-        // without burying you in every leaf at once.
-        const next = new Set<string>();
-        const seed = (list: TreeNode[], depth: number): void => {
-          for (const node of list) {
-            if (!node.isDir) continue;
-            if (depth < 2) next.add(node.uri);
-            seed(node.children, depth + 1);
-          }
-        };
-        seed(buildTree(result.nodes), 0);
-        open = next;
       })
       .catch((error: Error) => {
         failure = error.message;

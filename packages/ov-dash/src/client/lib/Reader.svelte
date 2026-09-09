@@ -7,7 +7,9 @@
    * `viking://` links resolve inside the app instead of dying in the browser,
    * because a memory that references another memory should be one click away.
    */
+  import { isInlineImage } from "../../shared/media";
   import type { FileDetail, Tree } from "../../shared/schemas";
+  import { api } from "./api";
   import Download from "./Download.svelte";
   import Icon from "./Icon.svelte";
   import { isMarkdown, renderMarkdown } from "./markdown";
@@ -39,6 +41,21 @@
     detail && !detail.binary && isMarkdown(detail.node.kind)
       ? renderMarkdown(detail.content)
       : "",
+  );
+
+  /*
+   * The picture that would not load, remembered by uri rather than as a flag.
+   *
+   * A flag would have to be cleared when the selection changes, and a missed
+   * reset means the next image never gets its chance. Keyed by uri, opening
+   * another file simply stops matching.
+   */
+  let brokenImage = $state("");
+  const showsImage = $derived(
+    !!detail &&
+      detail.binary &&
+      isInlineImage(detail.node.kind) &&
+      brokenImage !== detail.node.uri,
   );
 
   /**
@@ -90,15 +107,42 @@
 
     {#if detail.abstract}
       <aside class="summary">
-        <div class="slabel2 mono">Summary</div>
+        <div class="slabel2 mono">What OpenViking makes of this</div>
         <p>{detail.abstract}</p>
+      </aside>
+    {:else if detail.folderSummary}
+      <!--
+        Labelled as the folder's, because that is what it is. OpenViking has
+        no abstract per file and answers with the folder's, so showing it under
+        "Summary" claimed a description of this file that nobody wrote.
+      -->
+      <aside class="summary quiet">
+        <div class="slabel2 mono">About this folder</div>
+        <p>{detail.folderSummary}</p>
       </aside>
     {/if}
 
-    {#if detail.binary}
+    {#if showsImage}
+      <figure class="shot">
+        <img
+          src={api.imageUrl(detail.node.uri)}
+          alt={detail.node.name}
+          onerror={() => {
+            brokenImage = detail.node.uri;
+          }}
+        />
+      </figure>
+    {:else if detail.binary}
       <div class="callout c-sheet">
         <span class="ci"><Icon name="doc" /></span>
-        <p>This is a {detail.node.kind} file. Download it to open it.</p>
+        {#if brokenImage === detail.node.uri}
+          <p>
+            This {detail.node.kind} would not open — the stored file may be damaged.
+            Download it to check.
+          </p>
+        {:else}
+          <p>This is a {detail.node.kind} file. Download it to open it.</p>
+        {/if}
       </div>
     {:else if body}
       <!--
@@ -287,6 +331,26 @@
   .fs2 {
     font-size: 11px;
     color: var(--ink-3);
+  }
+
+  /*
+   * The picture, on the same measure as the prose.
+   *
+   * Sized to its own pixels up to that width rather than stretched to fill it:
+   * a 200px icon blown up to 68ch is worse than a small icon.
+   */
+  .shot {
+    margin: var(--s5) 0 0;
+    max-width: 68ch;
+  }
+  .shot img {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    border: 1px solid var(--rule);
+    border-radius: var(--r2);
+    /* Light artwork on a dark page needs something to sit on. */
+    background: var(--surface);
   }
 
   .raw {
