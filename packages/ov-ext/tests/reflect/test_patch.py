@@ -229,9 +229,7 @@ async def test_a_context_openviking_rejects_does_not_abort_the_boot(
     def exploding_identifier(*args: Any, **kwargs: Any) -> Any:
         raise ValueError("user_id must be alpha_numeric string.")
 
-    monkeypatch.setattr(
-        "openviking.server.identity.UserIdentifier", exploding_identifier
-    )
+    monkeypatch.setattr("openviking.server.identity.UserIdentifier", exploding_identifier)
     monkeypatch.setattr("ov_ext.reflect.patch.run_ticker", _never)
     install(settings())
 

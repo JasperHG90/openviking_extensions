@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 
-from .install import install
+from .installer import install
 
 __all__ = ["main"]
 

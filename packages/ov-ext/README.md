@@ -108,6 +108,33 @@ ov-ext-server --config /etc/ov.conf          # every subsystem installed
 Arguments pass through untouched, subcommands included. The wrapper installs
 the patch, logs what it enabled, and hands over.
 
+### More than one worker
+
+`install()` patches the process it runs in, which is the process serving
+requests only while `workers = 1`. Past one, OpenViking hands uvicorn an import
+string (`bootstrap.py:327`) and uvicorn **spawns** children
+(`uvicorn/_subprocess.py:18`) — fresh interpreters with an empty `sys.modules`
+that import that one string and never run `ov-ext-server`. Measured: the parent
+reports `HybridRetriever`, the child reports `HierarchicalRetriever` and has
+not imported `ov_ext` at all. A fork would have inherited the patches; uvicorn
+does not fork.
+
+So the parent rewrites the import string it gives uvicorn to name ov-ext's own
+factory, which installs and then delegates to OpenViking's. Nothing to
+configure — but two consequences worth knowing:
+
+- **Settings must come from the environment.** A spawned child inherits the
+  environment and nothing else, so objects passed to `install()` do not reach
+  it.
+- **`OV_REFLECT_LOCK=process` is refused** when uvicorn is starting more than
+  one worker. It asserts that exactly one process sweeps, which is false the
+  moment there are several — and a process-local lock cannot detect the others,
+  so the failure would be silent duplicate sweeps rather than an error.
+
+If OpenViking ever changes the factory it names, the parent logs an error
+saying the workers will be unpatched rather than rewriting a string it does not
+recognise.
+
 To go back, run `openviking-server` again. Nothing is written to disk and
 nothing about your data changes, so switching is reversible either way.
 
@@ -426,7 +453,8 @@ prove a fabricated quote never reaches the store.
 
 | Module | Depends on OpenViking? |
 |---|---|
-| `install` | Yes — the one entry point, fans out to each subsystem |
+| `installer` | Yes — the one entry point, fans out to each subsystem |
+| `worker` | Yes — carries the patches into uvicorn's spawned workers |
 | `observability` | No — OpenTelemetry API only, shared by every subsystem |
 | `retrieval.fusion` | No — pure functions |
 | `retrieval.diversity` | No — pure functions |

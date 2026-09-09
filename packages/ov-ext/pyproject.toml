@@ -124,7 +124,7 @@ strict = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["openviking.*", "openviking_cli.*", "testcontainers.*"]
+module = ["openviking.*", "openviking_cli.*", "testcontainers.*", "uvicorn.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

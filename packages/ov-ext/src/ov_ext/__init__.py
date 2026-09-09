@@ -21,7 +21,7 @@ rather than the package, so they survive this package being renamed again.
 
 from __future__ import annotations
 
-from .install import install, uninstall
+from .installer import install, uninstall
 
 __all__ = ["__version__", "install", "uninstall"]
 
