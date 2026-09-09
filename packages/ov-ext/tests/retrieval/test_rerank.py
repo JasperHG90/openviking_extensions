@@ -484,3 +484,108 @@ async def test_retrieve_sets_the_budget_before_the_descent_and_clears_it_after(
 
     assert seen == [7], "the descent must run with the configured ceiling in place"
     assert _rerank_budget.get() is None
+
+
+def make_recording_retriever(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    scores: list[float] | None = None,
+    **overrides: Any,
+) -> tuple[HybridRetriever, list[tuple[list[str], list[float]]]]:
+    """Return a retriever whose base rerank records what it was handed.
+
+    ``make_budgeted_retriever`` records only how many documents arrived, which
+    cannot tell a cap that sent the strongest candidates from one that sent the
+    first few.
+
+    Parameters
+    ----------
+    scores :
+        Returned to the caller, truncated to the batch. Defaults to a constant,
+        which is enough when the test is about what was sent rather than what
+        came back.
+
+    Returns
+    -------
+    tuple
+        The retriever, and a list receiving ``(documents, fallback_scores)``
+        for every call that reached the base implementation.
+    """
+    seen: list[tuple[list[str], list[float]]] = []
+
+    async def base_rerank(
+        self: Any, query: str, documents: list[str], fallback_scores: list[float]
+    ) -> list[float]:
+        seen.append((list(documents), list(fallback_scores)))
+        return list(scores[: len(documents)]) if scores else [9.0] * len(documents)
+
+    monkeypatch.setattr(HierarchicalRetriever, "_rerank_scores", base_rerank)
+
+    class _Stubbed(HybridRetriever):
+        def __init__(self) -> None:
+            self._settings = HybridSettings(**overrides)
+
+    return _Stubbed(), seen
+
+
+@pytest.mark.asyncio
+async def test_the_document_cap_sends_the_strongest_candidates_in_batch_order(
+    monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
+) -> None:
+    """Two claims at once, because they are easy to get right separately.
+
+    The cap must choose by vector score -- sending the first N would rerank
+    whatever the store happened to return first. And it must then restore the
+    batch's own order, so the request reads like an uncapped one. The fallback
+    scores here rank ``d`` above ``b``, so score order and batch order differ
+    and only one of them can pass.
+    """
+    retriever, seen = make_recording_retriever(monkeypatch, rerank_max_documents=2)
+
+    await retriever._rerank_scores("q", ["a", "b", "c", "d"], [0.1, 0.7, 0.3, 0.9])
+
+    sent, fallbacks = seen[0]
+    assert sent == ["b", "d"], "the two strongest, in the batch's own order"
+    assert fallbacks == [0.7, 0.9], "each document keeps its own vector score"
+
+
+@pytest.mark.asyncio
+async def test_candidates_past_the_document_cap_keep_their_vector_scores(
+    monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
+) -> None:
+    """The operator's decision: hold them back from the reranker, not from the pool.
+
+    Dropping them, or flooring them below the reranked band, would push them
+    under the retrieval threshold and out of the answer entirely. Keeping the
+    vector score is the merge the base class already performs for documents it
+    skips.
+    """
+    retriever, _ = make_recording_retriever(
+        monkeypatch, scores=[5.0, 6.0], rerank_max_documents=2
+    )
+
+    result = await retriever._rerank_scores(
+        "q", ["a", "b", "c", "d"], [0.1, 0.7, 0.3, 0.9]
+    )
+
+    assert result == [0.1, 5.0, 0.3, 6.0], (
+        "reranked scores land on the chosen indexes; the rest keep theirs"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_default_document_cap_sends_every_document(
+    monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
+) -> None:
+    """``rerank_max_documents=0`` must mean no cap, not a cap of zero.
+
+    Zero is the shipped default, so reading it literally would stop every
+    deployment reranking at all -- silently, since candidates would simply keep
+    their vector scores.
+    """
+    retriever, seen = make_recording_retriever(monkeypatch)
+
+    assert retriever._settings.rerank_max_documents == 0, "the default under test"
+    await retriever._rerank_scores("q", ["a", "b", "c"], [0.1, 0.2, 0.3])
+
+    assert seen[0][0] == ["a", "b", "c"], "the default must send everything"

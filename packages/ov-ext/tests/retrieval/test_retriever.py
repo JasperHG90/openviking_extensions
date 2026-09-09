@@ -140,11 +140,26 @@ def make_retriever(
 
 
 def ctx(
-    uri: str, *, tags: list[str] | None = None, level: int = 2, score: float = 0.0
+    uri: str,
+    *,
+    tags: list[str] | None = None,
+    level: int = 2,
+    score: float = 0.0,
+    abstract: str = "",
 ) -> MatchedContext:
-    """Build a matched context with the fields the retriever reads."""
+    """Build a matched context with the fields the retriever reads.
+
+    ``abstract`` defaults to empty, which is what the final rerank pass reads.
+    A pool of blank abstracts is refused before any call goes out, so tests
+    that are not about that pass are unaffected by it.
+    """
     return MatchedContext(
-        uri=uri, context_type=None, level=level, score=score, search_tags=tags or []
+        uri=uri,
+        context_type=None,
+        level=level,
+        score=score,
+        abstract=abstract,
+        search_tags=tags or [],
     )
 
 
@@ -417,3 +432,142 @@ async def test_a_missing_upstream_suffix_table_degrades_rather_than_raising() ->
         assert len(result.matched_contexts) == 2
     finally:
         HierarchicalRetriever.LEVEL_URI_SUFFIX = saved
+
+
+def rerank_by_abstract(monkeypatch: pytest.MonkeyPatch, best: str) -> list[list[str]]:
+    """Stub the base rerank to prefer one abstract, recording each batch.
+
+    Returns
+    -------
+    list
+        The documents of every call that reached the base implementation.
+    """
+    seen: list[list[str]] = []
+
+    async def base_rerank(
+        self: Any, query: str, documents: list[str], fallback_scores: list[float]
+    ) -> list[float]:
+        seen.append(list(documents))
+        return [1.0 if document == best else 0.0 for document in documents]
+
+    monkeypatch.setattr(HierarchicalRetriever, "_rerank_scores", base_rerank)
+    return seen
+
+
+async def test_the_final_pass_reorders_the_fused_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pass exists to overrule the order the descent and fusion produced.
+
+    Both other passes are off, so nothing but the final rerank can move ``b``
+    ahead of ``a``.
+    """
+    rerank_by_abstract(monkeypatch, best="good")
+    retriever = make_retriever(
+        FakeStore(),
+        [ctx("a", abstract="dull"), ctx("b", abstract="good")],
+        keyword_enabled=False,
+        mmr_enabled=False,
+    )
+
+    result = await retriever.retrieve(FakeQuery(), ctx=None, limit=2)
+
+    assert [m.uri for m in result.matched_contexts] == ["b", "a"]
+
+
+async def test_the_final_pass_runs_before_the_diversity_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Order matters and is invisible in the output.
+
+    ``mmr_select`` reads relevance from a candidate's position, so a rerank
+    after it would quietly undo the diversification. Asserted by watching what
+    ``_diversify`` is handed, since a wrong order here still produces a
+    plausible-looking answer.
+    """
+    rerank_by_abstract(monkeypatch, best="good")
+    handed: list[str] = []
+
+    async def fake_diversify(
+        self: Any, contexts: list[MatchedContext], *, limit: int
+    ) -> list[MatchedContext]:
+        handed.extend(context.uri for context in contexts)
+        return contexts
+
+    monkeypatch.setattr(HybridRetriever, "_diversify", fake_diversify)
+    retriever = make_retriever(
+        FakeStore(),
+        [ctx("a", abstract="dull"), ctx("b", abstract="good")],
+        keyword_enabled=False,
+        mmr_enabled=True,
+        mmr_lambda=0.5,
+    )
+
+    await retriever.retrieve(FakeQuery(), ctx=None, limit=2)
+
+    assert handed == ["b", "a"], (
+        "diversity must see the reranked order, not the fused one"
+    )
+
+
+async def test_the_final_pass_is_not_charged_to_the_descent_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tight ceiling must not silently drop the pass that makes it affordable.
+
+    The budget is set to zero -- fully spent -- and the pass must still call.
+    """
+    from ov_ext.retrieval.retriever import _rerank_budget
+
+    seen = rerank_by_abstract(monkeypatch, best="good")
+
+    class _Stubbed(HybridRetriever):
+        def __init__(self) -> None:
+            self._settings = HybridSettings(rerank_max_calls=1)
+
+    token = _rerank_budget.set(0)
+    try:
+        await _Stubbed()._rerank_pool([ctx("a", abstract="good")], text="q")
+    finally:
+        _rerank_budget.reset(token)
+
+    assert seen == [["good"]], "the final pass must not consult the descent budget"
+
+
+async def test_the_final_pass_keeps_the_fused_order_when_scoring_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A short answer from the service must not reorder the pool by a wrong list."""
+
+    async def short_rerank(
+        self: Any, query: str, documents: list[str], fallback_scores: list[float]
+    ) -> list[float]:
+        return [1.0]
+
+    monkeypatch.setattr(HierarchicalRetriever, "_rerank_scores", short_rerank)
+
+    class _Stubbed(HybridRetriever):
+        def __init__(self) -> None:
+            self._settings = HybridSettings()
+
+    result = await _Stubbed()._rerank_pool(
+        [ctx("a", abstract="x"), ctx("b", abstract="y")], text="q"
+    )
+
+    assert [m.uri for m in result] == ["a", "b"]
+
+
+async def test_a_pool_of_blank_abstracts_costs_no_rerank_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ordinary mid-backfill, and a round trip that could only learn nothing."""
+    seen = rerank_by_abstract(monkeypatch, best="good")
+
+    class _Stubbed(HybridRetriever):
+        def __init__(self) -> None:
+            self._settings = HybridSettings()
+
+    result = await _Stubbed()._rerank_pool([ctx("a"), ctx("b")], text="q")
+
+    assert seen == [], "a pool with nothing to judge must not reach the service"
+    assert [m.uri for m in result] == ["a", "b"]
