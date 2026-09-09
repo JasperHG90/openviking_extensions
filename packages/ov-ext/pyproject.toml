@@ -52,6 +52,12 @@ dependencies = [
     "requests>=2.31",
 ]
 
+[project.optional-dependencies]
+# Needed only by deployments that set OV_REFLECT_LOCK=postgres. The lock
+# imports psycopg lazily, so a deployment that picks OV_REFLECT_LOCK=process
+# never needs it installed.
+postgres = ["psycopg>=3.1"]
+
 [project.scripts]
 # OpenViking has no plugin mechanism, so the patch needs somewhere to run.
 # Swapping `openviking-server` for this keeps that visible in the process list.

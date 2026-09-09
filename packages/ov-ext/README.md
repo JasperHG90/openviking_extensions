@@ -312,10 +312,45 @@ generated summary. Reflection refuses to run rather than verify quotes against
 a summary: a link whose `match_text` came from a summary would not appear in
 the memory it points at, breaking the contract the whole design rests on.
 
-Registering reflection does not start it. `ov_ext.reflect.run_sweep(fs, db,
-ctx)` runs one — it loads the watermark from the store, sweeps, and writes the
-mark back — so a cron or a script decides when, because something that writes
-to memory unattended should run when someone chose that it would.
+### Scheduling, and the single-sweeper guarantee
+
+The sweep runs on a timer inside the server process, started when OpenViking's
+service finishes booting — that is where the filesystem, the vector store and
+an event loop first exist together. memex does the same thing; this is that
+shape with the parts that only matter at scale left out.
+
+**Two sweeps at once is a correctness bug, not a performance one.** Both read
+the same watermark, both gather the same memories, and both advance the mark —
+so each silently consumes work the other is half-way through. The sweep
+therefore never runs unlocked, and `OV_REFLECT_LOCK` has **no default**: the
+ticker refuses to start until you say which lock, because every default is a
+way to end up sweeping unlocked by forgetting a setting rather than by
+deciding to.
+
+| `OV_REFLECT_LOCK` | Guarantees | Use when |
+|---|---|---|
+| `process` | One sweep at a time within this process | Exactly one process ever sweeps — choosing it asserts that |
+| `postgres` | One sweep at a time across every process reaching `OV_REFLECT_LOCK_DSN` | Anything else |
+
+`postgres` takes `pg_try_advisory_lock` on a connection opened for the sweep
+and closed after it. That lock is **session-scoped**: a crashed process, a
+killed container or a severed network drops the connection and the lock goes
+with it — no TTL to tune, no clock to trust, no lease to renew.
+
+**Why not Redis.** A `SET NX PX` lock expires on a timer, so a holder that
+stalls past its TTL — a GC pause, an IO stall, a frozen VM — loses the lock
+while still believing it holds it, and a second sweeper starts. Closing that
+needs fencing tokens validated *at the resource*, and OpenViking's `write_file`
+validates nothing, so there is no token to fence with. Redlock does not fix it.
+Redis would give you a lock that usually works; Postgres gives you one that is
+correct.
+
+The cost of choosing safety is liveness: a holder that is *alive but wedged*
+keeps its connection, keeps the lock, and nothing sweeps until it is killed.
+That is the right trade here — a sweep that does not happen this hour is
+recoverable; one that happens twice corrupts the watermark.
+
+`run_sweep(fs, db, ctx)` still runs exactly one sweep, for a script or a test.
 
 | Variable | Default | What it does |
 |---|---|---|
@@ -328,6 +363,11 @@ to memory unattended should run when someone chose that it would.
 | `OV_REFLECT_REQUIRE_CROSS_AREA` | `false` | Keep only observations spanning several directories |
 | `OV_REFLECT_CONTRADICTIONS` | `true` | Ask which memories are in tension |
 | `OV_REFLECT_MAX_STALLS` | `3` | Sweeps that may advance nothing before stepping over a failing batch |
+| `OV_REFLECT_INTERVAL_SECONDS` | `900` | Gap between the end of one sweep and the start of the next |
+| `OV_REFLECT_LOCK` | *(none)* | `process` or `postgres`. Required — there is no default |
+| `OV_REFLECT_LOCK_DSN` | — | Where to take the advisory lock, required by `postgres` |
+| `OV_REFLECT_USER_ID` | *(none)* | Whose memories to reflect on. Required when enabled |
+| `OV_REFLECT_ACCOUNT_ID` | `default` | Account the sweep's context belongs to |
 | `OV_REFLECT_OBSERVATIONS_ROOT` | `viking://~/memories/observations` | Where observations are written |
 | `OV_REFLECT_STATE_PATH` | `viking://~/resources/reflect/watermark.json` | Where the watermark lives |
 

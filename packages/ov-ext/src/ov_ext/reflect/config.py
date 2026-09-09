@@ -12,15 +12,30 @@ whole subsystem starts off.
 from __future__ import annotations
 
 import os
+from enum import Enum
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .verify import DEFAULT_MIN_EVIDENCE
 
-__all__ = ["ENV_PREFIX", "ReflectSettings"]
+__all__ = ["ENV_PREFIX", "LockKind", "ReflectSettings"]
 
 ENV_PREFIX = "OV_REFLECT_"
+
+
+class LockKind(str, Enum):
+    """How the sweep is kept to one at a time.
+
+    There is deliberately no default and no "off". Two concurrent sweeps
+    corrupt the watermark -- each consumes work the other is half-way through
+    -- so the ticker refuses to start until this is set, and setting it is a
+    statement about how many processes run.
+    """
+
+    UNSET = "unset"
+    PROCESS = "process"
+    POSTGRES = "postgres"
 
 
 class ReflectSettings(BaseSettings):
@@ -54,6 +69,39 @@ class ReflectSettings(BaseSettings):
             raise ValueError(
                 f"Unknown setting(s): {', '.join(unknown)}. "
                 f"Valid names are: {', '.join(sorted(known))}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _postgres_lock_needs_a_dsn(self) -> ReflectSettings:
+        """Refuse a Postgres lock with nowhere to take it.
+
+        Caught here rather than at the first tick, so a deployment that
+        misconfigures the lock fails at startup instead of running unlocked
+        until someone reads the logs.
+
+        Raises
+        ------
+        ValueError
+            When ``lock`` is postgres and ``lock_dsn`` is empty.
+        """
+        if self.lock is LockKind.POSTGRES and not self.lock_dsn.strip():
+            raise ValueError(f"{ENV_PREFIX}LOCK=postgres requires {ENV_PREFIX}LOCK_DSN.")
+        return self
+
+    @model_validator(mode="after")
+    def _enabled_reflection_needs_a_user(self) -> ReflectSettings:
+        """Refuse to enable reflection without saying whose memories it reads.
+
+        Raises
+        ------
+        ValueError
+            When ``enabled`` is set and ``user_id`` is empty.
+        """
+        if self.enabled and not self.user_id.strip():
+            raise ValueError(
+                f"{ENV_PREFIX}ENABLED=true requires {ENV_PREFIX}USER_ID: "
+                "reflection serves no request, so it has no user to inherit."
             )
         return self
 
@@ -130,6 +178,52 @@ class ReflectSettings(BaseSettings):
             "memories permanently; without this bound, one batch that fails "
             "every time would block every memory behind it for good. Stepping "
             "over is logged at error level and named in the report."
+        ),
+    )
+    interval_seconds: float = Field(
+        default=900.0,
+        gt=0,
+        description=(
+            "Seconds between sweeps, measured from the end of one to the start "
+            "of the next -- so a sweep slower than its interval cannot lap "
+            "itself. Fifteen minutes by default: reflection reads what changed "
+            "since the last run, so a longer gap means bigger batches rather "
+            "than lost work."
+        ),
+    )
+    lock: LockKind = Field(
+        default=LockKind.UNSET,
+        description=(
+            "How concurrent sweeps are prevented. `postgres` takes a "
+            "pg_try_advisory_lock on OV_REFLECT_LOCK_DSN and is correct for "
+            "any number of processes. `process` is an in-process asyncio lock "
+            "and is correct only if exactly one process ever sweeps -- "
+            "choosing it asserts that. There is no default: two sweeps at once "
+            "corrupt the watermark, so the ticker refuses to start until you "
+            "say which."
+        ),
+    )
+    user_id: str = Field(
+        default="",
+        description=(
+            "Whose memories the sweep reflects on. Required when the ticker "
+            "runs: reflection serves no request, so it has no user to inherit "
+            "and must be told one. No default, because guessing would mean "
+            "writing observations into somebody's store on the strength of a "
+            "guess."
+        ),
+    )
+    account_id: str = Field(
+        default="default",
+        description="Account the sweep's request context belongs to.",
+    )
+    lock_dsn: str = Field(
+        default="",
+        description=(
+            "libpq connection string for the advisory lock, required when "
+            "`lock` is postgres. Used only to hold the lock, never queried, "
+            "though the natural choice is the database already backing the "
+            "store."
         ),
     )
     contradictions: bool = Field(

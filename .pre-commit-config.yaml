@@ -46,6 +46,8 @@ repos:
           # The reflection tests parse the shipped memory-type schema to prove
           # it stays a valid one; PyYAML has no inline types.
           - types-PyYAML
+          # The sweep lock imports psycopg lazily, under the `postgres` extra.
+          - psycopg[binary,pool]>=3.1
           # `rerank` imports requests to pool the rerank client's connection.
           - types-requests>=2.31
         args: [--config-file=packages/ov-ext/pyproject.toml]

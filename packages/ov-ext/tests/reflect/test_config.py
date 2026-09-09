@@ -25,9 +25,13 @@ def test_the_safeguards_are_on_by_default() -> None:
 
 def test_settings_come_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(f"{ENV_PREFIX}ENABLED", "true")
+    # Enabling reflection requires naming whose memories it reads; it serves no
+    # request, so it has no user to inherit.
+    monkeypatch.setenv(f"{ENV_PREFIX}USER_ID", "jasper")
     monkeypatch.setenv(f"{ENV_PREFIX}MIN_EVIDENCE", "5")
     settings = ReflectSettings()
     assert settings.enabled is True
+    assert settings.user_id == "jasper"
     assert settings.min_evidence == 5
 
 

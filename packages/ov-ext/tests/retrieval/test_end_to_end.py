@@ -106,8 +106,11 @@ def postgres_dsn() -> Iterator[str]:
     except ImportError:  # pragma: no cover - environment without Docker support
         pytest.skip("testcontainers is not installed")
 
-    container = PostgresContainer("pgvector/pgvector:pg17", driver=None)
     try:
+        # Construction talks to the daemon too, so it belongs inside the guard:
+        # outside it, a machine with no Docker running errors the suite instead
+        # of skipping it.
+        container = PostgresContainer("pgvector/pgvector:pg17", driver=None)
         container.start()
     except Exception as exc:  # pragma: no cover - no container runtime
         pytest.skip(f"cannot start a PostgreSQL container: {exc}")

@@ -2682,6 +2682,11 @@ dependencies = [
     { name = "requests" },
 ]
 
+[package.optional-dependencies]
+postgres = [
+    { name = "psycopg" },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "ov-postgres" },
@@ -2695,10 +2700,12 @@ dev = [
 requires-dist = [
     { name = "opentelemetry-api", specifier = ">=1.14" },
     { name = "openviking", specifier = ">=0.4.16,<0.5" },
+    { name = "psycopg", marker = "extra == 'postgres'", specifier = ">=3.1" },
     { name = "pydantic", specifier = ">=2" },
     { name = "pydantic-settings", specifier = ">=2" },
     { name = "requests", specifier = ">=2.31" },
 ]
+provides-extras = ["postgres"]
 
 [package.metadata.requires-dev]
 dev = [

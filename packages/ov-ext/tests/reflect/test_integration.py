@@ -21,6 +21,7 @@ verify quotes against a generated summary would have silently engaged.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 import uuid
@@ -147,8 +148,11 @@ def postgres_dsn() -> Iterator[str]:
     except ImportError:  # pragma: no cover - environment without Docker support
         pytest.skip("testcontainers is not installed")
 
-    container = PostgresContainer("pgvector/pgvector:pg17", driver=None)
     try:
+        # Construction talks to the daemon too, so it belongs inside the guard:
+        # outside it, a machine with no Docker running errors the suite instead
+        # of skipping it.
+        container = PostgresContainer("pgvector/pgvector:pg17", driver=None)
         container.start()
     except Exception as exc:  # pragma: no cover - no container runtime
         pytest.skip(f"cannot start a PostgreSQL container: {exc}")
@@ -537,4 +541,133 @@ async def test_a_contradiction_found_in_a_sweep_lands_on_the_memory(
     assert report.contradictions == 1
     parsed = MemoryFileUtils.read(await viking_fs.read_file(A, ctx=ctx()), uri=A)
     assert [link["link_type"] for link in parsed.links] == ["contradicts"]
+    await backend.close()
+
+
+# --- the sweep lock, against a real Postgres --------------------------------
+#
+# The guarantee is "two processes never sweep at once". A lock tested against a
+# fake proves only that the fake agrees with itself, so every assertion below
+# runs against a real database, and the mutation note on each says what breaks
+# if the lock is removed.
+
+
+async def test_only_one_holder_gets_the_lock(postgres_dsn: str) -> None:
+    """Two independent locks, two connections, one winner.
+
+    This is the guarantee in one assertion. Delete the pg_try_advisory_lock
+    call and both return True.
+    """
+    from ov_ext.reflect.locks import PostgresAdvisoryLock
+
+    first = PostgresAdvisoryLock(postgres_dsn)
+    second = PostgresAdvisoryLock(postgres_dsn)
+
+    async with first.acquire() as held:
+        assert held is True
+        async with second.acquire() as also:
+            assert also is False
+
+
+async def test_the_lock_is_released_when_the_holder_lets_go(
+    postgres_dsn: str,
+) -> None:
+    from ov_ext.reflect.locks import PostgresAdvisoryLock
+
+    lock = PostgresAdvisoryLock(postgres_dsn)
+    async with lock.acquire() as held:
+        assert held is True
+    async with PostgresAdvisoryLock(postgres_dsn).acquire() as again:
+        assert again is True
+
+
+async def test_the_lock_is_released_when_the_connection_dies(
+    postgres_dsn: str,
+) -> None:
+    """The property that makes this better than a TTL lock.
+
+    A Redis lease expires on a timer, so a holder that stalls past its TTL
+    keeps believing it holds a lock somebody else now has. An advisory lock is
+    bound to the session: kill the connection and the lock goes with it, with
+    no timeout to wait out and no clock to trust.
+
+    Killing the backend from another connection is as close to `kill -9` as a
+    test can get without forking.
+    """
+    import psycopg
+
+    from ov_ext.reflect.locks import PostgresAdvisoryLock, advisory_key
+
+    victim = psycopg.connect(postgres_dsn, autocommit=True)
+    with victim.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(%s)", (advisory_key(),))
+        taken = cur.fetchone()
+        assert taken is not None and taken[0] is True
+        cur.execute("SELECT pg_backend_pid()")
+        backend = cur.fetchone()
+        assert backend is not None
+        pid = backend[0]
+
+    # Contended while the holder lives.
+    async with PostgresAdvisoryLock(postgres_dsn).acquire() as contended:
+        assert contended is False
+
+    executioner = psycopg.connect(postgres_dsn, autocommit=True)
+    with executioner.cursor() as cur:
+        cur.execute("SELECT pg_terminate_backend(%s)", (pid,))
+    executioner.close()
+
+    # Free the moment the connection is gone -- no TTL, no waiting.
+    async with PostgresAdvisoryLock(postgres_dsn).acquire() as freed:
+        assert freed is True
+
+
+async def test_a_raising_sweep_still_releases_the_lock(postgres_dsn: str) -> None:
+    """Otherwise one failed sweep wedges reflection until the process restarts."""
+    from ov_ext.reflect.locks import PostgresAdvisoryLock
+
+    lock = PostgresAdvisoryLock(postgres_dsn)
+    with pytest.raises(RuntimeError):
+        async with lock.acquire() as held:
+            assert held is True
+            raise RuntimeError("sweep exploded")
+
+    async with PostgresAdvisoryLock(postgres_dsn).acquire() as again:
+        assert again is True
+
+
+async def test_two_concurrent_sweeps_produce_one_sweep(
+    backend: Any, viking_fs: Any, postgres_dsn: str
+) -> None:
+    """The guarantee where it matters: at the watermark.
+
+    Both sweeps are handed a model that would write an observation. Without the
+    lock both write, both advance the mark, and each consumes work the other was
+    half-way through. With it, exactly one runs.
+    """
+    from ov_ext.reflect.locks import PostgresAdvisoryLock
+
+    when = datetime(2026, 9, 5, tzinfo=timezone.utc)
+    await seed(backend, when)
+
+    async def sweep_under_lock() -> bool:
+        lock = PostgresAdvisoryLock(postgres_dsn)
+        async with lock.acquire() as held:
+            if not held:
+                return False
+            await run_sweep(
+                viking_fs,
+                backend,
+                ctx(),
+                settings(),
+                llm=FakeLLM([proposal(), Contradictions(relationships=[])]),
+                now=datetime.now(timezone.utc),
+            )
+            return True
+
+    ran = await asyncio.gather(sweep_under_lock(), sweep_under_lock())
+
+    assert sorted(ran) == [False, True], "exactly one sweep should have run"
+    written = await viking_fs.ls(f"viking://user/{USER}/memories/observations", ctx=ctx())
+    assert len(written) == 1
     await backend.close()

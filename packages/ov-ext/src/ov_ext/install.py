@@ -20,6 +20,8 @@ from __future__ import annotations
 import logging
 
 from .reflect.config import ReflectSettings
+from .reflect.patch import install as install_reflect_ticker
+from .reflect.patch import uninstall as uninstall_reflect_ticker
 from .reflect.registration import register as register_reflect
 from .reflect.registration import unregister as unregister_reflect
 from .retrieval.config import HybridSettings
@@ -41,10 +43,10 @@ def install(
     each subsystem's own install is idempotent and does not stack a second
     layer.
 
-    Registering reflection does not start it. A sweep runs when something calls
-    it -- a cron, a CLI -- rather than on a timer inside the server, because a
-    process that writes to memory unattended should do so because someone
-    decided it should.
+    Reflection, when enabled, also arranges for its sweep ticker to start
+    when OpenViking's service finishes booting -- that is where the filesystem,
+    the vector store and an event loop first exist together. The ticker holds a
+    lock for every sweep, and refuses to start if no lock has been chosen.
 
     Parameters
     ----------
@@ -66,6 +68,7 @@ def install(
 
     install_retrieval(retrieval_settings)
     register_reflect(reflect_settings)
+    install_reflect_ticker(reflect_settings)
 
     logger.info(
         "ov-ext: keyword=%s mmr=%s lambda=%.2f pool=x%d reflect=%s",
@@ -84,5 +87,6 @@ def uninstall() -> None:
     unregistered before the retriever it searches through is put back. One that
     was never installed is skipped rather than treated as an error.
     """
+    uninstall_reflect_ticker()
     unregister_reflect()
     uninstall_retrieval()
