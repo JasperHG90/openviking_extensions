@@ -14,7 +14,12 @@ from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
 from pydantic import ValidationError
 
 from ov_postgres.adapter import PgVectorCollectionAdapter
-from ov_postgres.collection import _term_tsquery
+from ov_postgres.collection import (
+    _MAX_ANY_MODE_TOTAL_WORDS,
+    _MAX_ANY_MODE_WORDS,
+    _split_any_term,
+    _term_tsquery,
+)
 from ov_postgres.config import DEFAULT_KEYWORD_FIELDS, PgVectorParams
 
 DSN = "postgresql://user:pw@localhost:5432/openviking"
@@ -173,3 +178,52 @@ def test_unknown_rank_function_is_rejected() -> None:
     """Never let a config string reach SQL unchecked."""
     with pytest.raises(ValidationError):
         PgVectorParams(dsn=DSN, keyword_rank="ts_rank_bm25")
+
+
+def test_a_term_short_enough_to_parse_is_left_alone() -> None:
+    """The split is a safety valve, not something normal queries go through."""
+    assert _split_any_term("vault policy rotation", "any") == ["vault policy rotation"]
+
+
+def test_a_document_sized_term_is_split_below_the_parse_ceiling() -> None:
+    """Each piece has to parse on its own, so each has to fit on its own."""
+    words = [f"word{n}" for n in range(_MAX_ANY_MODE_WORDS * 2 + 7)]
+
+    pieces = _split_any_term(" ".join(words), "any")
+
+    assert len(pieces) == 3
+    assert all(len(piece.split()) <= _MAX_ANY_MODE_WORDS for piece in pieces)
+
+
+def test_splitting_keeps_every_word_exactly_once() -> None:
+    """Dropping the tail piece would lose terms silently, which is worse than raising."""
+    words = [f"word{n}" for n in range(_MAX_ANY_MODE_WORDS + 3)]
+
+    pieces = _split_any_term(" ".join(words), "any")
+
+    assert [word for piece in pieces for word in piece.split()] == words
+
+
+def test_a_term_past_what_postgres_will_allocate_is_refused() -> None:
+    """Splitting bounds the parse, not the query PostgreSQL builds from it.
+
+    Past this size the statement fails with `invalid memory alloc request
+    size`, so the refusal is what turns an internal database error into a
+    sentence naming the cause.
+    """
+    words = " ".join(f"word{n}" for n in range(_MAX_ANY_MODE_TOTAL_WORDS + 1))
+
+    with pytest.raises(ValueError, match="Clip the query"):
+        _split_any_term(words, "any")
+
+
+def test_an_all_mode_term_is_never_split() -> None:
+    """`plainto_tsquery` builds the tree itself, so `all` has nothing to recurse through.
+
+    Splitting it would also change what it means: the words of one `all` term
+    are ANDed, and separate terms are alternatives, so two pieces would match
+    rows holding either half rather than the whole phrase.
+    """
+    long_phrase = " ".join(f"word{n}" for n in range(_MAX_ANY_MODE_WORDS * 2))
+
+    assert _split_any_term(long_phrase, "all") == [long_phrase]

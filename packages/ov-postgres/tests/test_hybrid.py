@@ -10,7 +10,12 @@ from __future__ import annotations
 
 from typing import Any
 
+import psycopg
 import pytest
+from psycopg import sql
+from psycopg.conninfo import conninfo_to_dict
+
+from ov_postgres.collection import _MAX_ANY_MODE_WORDS
 
 from .test_backends import build
 from .test_integration import META, vec
@@ -134,6 +139,96 @@ def test_all_mode_still_requires_every_word(dsn: str, test_schema: str) -> None:
         assert uris(strict) == [], "'how' and 'configure' are absent from the body"
     finally:
         adapter.close()
+
+
+def test_a_document_sized_query_searches_instead_of_raising(
+    dsn: str, test_schema: str
+) -> None:
+    """An agent pasting a whole document as the query used to get a ValueError.
+
+    The two real words sit in different pieces of the split on purpose. A
+    split that dropped a piece, or ANDed the pieces instead of ORing them,
+    would find one of these documents or neither.
+    """
+    adapter = build(
+        dsn,
+        test_schema,
+        meta=content_meta(),
+        store_content=True,
+        text_search_config="english",
+    )
+    try:
+        adapter.upsert(
+            [
+                record("a", name="Runbook", content=BODY),
+                record(
+                    "b", name="Cluster", content="Kubernetes drains the node.", seed=2
+                ),
+            ]
+        )
+        filler = " ".join(f"filler{n}" for n in range(_MAX_ANY_MODE_WORDS * 3))
+        document = f"intermediate {filler} kubernetes"
+
+        found = adapter.search_by_keywords(query=document, limit=10)
+
+        assert len(document.split()) > _MAX_ANY_MODE_WORDS * 3, "several pieces, not two"
+        assert set(uris(found)) == {"viking://docs/a", "viking://docs/b"}
+    finally:
+        adapter.close()
+
+
+def test_the_split_survives_a_stack_the_unsplit_term_would_exhaust(
+    dsn: str, test_schema: str
+) -> None:
+    """The split earns its place below the default 2MB stack, not at it.
+
+    At 2MB an unsplit term parses to about 14500 words, well past the ceiling
+    this backend enforces, so nothing here would fail without the split. 512kB
+    is the low end of the range the split covers: an unsplit term parses to
+    about 3600 words there, a single piece still parses comfortably, and the
+    6000 words below sit well clear of both. That window is what the split is
+    for -- which queries work stops depending on a server setting this package
+    does not control.
+
+    The size is chosen for margin, not to sit near either wall. A query just
+    over the unsplit limit would fail *open* as PostgreSQL versions move: the
+    test would quietly start passing without the split rather than going red.
+
+    `ALTER DATABASE` reaches every connection to the shared container, not just
+    this test's. The `finally` puts it back, and the suite runs sequentially --
+    running these tests in parallel would need a different approach.
+    """
+    database = conninfo_to_dict(dsn)["dbname"]
+    setting = sql.SQL("ALTER DATABASE {} SET max_stack_depth = {}").format(
+        sql.Identifier(str(database)), sql.Literal("512kB")
+    )
+    # Applies to connections opened after it, so the adapter is built below.
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(setting)
+    try:
+        adapter = build(
+            dsn,
+            test_schema,
+            meta=content_meta(),
+            store_content=True,
+            text_search_config="english",
+        )
+        try:
+            adapter.upsert([record("a", name="Runbook", content=BODY)])
+            filler = " ".join(f"filler{n}" for n in range(6000))
+
+            found = adapter.search_by_keywords(query=f"intermediate {filler}", limit=10)
+
+            assert uris(found) == ["viking://docs/a"]
+        finally:
+            adapter.close()
+    finally:
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            conn.execute(
+                sql.SQL("ALTER DATABASE {} RESET max_stack_depth").format(
+                    sql.Identifier(str(database))
+                )
+            )
 
 
 def test_an_all_stopword_query_matches_nothing_and_does_not_raise(

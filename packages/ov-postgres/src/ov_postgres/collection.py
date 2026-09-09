@@ -88,13 +88,35 @@ _KEYWORD_RANK_FNS: dict[str, sql.SQL] = {
 # would change what every query matches.
 _KEYWORD_QUERY_MODES = frozenset({"all", "any"})
 
-# Words allowed in one `any`-mode term. The rewrite re-parses a flat `a | b |
-# c ...` chain, which PostgreSQL's parser recurses through once per level, so a
-# long enough term reaches `stack depth limit exceeded` -- around 12000 words
-# at the default 2MB. `all` mode has no such ceiling, since `plainto_tsquery`
-# builds the tree itself. Set well below the limit so the failure is this
-# message rather than a driver error, and far above any real query.
+# Words allowed in one `any`-mode term before it is split into several. The
+# rewrite re-parses a flat `a | b | c ...` chain, which PostgreSQL's parser
+# recurses through once per level, so a long enough term reaches `stack depth
+# limit exceeded`. `all` mode needs no split, since `plainto_tsquery` builds
+# the tree itself.
+#
+# How long is "long enough" depends on `max_stack_depth`, a server setting this
+# package does not control. Measured on PostgreSQL 17 with eight-letter words:
+# about 14500 words at the 2MB default, 7250 at 1MB, 3600 at 512kB, 1800 at
+# 256kB. Splitting bounds every parse by the piece instead, so the same query
+# behaves the same way across those servers -- down to about 512kB, below which
+# one whole piece already exhausts the stack and the split buys nothing.
+#
+# This was once a ceiling that raised at 2048, on the reasoning that no real
+# query would reach it. Agents paste whole documents as queries, so they do.
+# memex, which this rewrite is ported from, runs it with no ceiling at all.
 _MAX_ANY_MODE_WORDS = 2048
+
+# Total words allowed in one `any`-mode term, split or not. Splitting bounds
+# how deep PostgreSQL's parser recurses, but not the size of the query it then
+# builds: measured on PostgreSQL 17 through this collection's own search, a
+# term of about 16500 eight-letter words fails with `invalid memory alloc
+# request size`, asking for more than the 1GB served in one request. Half that
+# leaves room for longer words, which reach the same volume in fewer of them.
+#
+# A caller anywhere near this should be clipping its query instead -- see
+# ov-ext's `keyword_max_chars`. This is the backstop that makes an absurd term
+# say so, rather than surfacing as an internal database error.
+_MAX_ANY_MODE_TOTAL_WORDS = 8192
 
 # Validators for a primary key value, by declared OpenViking type. These are
 # the same pydantic types the native engine validates every record against, so
@@ -1378,8 +1400,18 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             text = str(raw).strip()
             if text and text not in seen_terms:
                 seen_terms.add(text)
-                terms.append(text)
-                modes.append(mode)
+                # A document-sized `any` term becomes several, so no single
+                # one parses into a chain deep enough to exhaust the stack.
+                pieces = _split_any_term(text, mode)
+                if len(pieces) > 1:
+                    logger.debug(
+                        "search_by_keywords: an 'any' term longer than %d words "
+                        "was split into %d, which match the same rows",
+                        _MAX_ANY_MODE_WORDS,
+                        len(pieces),
+                    )
+                terms.extend(pieces)
+                modes.extend([mode] * len(pieces))
         annotate(
             {
                 "db.operation.name": "SELECT",
@@ -1395,25 +1427,15 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         if len(terms) > _MAX_KEYWORD_TERMS:
             raise ValueError(
                 f"search_by_keywords accepts at most {_MAX_KEYWORD_TERMS} distinct "
-                f"terms; got {len(terms)}. Each binds two parameters, and "
-                "PostgreSQL allows 65535 per statement."
+                f"terms; got {len(terms)} after splitting long ones. Each binds "
+                "two parameters, and PostgreSQL allows 65535 per statement."
             )
         if len(terms) > _KEYWORD_TERMS_WARN:
             logger.warning(
-                "search_by_keywords: %d distinct terms; planning time grows "
-                "with the term count, roughly a millisecond each",
+                "search_by_keywords: %d terms after splitting; planning time "
+                "grows with the term count, roughly a millisecond each",
                 len(terms),
             )
-
-        for text, mode in zip(terms, modes, strict=True):
-            if mode == "any" and text.count(" ") + 1 > _MAX_ANY_MODE_WORDS:
-                raise ValueError(
-                    f"A single 'any'-mode term accepts at most "
-                    f"{_MAX_ANY_MODE_WORDS} words; got about {text.count(' ') + 1}. "
-                    "Rewriting the conjunction produces a flat disjunction that "
-                    "PostgreSQL's parser recurses through. Split the query, or "
-                    "set keyword_query_mode='all', which has no such ceiling."
-                )
 
         specs = self._fulltext_specs()
         if not specs:
@@ -2778,6 +2800,61 @@ def _sort_key(value: object) -> tuple[int, Any]:
     if isinstance(value, (int, float)):
         return (1, value)
     return (2, str(value))
+
+
+def _split_any_term(text: str, mode: str) -> list[str]:
+    """Break an ``any``-mode term into pieces PostgreSQL's parser can hold.
+
+    ``any`` mode rewrites a parsed conjunction into ``a | b | c ...`` and
+    re-parses it, and that parse recurses once per word. Cutting the term into
+    pieces of at most :data:`_MAX_ANY_MODE_WORDS` bounds the depth of every
+    parse by the piece rather than by the query, and the caller ORs the pieces
+    back together -- ``(a | b) || (c | d)`` matches what ``a | b | c | d``
+    matches, since OR does not care how it is bracketed.
+
+    Splitting on whitespace is an approximation in one direction: a token such
+    as ``a.com/x?y=1`` parses into several lexemes, so a piece can carry more
+    lexemes than words. The piece size sits about seven times below the depth
+    PostgreSQL refuses at its default stack, which covers that.
+
+    Parameters
+    ----------
+    text :
+        The term, already stripped.
+    mode :
+        ``all`` or ``any``. Only ``any`` is ever split; ``all`` leaves the
+        tree to ``plainto_tsquery``, which builds it without re-parsing.
+
+    Returns
+    -------
+    list[str]
+        The pieces, in order. A term short enough to keep is returned
+        unchanged as the only element, so callers need no special case.
+
+    Raises
+    ------
+    ValueError
+        If an ``any`` term runs past :data:`_MAX_ANY_MODE_TOTAL_WORDS`.
+        Splitting bounds the parse, not the size of the query PostgreSQL
+        builds from it, so this size stays refused -- with a message rather
+        than an internal database error.
+    """
+    if mode != "any":
+        return [text]
+    words = text.split()
+    if len(words) <= _MAX_ANY_MODE_WORDS:
+        return [text]
+    if len(words) > _MAX_ANY_MODE_TOTAL_WORDS:
+        raise ValueError(
+            f"An 'any'-mode term accepts at most {_MAX_ANY_MODE_TOTAL_WORDS} "
+            f"words; got {len(words)}. Splitting the term keeps PostgreSQL's "
+            "parser inside its stack, but a term this size fails on the memory "
+            "the statement asks for instead. Clip the query before searching."
+        )
+    return [
+        " ".join(words[start : start + _MAX_ANY_MODE_WORDS])
+        for start in range(0, len(words), _MAX_ANY_MODE_WORDS)
+    ]
 
 
 def _balanced_or(parts: list[sql.Composable]) -> sql.Composable:
