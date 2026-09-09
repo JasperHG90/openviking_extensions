@@ -61,6 +61,21 @@ function directoriesFirst(a: TreeNode, b: TreeNode): number {
   return a.name.localeCompare(b.name, undefined, { numeric: true });
 }
 
+/**
+ * The folder a uri sits in.
+ *
+ * A uri with nothing above it answers with itself, so a caller comparing a node
+ * against its parent stops rather than producing `viking:/`. Mirrors `parentOf`
+ * on the server, which is the one OpenViking is actually asked about.
+ */
+export function parentUri(uri: string): string {
+  const SCHEME = "viking://";
+  const trimmed = uri.replace(/\/+$/, "");
+  if (trimmed.length < SCHEME.length) return uri;
+  const cut = trimmed.lastIndexOf("/");
+  return cut < SCHEME.length ? trimmed : trimmed.slice(0, cut);
+}
+
 /** Every directory path in a tree, for Expand all. */
 export function allFolderUris(nodes: TreeNode[]): string[] {
   const out: string[] = [];

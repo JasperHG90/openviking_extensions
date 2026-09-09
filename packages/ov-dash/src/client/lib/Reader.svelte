@@ -13,6 +13,7 @@
   import Download from "./Download.svelte";
   import Icon from "./Icon.svelte";
   import { isMarkdown, renderMarkdown } from "./markdown";
+  import { toast } from "./state.svelte";
   import { formatSize, formatWhen } from "./tree";
 
   interface Props {
@@ -26,6 +27,25 @@
     failure?: string;
     /** Called when a link or row inside the pane points at another resource. */
     onopen?: (uri: string) => void;
+    /**
+     * Called once OpenViking has rewritten a description.
+     *
+     * The pane holds what it was given rather than fetching it, so somebody
+     * else has to read it back — this is how they find out there is something
+     * new to read.
+     */
+    onrefresh?: (uri: string) => void;
+    /** Called after the open resource is deleted, so the tree drops the row. */
+    ondeleted?: (uri: string) => void;
+    /**
+     * Called when a listing may no longer be true, without saying how.
+     *
+     * Its one caller is a delete that failed on the way back, where "gone" and
+     * "still there" are both live and only a fresh listing can settle it. Kept
+     * apart from `onrefresh` so a describe — which rewrites words and moves
+     * nothing — does not pay for a whole tree read.
+     */
+    onlisting?: () => void;
   }
 
   const {
@@ -35,6 +55,9 @@
     loading = false,
     failure = "",
     onopen,
+    onrefresh,
+    ondeleted,
+    onlisting,
   }: Props = $props();
 
   const body = $derived(
@@ -42,6 +65,150 @@
       ? renderMarkdown(detail.content)
       : "",
   );
+
+  /*
+   * The summaries are markdown too, and were being printed as source.
+   *
+   * OpenViking writes them with a model: the per-file section it lifts out of
+   * a folder's overview arrives full of `**bold**`, bullets and `[name](uri)`
+   * links, and shown raw it reads as a wall of asterisks. Same renderer as the
+   * document below, so the same sanitizing applies.
+   */
+  const fileSummary = $derived(detail?.abstract ? renderMarkdown(detail.abstract) : "");
+  const aboutFolder = $derived(
+    detail?.folderSummary ? renderMarkdown(detail.folderSummary) : "",
+  );
+  const folderSummary = $derived(folder?.summary ? renderMarkdown(folder.summary) : "");
+
+  /** What is open in the pane, whichever shape it arrived in. */
+  const openUri = $derived(detail?.node.uri ?? folder?.root ?? "");
+  const openName = $derived(detail?.node.name ?? folderName);
+  const openIsDir = $derived(!detail && !!folder);
+
+  /** How often to ask whether the describe job has finished, in milliseconds. */
+  const POLL_EVERY = 2500;
+
+  /**
+   * How long to wait on one before giving up, in milliseconds.
+   *
+   * A model rewriting a long document takes minutes, so this is generous. It is
+   * bounded all the same: a page left open on a job that never finishes would
+   * otherwise poll for the life of the tab.
+   */
+  const PATIENCE = 4 * 60_000;
+
+  /*
+   * What is in flight, remembered by uri rather than as a flag.
+   *
+   * A describe runs for minutes and this one component shows every file in
+   * turn, so a boolean would leave the next file you clicked with its buttons
+   * greyed out and labelled "Describing…" about a job that is not its own.
+   * Keyed by uri, the greying follows the file it belongs to.
+   *
+   * One slot, not a set: two describes at once is not a thing worth building
+   * for, and the second would come back 409 anyway — OpenViking refuses a
+   * second reindex of a uri while the first is running.
+   */
+  let describing = $state("");
+  let deleting = $state("");
+  /** Set by the first click on Delete; the second one does it. */
+  let confirming = $state(false);
+
+  const busy = $derived(describing === openUri || deleting === openUri);
+
+  // A different file is a different question, so a half-asked one is dropped.
+  $effect(() => {
+    void openUri;
+    confirming = false;
+  });
+
+  /*
+   * Whether this pane is still on screen.
+   *
+   * A describe polls for up to four minutes and nothing about leaving the page
+   * stops it, so without this the job's toast would land over whatever the
+   * person navigated to — a note about a file they are no longer looking at.
+   */
+  let onScreen = true;
+  $effect(() => () => {
+    onScreen = false;
+  });
+
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  /**
+   * Ask OpenViking to describe this again, and wait for it.
+   *
+   * The work happens out of band — see `describeAgain` on the server for why —
+   * so there is nothing to await but the job record.
+   */
+  async function describe(): Promise<void> {
+    const uri = openUri;
+    const name = openName;
+    if (!uri) return;
+    describing = uri;
+    try {
+      const { taskId } = await api.describe(uri);
+      if (taskId) await waitFor(taskId, name);
+      if (!onScreen) return;
+      api.refresh();
+      onrefresh?.(uri);
+      toast(`OpenViking has described ${name} again`);
+    } catch (error) {
+      if (onScreen) toast((error as Error).message);
+    } finally {
+      if (describing === uri) describing = "";
+    }
+  }
+
+  /** Poll one job to its end, or give up out loud. */
+  async function waitFor(taskId: string, name: string): Promise<void> {
+    const deadline = Date.now() + PATIENCE;
+    while (Date.now() < deadline) {
+      await sleep(POLL_EVERY);
+      // Leaving the page ends the waiting, not the job. OpenViking finishes
+      // either way; there is just nobody here to be told about it, and ninety
+      // more polls would be asking on behalf of a pane that is gone.
+      if (!onScreen) return;
+      const job = await api.job(taskId);
+      // `gone` is a record OpenViking has stopped keeping, not a failure. There
+      // is nothing left to wait for, so read the file back and let it speak.
+      if (job.state === "done" || job.state === "gone") return;
+      if (job.state === "failed") {
+        throw new Error(job.error || "OpenViking could not describe that");
+      }
+    }
+    throw new Error(`OpenViking is still describing ${name} — open it again in a minute`);
+  }
+
+  /** Delete what is open. Only reached from the second click. */
+  async function remove(): Promise<void> {
+    const uri = openUri;
+    const name = openName;
+    if (!uri) return;
+    deleting = uri;
+    try {
+      await api.remove(uri);
+      confirming = false;
+      ondeleted?.(uri);
+      toast(`Deleted ${name}`);
+    } catch (error) {
+      /*
+       * A failed delete is not proof the file is still there.
+       *
+       * A recursive delete of a big folder can outrun the dashboard's own
+       * timeout while OpenViking carries on and finishes it. Left alone, the
+       * tree would keep drawing a row for something that is gone, and the next
+       * click on it would 404. So the listing is read again either way, and it
+       * is the listing that decides what is true.
+       */
+      api.refresh();
+      onlisting?.();
+      toast((error as Error).message);
+    } finally {
+      if (deleting === uri) deleting = "";
+    }
+  }
 
   /*
    * The picture that would not load, remembered by uri rather than as a flag.
@@ -82,6 +249,43 @@
   }
 </script>
 
+<!--
+  The controls that act on whatever is open, drawn the same for a file and for
+  a folder. Delete asks twice: the first click turns the button into the
+  question, the second answers it. A browser `confirm()` would have done the
+  same job and looked like it came from a different program.
+-->
+{#snippet actions()}
+  <div class="racts">
+    <button
+      class="mini"
+      onclick={describe}
+      disabled={busy}
+      title="Have OpenViking read this again and rewrite what it says about it"
+    >
+      <Icon name="refresh" size={13} />
+      {describing === openUri ? "Describing…" : "Describe again"}
+    </button>
+
+    {#if confirming}
+      <span class="ask">
+        Delete {openName}{openIsDir ? " and everything in it" : ""}?
+      </span>
+      <button class="mini danger" onclick={remove} disabled={busy}>
+        {deleting === openUri ? "Deleting…" : "Yes, delete"}
+      </button>
+      <button class="mini" onclick={() => (confirming = false)} disabled={busy}>
+        Keep it
+      </button>
+    {:else}
+      <button class="mini danger" onclick={() => (confirming = true)} disabled={busy}>
+        <Icon name="trash" size={13} />
+        Delete
+      </button>
+    {/if}
+  </div>
+{/snippet}
+
 <div class="reader">
   {#if loading}
     <p class="pdesc">Loading…</p>
@@ -105,12 +309,21 @@
       {#if detail.node.modTime}<span class="sep">·</span>{formatWhen(detail.node.modTime)}{/if}
     </div>
 
-    {#if detail.abstract}
+    {@render actions()}
+
+    <!--
+      Sanitized in renderMarkdown before it reaches the DOM, and the click
+      handler only delegates for the links inside — real anchors, which already
+      answer to Enter — so this needs no key handler of its own.
+    -->
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+    {#if fileSummary}
       <aside class="summary">
         <div class="slabel2 mono">What OpenViking makes of this</div>
-        <p>{detail.abstract}</p>
+        <article class="md stext" onclick={intercept}>{@html fileSummary}</article>
       </aside>
-    {:else if detail.folderSummary}
+    {:else if aboutFolder}
       <!--
         Labelled as the folder's, because that is what it is. OpenViking has
         no abstract per file and answers with the folder's, so showing it under
@@ -118,7 +331,14 @@
       -->
       <aside class="summary quiet">
         <div class="slabel2 mono">About this folder</div>
-        <p>{detail.folderSummary}</p>
+        <article class="md stext" onclick={intercept}>{@html aboutFolder}</article>
+      </aside>
+    {:else}
+      <aside class="summary quiet">
+        <div class="slabel2 mono">What OpenViking makes of this</div>
+        <p class="none">
+          Nothing yet. “Describe again” hands it back to OpenViking to read.
+        </p>
       </aside>
     {/if}
 
@@ -173,15 +393,22 @@
       {folder.nodes.length === 1 ? "item" : "items"}
     </div>
 
-    {#if folder.summary}
+    {@render actions()}
+
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+    {#if folderSummary}
       <aside class="summary">
         <div class="slabel2 mono">What OpenViking makes of this</div>
-        <p>{folder.summary}</p>
+        <article class="md stext" onclick={intercept}>{@html folderSummary}</article>
       </aside>
     {:else}
       <aside class="summary quiet">
         <div class="slabel2 mono">Summary</div>
-        <p>OpenViking has not summarised this folder yet.</p>
+        <p class="none">
+          OpenViking has not summarised this folder yet. “Describe again” asks
+          it to.
+        </p>
       </aside>
     {/if}
 
@@ -273,14 +500,35 @@
     color: var(--ink-3);
     margin-bottom: 5px;
   }
-  .summary p {
+  .summary p.none {
     margin: 0;
     font-size: 15px;
     line-height: 1.62;
-    color: var(--ink-2);
-  }
-  .summary.quiet p {
     color: var(--ink-3);
+  }
+
+  /* The controls that act on what is open, between the meta line and the prose. */
+  .racts {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--s1);
+    margin-top: var(--s3);
+  }
+  .racts .mini {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .racts .danger:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--rose) 16%, transparent);
+    border-color: color-mix(in srgb, var(--rose) 40%, transparent);
+    color: var(--rose);
+  }
+  .ask {
+    font-size: 13px;
+    color: var(--ink-2);
+    padding-left: var(--s1);
   }
 
   .empty {
@@ -503,5 +751,35 @@
   .md :global(img) {
     max-width: 100%;
     border-radius: var(--r2);
+  }
+
+  /*
+   * The summary: the same prose rules as the document, one notch quieter.
+   *
+   * It carries `.md` for the element styles above — links, lists, code, tables
+   * — and overrides the size here, so a heading in a summary is a summary
+   * heading rather than a second document title. These rules come last on
+   * purpose: they tie with the `.md` ones on specificity, and order is what
+   * decides.
+   */
+  .stext {
+    margin-top: 0;
+    font-size: 15px;
+    line-height: 1.62;
+    color: var(--ink-2);
+    font-variation-settings: "opsz" 14;
+  }
+  .summary.quiet .stext {
+    color: var(--ink-3);
+  }
+  .stext :global(h1),
+  .stext :global(h2),
+  .stext :global(h3),
+  .stext :global(h4) {
+    font-size: 15px;
+    margin: 1em 0 0.35em;
+  }
+  .stext :global(> :last-child) {
+    margin-bottom: 0;
   }
 </style>

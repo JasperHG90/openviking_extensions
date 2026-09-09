@@ -115,6 +115,11 @@ hourly and buy nothing.
 | Sessions | `sessions` |
 | Add a file | `resources` import, via a private temp file |
 
+The reading pane also acts on what it is showing: **Describe again** hands the
+file back to OpenViking's model, **Delete** removes it, and dragging a row in
+the tree onto a folder moves it there (`fs/mv`). See below for what each of
+those does and does not do.
+
 Downloads use `content/download`. A folder has no archive endpoint upstream, so
 the server fetches each file and zips them. `/api/image` serves the same bytes
 under a real image type so the reading pane can show a picture rather than a
@@ -147,6 +152,55 @@ no ellipsis, no marker. On a folder of four files that cut lands inside the
 Detailed Description and the last three entries simply are not there, while the
 front matter still reports every entry as sampled. Quick Navigation sits above
 the cut and usually survives it, which is why it is the fallback.
+
+The description is markdown, and the pane renders it as markdown. What
+OpenViking writes into an overview section is prose with `**bold**`, bullets
+and `[name](viking://…)` links in it; printed as source it read as a wall of
+asterisks. Same renderer and same sanitizing as the document below it, so the
+links inside a description open in the pane like any other.
+
+### Describe again
+
+A description is written once, by a model, and sometimes it does not arrive —
+an image nothing could read, an import that ran while the model was down.
+`POST /api/describe` hands the file back: `content/reindex` with
+`mode=semantic_and_vectors`, which is the mode that reruns the model. The
+SDK's default, `vectors_only`, re-embeds the text already stored, so a file
+that never got a description would come back just as empty.
+
+It runs out of band (`wait=false`) because the model takes minutes on a large
+document, and a request held open that long times out on the way rather than
+finishing. The page follows the job through `GET /api/job`, which reports
+`waiting`, `done`, `failed` or `gone`. `gone` is its own answer, not a kind of
+`done`: OpenViking drops task records after a while, and a job that failed and
+then expired must not read as one that succeeded.
+
+Handing it a file also refreshes the folder above, which is where the per-file
+descriptions live (`reindex_executor.py` sets `propagate_to_parent=recursive`,
+and the route defaults `recursive` to true).
+
+Two limits worth knowing before you click it. OpenViking lets a `USER` reindex
+**only their own namespace** — `content.py:_authorize_reindex_uri` — so on a
+file under `OV_SHARED_ROOT` this comes back 403 with OpenViking's own words,
+unless the dashboard's key carries an admin role. And a scope root is refused
+here for the same reason a delete is: reindexing one reruns the model over
+every document under it.
+
+### Dragging a row moves it; there is nothing to reorder
+
+Dropping a row on a folder calls `fs/mv`. What a drag cannot do is set a
+position within a folder: OpenViking stores no order of its own and every
+listing comes back sorted, so an order dragged into place would not survive the
+next read. The destination sent to the server is the *folder*, not the finished
+path — the name comes off what is being moved, so the new uri is one the server
+derived rather than one it was handed.
+
+The server also refuses a move onto a name the destination already holds, and
+that check has to live here: OpenViking's `mv` refuses only when the
+destination is a *directory*, and copies straight over an existing file without
+a word (`storage/viking_fs/_ops.py`). Dragging `todo.md` into a folder that
+already has one would otherwise destroy the second with nothing on screen to
+say so.
 
 ### Search is the vector face alone
 
@@ -226,12 +280,24 @@ since it only inspects form-shaped content types. A JSON `DELETE` was once
 covered by nothing but the absence of a CORS middleware, which is a property of
 what is missing rather than a check.
 
-`/api/upload` also checks where the file is going. A destination outside
-`OV_ROOT` and `OV_SHARED_ROOT` is refused, including one that climbs out with
-`..` — written plainly, with backslashes, or percent-encoded. It refuses *any*
-percent escape in a destination, harmless ones included: allowing them means
-deciding whose decoding wins, ours or OpenViking's, and it is what closes
-double encoding without a decode loop.
+Every write also checks *what* it is about to touch. A uri outside `OV_ROOT`
+and `OV_SHARED_ROOT` is refused, including one that climbs out with `..` —
+written plainly, with backslashes, or percent-encoded. It refuses *any* percent
+escape, harmless ones included: allowing them means deciding whose decoding
+wins, ours or OpenViking's, and it is what closes double encoding without a
+decode loop. `requireInScope` in `src/server/app.ts` is the one place that
+says so, and `/api/upload`, `/api/file`, `/api/move` and `/api/describe` all go
+through it.
+
+Somewhere to *put* a file may be a scope root; something to act on may not.
+"Delete `viking://user/jasper`", or "rerun the model over all of it", is not a
+request a stray click should be able to make, so delete, move and describe all
+ask for a uri strictly inside a scope.
+
+None of this is what stops one person reaching another's tree — the API key is,
+since OpenViking answers as whoever it belongs to. What it stops is a typo, or
+a request the dashboard's own pages never made, scattering somebody's own
+files.
 
 ## Run it
 

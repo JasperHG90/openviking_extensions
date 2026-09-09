@@ -199,6 +199,11 @@ describe("where a file may land", () => {
     // target resource content", which is a real 502 against the cluster.
     expect(resolveTarget(config, JASPER, "")).toBe("viking://user/resources");
     expect(resolveTarget(config, JASPER, "   ")).toBe("viking://user/resources");
+    // Non-empty strings that name nothing, which is not the same thing to
+    // `||`. Trimming after the fallback let these through as an empty target,
+    // refused for being outside a scope by a message with no subject.
+    expect(resolveTarget(config, JASPER, "/")).toBe("viking://user/resources");
+    expect(resolveTarget(config, JASPER, "///")).toBe("viking://user/resources");
   });
 
   it("accepts a folder inside either scope", () => {

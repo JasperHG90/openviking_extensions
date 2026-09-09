@@ -18,8 +18,10 @@ import { inlineImageType } from "../shared/media";
 import type {
   FileDetail,
   Home,
+  Job,
   Memory,
   MemoryGroup,
+  Moved,
   Node,
   Opened,
   SessionState,
@@ -719,6 +721,112 @@ export function createApp(services: Services) {
     return c.body(null, 204);
   });
 
+  /**
+   * Delete one file or folder outright.
+   *
+   * Separate from `DELETE /api/memories`, which only reaches the memories
+   * directory and is scoped by that path. This one takes anything inside the
+   * scopes the dashboard writes to, so it is guarded the same way an upload's
+   * destination is, and it refuses a scope root: "delete everything I have" is
+   * not a request a stray click should be able to make.
+   */
+  app.delete("/api/file", async (c) => {
+    const ov = c.get("ov");
+    const uri = requireInScope(config, c.get("viewer"), requireUri(c));
+
+    // Stat first, because a folder needs `recursive` and OpenViking refuses a
+    // non-empty one without it — and because a uri that is not there should
+    // say so rather than come back as an upstream failure.
+    const node = await ov.stat(uri);
+    await ov.remove(uri, { recursive: node.isDir, wait: true });
+    return c.body(null, 204);
+  });
+
+  /**
+   * Move a file or folder into another folder.
+   *
+   * The destination is the folder, not the finished path: the name comes off
+   * what is being moved, so a caller cannot rename in the same breath and the
+   * new uri is one the server derived rather than one it was handed.
+   */
+  app.post("/api/move", async (c) => {
+    const ov = c.get("ov");
+    const viewer = c.get("viewer");
+    const body = await readJson(c);
+    const from = requireInScope(config, viewer, requireUriField(body, "from"));
+    const into = requireInScope(config, viewer, requireUriField(body, "into"), true);
+
+    const name = from.split("/").pop() ?? "";
+    if (!name) {
+      throw new OvError("that uri has no name to move", 400, "INVALID_ARGUMENT");
+    }
+    // A folder dropped inside itself is a folder that eats itself.
+    if (into === from || into.startsWith(`${from}/`)) {
+      throw new OvError(`${name} cannot be moved inside itself`, 400, "INVALID_ARGUMENT");
+    }
+    if (parentOf(from) === into) {
+      // Already there. Answering 204 keeps a stray drop from costing an
+      // upstream call and a spurious failure.
+      return c.body(null, 204);
+    }
+
+    const target = await ov.stat(into);
+    if (!target.isDir) {
+      throw new OvError(
+        `${target.name} is a file, not somewhere to put one`,
+        400,
+        "INVALID_ARGUMENT",
+      );
+    }
+
+    /*
+     * Refuse a move onto a name already taken.
+     *
+     * OpenViking will not do this for us. Its `mv` refuses only when the
+     * destination is a *directory*; an existing file there is copied over
+     * without a word — measured in `storage/viking_fs/_ops.py`. So dragging
+     * `todo.md` into a folder that already holds one would destroy the second,
+     * with nothing to undo it and nothing on screen to say it happened.
+     */
+    const to = `${into}/${name}`;
+    if (await ov.exists(to)) {
+      throw new OvError(
+        `${target.name} already holds something called ${name}`,
+        409,
+        "ALREADY_EXISTS",
+      );
+    }
+
+    await ov.move(from, to);
+    return c.json({ uri: to } satisfies Moved);
+  });
+
+  /**
+   * Hand one file or folder back to OpenViking to describe again.
+   *
+   * Descriptions are written once, by a model, and sometimes they do not
+   * arrive — an image nothing could read, an import that ran while the model
+   * was down. Without this the only cure was deleting the file and adding it
+   * back.
+   *
+   * A scope root is refused like a delete is. Reindexing one reruns the model
+   * over every document in it, which is an hour of work and a bill, and no
+   * button in this dashboard should be able to start that by accident.
+   */
+  app.post("/api/describe", async (c) => {
+    const ov = c.get("ov");
+    const body = await readJson(c);
+    const uri = requireInScope(config, c.get("viewer"), requireUriField(body, "uri"));
+    return c.json({ taskId: await ov.describeAgain(uri) } satisfies Job);
+  });
+
+  /** How a background job started above is getting on. */
+  app.get("/api/job", async (c) => {
+    const id = (c.req.query("id") ?? "").trim();
+    if (!id) throw new OvError("a job id is required", 400, "INVALID_ARGUMENT");
+    return c.json(await c.get("ov").job(id));
+  });
+
   app.get("/api/sessions", async (c) => {
     const ov = c.get("ov");
     return c.json(await ov.sessions());
@@ -1013,7 +1121,36 @@ export function resolveTarget(config: Config, viewer: Viewer, requested: string)
   // appending again would invent a path nobody asked for.
   const WRITABLE = /\/(resources|skills)(\/|$)/;
   const fallback = WRITABLE.test(userRoot) ? userRoot : `${userRoot}/resources`;
-  const target = trim(requested.trim()) || fallback;
+
+  // Trimmed before the fallback, not after: "/" and "///" are non-empty
+  // strings that name nothing, and left to `||` they would reach the scope
+  // check as an empty target and be refused for being outside a scope.
+  return requireInScope(config, viewer, trim(requested.trim()) || fallback, true);
+}
+
+/**
+ * Check a uri names something this dashboard may change, and return it tidied.
+ *
+ * The rules an upload's destination has always answered to, now applied to
+ * every write: no `..`, no percent escape, and inside the person's own root or
+ * the shared one. OpenViking's key is what stops one person touching another's
+ * tree; this is what stops a typo — or a request the dashboard's own pages
+ * never made — scattering their own.
+ *
+ * @param allowScopeRoot - Whether the scope root itself is an answer. True for
+ *   somewhere to put a file, false for something to act on: "delete
+ *   viking://user/jasper", or "rerun the model over all of it", is not a
+ *   request one stray click should be able to make.
+ */
+export function requireInScope(
+  config: Config,
+  viewer: Viewer,
+  requested: string,
+  allowScopeRoot = false,
+): string {
+  const roots = rootsFor(config, viewer);
+  const trim = (value: string) => value.replace(/\/+$/, "");
+  const target = trim(requested.trim());
 
   // Decoded before it is judged, because `%2e%2e` and `..%2f` are `..` to
   // anything that resolves the path downstream, and checking the raw text alone
@@ -1025,7 +1162,12 @@ export function resolveTarget(config: Config, viewer: Viewer, requested: string)
   } catch {
     // A malformed escape is not a path; the blanket rule below rejects it.
   }
-  if (decoded.replace(/\\/g, "/").split("/").includes("..")) {
+  //
+  // `.` goes with `..`. On its own it climbs nowhere, but it normalizes a uri
+  // to a different one than it reads as — `viking://user/jasper/.` is the
+  // scope root written so that the root check below does not see it.
+  const segments = decoded.replace(/\\/g, "/").split("/");
+  if (segments.includes("..") || segments.includes(".")) {
     throw new OvError(
       `${target} walks outside the scopes this dashboard writes to`,
       400,
@@ -1038,7 +1180,9 @@ export function resolveTarget(config: Config, viewer: Viewer, requested: string)
   // is what closes double encoding without a decode loop.
   if (target.includes("%")) {
     throw new OvError(
-      `${target} contains a percent escape, which this dashboard does not accept in a destination`,
+      // Worded as what the dashboard will not do, because the usual cause is
+      // a name somebody else chose, not a mistake the caller made.
+      `${target} contains a percent escape, which this dashboard will not put in a uri`,
       400,
       "INVALID_ARGUMENT",
     );
@@ -1047,12 +1191,23 @@ export function resolveTarget(config: Config, viewer: Viewer, requested: string)
   const scopes = [trim(roots.user), roots.shared ? trim(roots.shared) : null].filter(
     (value): value is string => value !== null,
   );
+  // Said separately from "outside the scopes", because a scope root is not
+  // outside anything — it is the scope. One message covering both told people
+  // that viking://user/jasper was outside viking://user/jasper.
+  if (!allowScopeRoot && scopes.includes(target)) {
+    throw new OvError(
+      `${target} is a whole scope — pick something inside it`,
+      403,
+      "OUT_OF_SCOPE",
+    );
+  }
+
   const inside = scopes.some(
-    (scope) => target === scope || target.startsWith(`${scope}/`),
+    (scope) => target.startsWith(`${scope}/`) || (allowScopeRoot && target === scope),
   );
   if (!inside) {
-    // 403, not 400: the destination is well formed, the caller just may not
-    // write there. A malformed path is the caller's mistake; this is a refusal.
+    // 403, not 400: the uri is well formed, the caller just may not write
+    // there. A malformed path is the caller's mistake; this is a refusal.
     throw new OvError(
       `${target} is outside the scopes this dashboard writes to (${scopes.join(", ")})`,
       403,
@@ -1093,6 +1248,23 @@ function requireUri(c: Context): string {
     throw new OvError("a viking:// uri is required", 400, "INVALID_URI");
   }
   return uri;
+}
+
+/** Read a JSON body, treating anything unparseable as an empty one. */
+async function readJson(c: Context): Promise<Record<string, unknown>> {
+  const body: unknown = await c.req.json().catch(() => null);
+  return body !== null && typeof body === "object" && !Array.isArray(body)
+    ? (body as Record<string, unknown>)
+    : {};
+}
+
+/** Require one named field of a JSON body to be a Viking uri. */
+function requireUriField(body: Record<string, unknown>, field: string): string {
+  const value = body[field];
+  if (typeof value !== "string" || !value.startsWith("viking://")) {
+    throw new OvError(`${field} must be a viking:// uri`, 400, "INVALID_URI");
+  }
+  return value;
 }
 
 /**

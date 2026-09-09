@@ -11,7 +11,14 @@
 import { OpenVikingClient, isOpenVikingError } from "@openviking/sdk";
 import { z } from "zod";
 import type { Viewer } from "../shared/schemas";
-import type { Match, Node, SearchHit, SearchMode, SessionRow } from "../shared/schemas";
+import type {
+  JobState,
+  Match,
+  Node,
+  SearchHit,
+  SearchMode,
+  SessionRow,
+} from "../shared/schemas";
 import type { Config } from "./env";
 import type { KeyResolver } from "./keys";
 
@@ -61,6 +68,21 @@ const grepResultSchema = z.object({
     )
     .default([]),
   count: z.number().default(0),
+});
+
+/** What `POST /api/v1/content/reindex` answers with when it does not wait. */
+const reindexAcceptedSchema = z.object({ task_id: z.string().default("") });
+
+/**
+ * The part of a task record the dashboard follows.
+ *
+ * Every field has a default, so an unfamiliar record reads as a job still
+ * running rather than failing the poll. The caller gives up on its own clock,
+ * so an unknown status costs a wait rather than a hang.
+ */
+const taskSchema = z.object({
+  status: z.string().default(""),
+  error: z.string().nullable().default(""),
 });
 
 /**
@@ -263,9 +285,7 @@ export class OvClient {
     } catch (error) {
       if (isOpenVikingError(error)) {
         const code = error.code ?? "UPSTREAM_ERROR";
-        const status =
-          code === "NOT_FOUND" ? 404 : code === "PERMISSION_DENIED" ? 403 : 502;
-        throw new OvError(`${what}: ${error.message}`, status, code);
+        throw new OvError(`${what}: ${error.message}`, statusFor(code), code);
       }
       throw new OvError(`${what}: ${(error as Error).message}`);
     }
@@ -411,9 +431,83 @@ export class OvClient {
     return new Uint8Array(await response.arrayBuffer());
   }
 
-  /** Delete a resource. */
-  async remove(uri: string): Promise<void> {
-    await this.guard(`deleting ${uri}`, () => this.sdk.remove(uri));
+  /**
+   * Delete a resource.
+   *
+   * @param options - `recursive` is what lets a folder go; OpenViking refuses a
+   *   non-empty one without it. `wait` holds until the delete has landed, so a
+   *   listing fetched straight afterwards does not still show the file.
+   */
+  async remove(
+    uri: string,
+    options: { recursive?: boolean; wait?: boolean } = {},
+  ): Promise<void> {
+    await this.guard(`deleting ${uri}`, () => this.sdk.remove(uri, options));
+  }
+
+  /** Move a resource. `to` is its full new uri, name included. */
+  async move(from: string, to: string): Promise<void> {
+    await this.guard(`moving ${from}`, () => this.sdk.move(from, to));
+  }
+
+  /**
+   * Whether anything is at a uri.
+   *
+   * A missing resource is the answer here, not a failure, so a 404 comes back
+   * as `false`. Anything else still throws: "OpenViking is down" must not read
+   * as "nothing there", or a move would overwrite on the strength of an
+   * outage.
+   */
+  async exists(uri: string): Promise<boolean> {
+    try {
+      await this.stat(uri);
+      return true;
+    } catch (error) {
+      if (error instanceof OvError && error.status === 404) return false;
+      throw error;
+    }
+  }
+
+  /**
+   * Hand a resource back to OpenViking to describe again.
+   *
+   * The mode is the whole point. `vectors_only` — the SDK's default — re-embeds
+   * the text already stored, so a file whose description never arrived comes
+   * back just as empty. `semantic_and_vectors` runs the model again, which is
+   * what "describe this properly this time" means.
+   *
+   * It runs out of band because the model takes minutes on a large document,
+   * and a request held open that long times out on the way rather than
+   * finishing. Handing it a file also refreshes the folder above, which is
+   * where OpenViking keeps the per-file descriptions this dashboard shows.
+   *
+   * @returns The job id to follow, or "" if OpenViking opened no job.
+   */
+  async describeAgain(uri: string): Promise<string> {
+    const raw = await this.guard(`re-describing ${uri}`, () =>
+      this.sdk.reindex(uri, { mode: "semantic_and_vectors", wait: false }),
+    );
+    const parsed = reindexAcceptedSchema.safeParse(raw);
+    return parsed.success ? parsed.data.task_id : "";
+  }
+
+  /** How a background job is getting on. */
+  async job(taskId: string): Promise<JobState> {
+    const raw = await this.guard(`reading job ${taskId}`, () => this.sdk.getTask(taskId));
+    // OpenViking keeps task records for a while and then drops them, so a null
+    // here means "no longer tracked", which is not the same as "succeeded".
+    if (raw === null) return { state: "gone", error: "" };
+
+    const parsed = taskSchema.safeParse(raw);
+    const status = parsed.success ? parsed.data.status : "";
+    if (status === "completed") return { state: "done", error: "" };
+    if (status === "failed" || status === "cancelled") {
+      return {
+        state: "failed",
+        error: (parsed.success ? parsed.data.error : "") ?? "",
+      };
+    }
+    return { state: "waiting", error: "" };
   }
 
   /** Import a resource from a local path or a remote URL. */
@@ -744,6 +838,31 @@ export function usefulAbstract(text: string): string {
   if (/^\[[^\]]*not ready[^\]]*\]$/i.test(withoutHeading)) return "";
   if (/^\[[^\]]*\]$/.test(withoutHeading)) return "";
   return trimmed;
+}
+
+/**
+ * The HTTP status one of OpenViking's error codes deserves.
+ *
+ * Anything unrecognised is 502: the dashboard could not get an answer, and
+ * saying so beats guessing which side was at fault. The listed codes are the
+ * ones a person can act on — a name already taken, a folder already being
+ * reindexed — and reporting those as a gateway failure sends someone looking
+ * for an outage that is not there.
+ */
+export function statusFor(code: string): number {
+  switch (code) {
+    case "NOT_FOUND":
+      return 404;
+    case "PERMISSION_DENIED":
+      return 403;
+    case "INVALID_ARGUMENT":
+      return 400;
+    case "CONFLICT":
+    case "ALREADY_EXISTS":
+      return 409;
+    default:
+      return 502;
+  }
 }
 
 /** Escape a user's word so grep treats it literally, not as a pattern. */

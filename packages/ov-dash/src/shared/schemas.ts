@@ -232,3 +232,28 @@ export const uploadResultSchema = z.object({
   name: z.string(),
 });
 export type UploadResult = z.infer<typeof uploadResultSchema>;
+
+/** A background job OpenViking took on, with the id to follow it by. */
+export const jobSchema = z.object({
+  /** Empty when OpenViking did the work outright and opened no job. */
+  taskId: z.string(),
+});
+export type Job = z.infer<typeof jobSchema>;
+
+/**
+ * How a background job is getting on.
+ *
+ * `gone` is a state of its own rather than a kind of `done`. OpenViking drops
+ * task records after a while, so a job that failed and then expired would read
+ * as a success to anything that treated "not found" as finished.
+ */
+export const jobStateSchema = z.object({
+  state: z.enum(["waiting", "done", "failed", "gone"]),
+  /** What went wrong, when the job failed and OpenViking said. */
+  error: z.string().default(""),
+});
+export type JobState = z.infer<typeof jobStateSchema>;
+
+/** Where a moved resource ended up. */
+export const movedSchema = z.object({ uri: z.string() });
+export type Moved = z.infer<typeof movedSchema>;

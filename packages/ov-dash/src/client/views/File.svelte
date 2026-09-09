@@ -20,8 +20,17 @@
   let failure = $state("");
   let loading = $state(true);
 
-  $effect(() => {
-    const target = uri;
+  /**
+   * Load whatever the uri points at. Shared with the reload after a rewrite.
+   *
+   * The reload arrives minutes late, carrying the uri the describe started on,
+   * and by then the page may be showing something else. Without the first
+   * line it would blank that, set `loading`, and then never clear it — every
+   * later guard compares against the current uri and fails — leaving the pane
+   * saying "Loading…" until the next navigation.
+   */
+  function load(target: string): void {
+    if (target !== uri) return;
     opened = null;
     failure = "";
     loading = true;
@@ -36,6 +45,10 @@
       .finally(() => {
         if (target === uri) loading = false;
       });
+  }
+
+  $effect(() => {
+    load(uri);
   });
 </script>
 
@@ -47,6 +60,8 @@
     {loading}
     {failure}
     onopen={(next) => go({ page: "file", uri: next })}
+    onrefresh={load}
+    ondeleted={() => go({ page: "files" })}
   />
 </div>
 

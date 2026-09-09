@@ -12,6 +12,8 @@ import {
   type Destinations,
   type FileDetail,
   type Home,
+  type Job,
+  type JobState,
   type MemoryGroup,
   type Opened,
   type SearchMode,
@@ -23,7 +25,10 @@ import {
   destinationsSchema,
   fileDetailSchema,
   homeSchema,
+  jobSchema,
+  jobStateSchema,
   memoryGroupSchema,
+  movedSchema,
   openedSchema,
   searchResponseSchema,
   sessionStateSchema,
@@ -88,16 +93,7 @@ async function call<S extends z.ZodTypeAny>(
     throw new ApiError(`could not reach the dashboard: ${error.message}`, "OFFLINE", 0);
   });
 
-  if (!response.ok) {
-    noticeSessionEnd(response.status);
-    const body: unknown = await response.json().catch(() => null);
-    const parsed = apiErrorSchema.safeParse(body);
-    throw new ApiError(
-      parsed.success ? parsed.data.error.message : `HTTP ${response.status}`,
-      parsed.success ? parsed.data.error.code : "HTTP_ERROR",
-      response.status,
-    );
-  }
+  if (!response.ok) throw await refusal(response);
 
   const parsed = schema.safeParse(await response.json());
   if (!parsed.success) {
@@ -108,6 +104,43 @@ async function call<S extends z.ZodTypeAny>(
     );
   }
   return parsed.data;
+}
+
+/**
+ * Turn a failed response into the error to throw.
+ *
+ * The server sends its own code and message in every refusal, and those are
+ * written to be shown — "that folder is outside the scopes this dashboard
+ * writes to" tells somebody what to do next, where "HTTP 403" does not.
+ */
+async function refusal(response: Response): Promise<ApiError> {
+  noticeSessionEnd(response.status);
+  const body: unknown = await response.json().catch(() => null);
+  const parsed = apiErrorSchema.safeParse(body);
+  return new ApiError(
+    parsed.success ? parsed.data.error.message : `HTTP ${response.status}`,
+    parsed.success ? parsed.data.error.code : "HTTP_ERROR",
+    response.status,
+  );
+}
+
+/** Run a route that answers with no body worth reading. */
+async function send(path: string, init: RequestInit): Promise<void> {
+  const response = await fetch(path, { credentials: "same-origin", ...init }).catch(
+    (error: Error) => {
+      throw new ApiError(`could not reach the dashboard: ${error.message}`, "OFFLINE", 0);
+    },
+  );
+  if (!response.ok) throw await refusal(response);
+}
+
+/** Send a JSON body, the way every write on this API takes one. */
+function posting(body: unknown): RequestInit {
+  return {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  };
 }
 
 /*
@@ -168,6 +201,62 @@ export const api = {
     invalidate(`open:${uri}`);
   },
 
+  /**
+   * Delete a file or folder outright.
+   *
+   * Everything cached is dropped rather than picked over: a file's own entries
+   * are the obvious loss, but the tree that listed it, the home counts, the
+   * folder it sat in and any search that returned it are all wrong now too.
+   */
+  async remove(uri: string): Promise<void> {
+    await send(`/api/file?uri=${encodeURIComponent(uri)}`, { method: "DELETE" });
+    invalidate();
+  },
+
+  /**
+   * Move a file or folder into another folder.
+   *
+   * @returns Where it ended up. The server derives that from the uri it moved
+   *   rather than from anything the browser sent, so this is the one answer
+   *   worth trusting about the new path — a caller that rebuilt it locally
+   *   would be guessing at the same string twice.
+   */
+  async move(from: string, into: string): Promise<string> {
+    const response = await fetch("/api/move", {
+      credentials: "same-origin",
+      ...posting({ from, into }),
+    }).catch((error: Error) => {
+      throw new ApiError(`could not reach the dashboard: ${error.message}`, "OFFLINE", 0);
+    });
+    if (!response.ok) throw await refusal(response);
+    // Both paths changed, and the tree drew them both.
+    invalidate();
+
+    // 204 means it was already there, so nothing moved and nothing is sent.
+    if (response.status === 204) return from;
+
+    // Parsed the way `call` parses, not with a bare `.parse`. A zod failure
+    // thrown from here reaches a toast, and a page of zod issues is not a
+    // sentence anybody can act on.
+    const parsed = movedSchema.safeParse(await response.json().catch(() => null));
+    if (!parsed.success) {
+      throw new ApiError(
+        "the server answered /api/move in an unexpected shape",
+        "BAD_SHAPE",
+        response.status,
+      );
+    }
+    return parsed.data.uri;
+  },
+
+  /** Hand a file or folder back to OpenViking to describe again. */
+  describe: (uri: string): Promise<Job> =>
+    call("/api/describe", jobSchema, posting({ uri })),
+
+  /** How a background job is getting on. */
+  job: (taskId: string): Promise<JobState> =>
+    call(`/api/job?id=${encodeURIComponent(taskId)}`, jobStateSchema),
+
   async upload(file: File, to?: string): Promise<UploadResult> {
     const form = new FormData();
     form.set("file", file);
@@ -207,6 +296,8 @@ export type {
   Opened,
   FileDetail,
   Home,
+  Job,
+  JobState,
   MemoryGroup,
   SessionState,
   Tree,

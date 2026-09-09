@@ -12,7 +12,8 @@
   import Icon from "../lib/Icon.svelte";
   import PageHead from "../lib/PageHead.svelte";
   import Reader from "../lib/Reader.svelte";
-  import { formatSize } from "../lib/tree";
+  import { toast } from "../lib/state.svelte";
+  import { formatSize, parentUri } from "../lib/tree";
   import { allFolderUris, buildTree, visibleRows, type TreeNode } from "../lib/tree";
 
   let tree = $state<Tree | null>(null);
@@ -91,21 +92,46 @@
 
   const COLUMNS = "minmax(0,1fr) 78px 40px";
 
+  /**
+   * Read the whole listing.
+   *
+   * Everything starts shut. Seeding the first two levels open was meant to show
+   * the shape of the workspace, and on a real tree it opened hundreds of rows —
+   * the top of the list scrolled away before you could read it. A closed tree
+   * is one screen you choose your way into; Expand all is still there for the
+   * times you want the whole thing.
+   */
+  async function loadTree(): Promise<void> {
+    try {
+      tree = await api.tree();
+      failure = "";
+    } catch (error) {
+      failure = (error as Error).message;
+    }
+  }
+
   $effect(() => {
-    api
-      .tree()
-      .then((result) => {
-        // Everything shut. Seeding the first two levels open was meant to show
-        // the shape of the workspace, and on a real tree it opened hundreds of
-        // rows — the top of the list scrolled away before you could read it.
-        // A closed tree is one screen you choose your way into; Expand all is
-        // still there for the times you want the whole thing.
-        tree = result;
-      })
-      .catch((error: Error) => {
-        failure = error.message;
-      });
+    void loadTree();
   });
+
+  /**
+   * Read the listing again after something moved or was deleted.
+   *
+   * The fetched children are keyed by folder uri, and a move has just changed
+   * which uris exist, so they go. Then they are fetched back for the folders
+   * still open: the recursive listing stops at depth 2, so anything expanded
+   * below that would otherwise sit there open and empty, looking like a folder
+   * whose contents the move had eaten.
+   */
+  async function refreshTree(): Promise<void> {
+    extra = new Map();
+    await loadTree();
+    for (let round = 0; round < 6; round++) {
+      const missing = findUnfetched(roots).filter((node) => open.has(node.uri));
+      if (missing.length === 0) break;
+      await Promise.all(missing.slice(0, 40).map((node) => fill(node)));
+    }
+  }
 
   function toggle(node: TreeNode): void {
     const next = new Set(open);
@@ -250,6 +276,114 @@
     }
   }
 
+  /*
+   * ── Rearranging the tree ─────────────────────────────────────
+   *
+   * Dragging a row onto a folder moves it there. There is no reordering within
+   * a folder to be had: OpenViking stores no order of its own, and every
+   * listing comes back sorted, so a position dragged into place would not
+   * survive the next read. What a drag can change is where something lives,
+   * and that is what this does.
+   */
+
+  /** The row being dragged, or null. Held for the drop, which only has a uri. */
+  let dragging = $state<TreeNode | null>(null);
+  /** The folder currently under the pointer, so it can light up. */
+  let over = $state("");
+  /** The uri being moved right now, so its row can say so. */
+  let moving = $state("");
+
+  /**
+   * Whether dropping `held` onto `target` would do anything.
+   *
+   * Takes the dragged row rather than reading `dragging`, because the drop
+   * handler has to clear that before it awaits: left set through a move that
+   * takes a second, a second drop could start against a row already gone.
+   */
+  function canDrop(held: TreeNode | null, target: TreeNode): boolean {
+    if (!held || !target.isDir) return false;
+    if (target.uri === held.uri) return false;
+    // Into its own subtree is a folder swallowing itself.
+    if (target.uri.startsWith(`${held.uri}/`)) return false;
+    return parentUri(held.uri) !== target.uri;
+  }
+
+  function startDrag(event: DragEvent, node: TreeNode): void {
+    dragging = node;
+    // Some browsers cancel a drag that carries no data at all.
+    event.dataTransfer?.setData("text/plain", node.uri);
+    if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+  }
+
+  function dragOver(event: DragEvent, node: TreeNode): void {
+    if (moving || !canDrop(dragging, node)) return;
+    // Without this the browser treats the row as somewhere a drop cannot land.
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    over = node.uri;
+  }
+
+  async function drop(event: DragEvent, node: TreeNode): Promise<void> {
+    event.preventDefault();
+    const held = dragging;
+    over = "";
+    dragging = null;
+    if (!held || !canDrop(held, node)) return;
+
+    moving = held.uri;
+    try {
+      const landed = await api.move(held.uri, node.uri);
+      await refreshTree();
+      follow(held.uri, landed);
+      // Opened, so the row it landed in is visible rather than folded away.
+      open = new Set(open).add(node.uri);
+      toast(`Moved ${held.name} into ${node.name}`);
+    } catch (error) {
+      toast((error as Error).message);
+    } finally {
+      moving = "";
+    }
+  }
+
+  /**
+   * Follow the selection through a move.
+   *
+   * The open file keeps its uri only if it was not the thing that moved — or
+   * inside it. Selecting `notes/a.md` and then dragging `notes` elsewhere
+   * leaves the pane on a uri nothing answers to, so every button on it fails
+   * with a 404 that reads like a bug.
+   */
+  function follow(from: string, to: string): void {
+    if (selected === from) {
+      openUri(to);
+    } else if (selected.startsWith(`${from}/`)) {
+      openUri(to + selected.slice(from.length));
+    }
+  }
+
+  /**
+   * Read the open resource back after OpenViking has rewritten it.
+   *
+   * The pane only, not the tree: a describe changes the words about a file,
+   * never which files there are.
+   */
+  function reread(uri: string): void {
+    if (selected !== uri) return;
+    if (detail) openFile(uri);
+    else if (folderView) openFolder(uri, folderName);
+  }
+
+  /** Forget a deleted resource: it is gone from the pane and from the tree. */
+  async function dropped(uri: string): Promise<void> {
+    if (selected === uri) {
+      selected = "";
+      detail = null;
+      folderView = null;
+      detailFailure = "";
+    }
+    await refreshTree();
+  }
+
   /** Folders whose children have never been fetched. */
   function findUnfetched(list: TreeNode[]): TreeNode[] {
     const out: TreeNode[] = [];
@@ -301,13 +435,31 @@
 
       <div class="fs" role="tree" aria-label="Files">
         {#each rows as node (node.uri)}
+          <!--
+            Draggable rows. The handlers sit on the row itself rather than on a
+            grip, so the whole name is the handle — a 15px grip in a 29px row is
+            a target people miss.
+          -->
           <div
             class="tnode {node.isDir && open.has(node.uri) ? 'open' : ''}"
             class:sel={node.uri === selected}
+            class:over={over === node.uri}
+            class:held={dragging?.uri === node.uri || moving === node.uri}
             role="treeitem"
             aria-expanded={node.isDir ? open.has(node.uri) : undefined}
             aria-selected={node.uri === selected}
             tabindex="-1"
+            draggable={moving === ""}
+            ondragstart={(event) => startDrag(event, node)}
+            ondragend={() => {
+              dragging = null;
+              over = "";
+            }}
+            ondragover={(event) => dragOver(event, node)}
+            ondragleave={() => {
+              if (over === node.uri) over = "";
+            }}
+            ondrop={(event) => void drop(event, node)}
             style={`grid-template-columns:${COLUMNS}`}
           >
             <span class="cell nm">
@@ -331,7 +483,7 @@
               {/if}
 
               <span class="tg">
-                {#if loadingDirs.has(node.uri)}
+                {#if loadingDirs.has(node.uri) || moving === node.uri}
                   <span class="dspin" aria-label="Loading"></span>
                 {:else}
                   <Icon name={node.isDir ? "folder" : "doc"} />
@@ -360,6 +512,9 @@
       loading={loadingFile}
       failure={detailFailure}
       onopen={openUri}
+      onrefresh={reread}
+      ondeleted={(uri) => void dropped(uri)}
+      onlisting={() => void refreshTree()}
     />
   </div>
 {/if}
@@ -450,6 +605,21 @@
   }
   .tlb:hover {
     color: var(--accent);
+  }
+
+  /*
+   * Dragging: the row in hand fades, the folder under it is outlined.
+   *
+   * An outline rather than a fill, because a fill on the row you are hovering
+   * reads the same as the selected row two lines up.
+   */
+  .tnode.held {
+    opacity: 0.42;
+  }
+  .tnode.over {
+    background: var(--accent-quiet);
+    outline: 1px dashed var(--accent);
+    outline-offset: -1px;
   }
 
   .dspin {
