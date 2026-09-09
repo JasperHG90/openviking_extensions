@@ -302,9 +302,7 @@ async def test_changed_since_finds_real_rows_and_orders_them_oldest_first(
     )
 
     store = VikingStore(viking_fs, backend, ctx(), settings())
-    found = await store.changed_since(
-        datetime(2026, 8, 1, tzinfo=timezone.utc), limit=10
-    )
+    found = await store.changed_since(datetime(2026, 8, 1, tzinfo=timezone.utc), limit=10)
 
     assert found == [A, B]
     await backend.close()
@@ -324,9 +322,9 @@ async def test_changed_since_excludes_everything_at_or_before_the_mark(
     store = VikingStore(viking_fs, backend, ctx(), settings())
 
     assert await store.changed_since(when, limit=10) == []
-    assert set(await store.changed_since(
-        datetime(2026, 9, 4, tzinfo=timezone.utc), limit=10
-    )) == {A, B}
+    assert set(
+        await store.changed_since(datetime(2026, 9, 4, tzinfo=timezone.utc), limit=10)
+    ) == {A, B}
     await backend.close()
 
 
