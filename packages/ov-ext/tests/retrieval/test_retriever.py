@@ -120,6 +120,10 @@ def make_retriever(
             # rerank config; none is reached once its `retrieve` is stubbed.
             self._settings = HybridSettings(**overrides)
             self.vector_store = store
+            # Present, and truthy, because the final pass refuses to reorder
+            # without one. Never called: the tests that reach the service
+            # patch the base `_rerank_scores` over it.
+            self._rerank_client = object()
             self.base_limit: int | None = None
 
     async def base_retrieve(
@@ -524,6 +528,7 @@ async def test_the_final_pass_is_not_charged_to_the_descent_ceiling(
     class _Stubbed(HybridRetriever):
         def __init__(self) -> None:
             self._settings = HybridSettings(rerank_max_calls=1)
+            self._rerank_client = object()
 
     token = _rerank_budget.set(0)
     try:
@@ -549,6 +554,7 @@ async def test_the_final_pass_keeps_the_fused_order_when_scoring_fails(
     class _Stubbed(HybridRetriever):
         def __init__(self) -> None:
             self._settings = HybridSettings()
+            self._rerank_client = object()
 
     result = await _Stubbed()._rerank_pool(
         [ctx("a", abstract="x"), ctx("b", abstract="y")], text="q"
@@ -566,8 +572,72 @@ async def test_a_pool_of_blank_abstracts_costs_no_rerank_call(
     class _Stubbed(HybridRetriever):
         def __init__(self) -> None:
             self._settings = HybridSettings()
+            self._rerank_client = object()
 
     result = await _Stubbed()._rerank_pool([ctx("a"), ctx("b")], text="q")
 
     assert seen == [], "a pool with nothing to judge must not reach the service"
     assert [m.uri for m in result] == ["a", "b"]
+
+
+def fused_pool() -> list[MatchedContext]:
+    """A pool in fused order whose vector scores run the opposite way.
+
+    This is the shape fusion produces whenever the keyword leg promotes a
+    document the embedding ranked last, so sorting it by score is visibly
+    wrong rather than merely unjustified.
+    """
+    return [
+        ctx("buried", abstract="rotating the intermediate certificate", score=0.1),
+        ctx("decoy", abstract="nothing of interest", score=0.9),
+    ]
+
+
+async def test_the_final_pass_keeps_the_fused_order_with_no_reranker_configured() -> None:
+    """Regression: the end-to-end keyword test caught this and the unit suite did not.
+
+    With no rerank client the base class hands ``fallback_scores`` straight
+    back -- the pool's *vector* scores. Sorting by those undoes the fusion
+    this pass runs after and puts the decoy back on top, which is exactly
+    what the keyword leg exists to prevent.
+    """
+
+    class _Stubbed(HybridRetriever):
+        def __init__(self) -> None:
+            self._settings = HybridSettings()
+            self._rerank_client = None
+
+    result = await _Stubbed()._rerank_pool(fused_pool(), text="intermediate certificate")
+
+    assert [m.uri for m in result] == ["buried", "decoy"], (
+        "fusion's order must survive a pass that scored nothing"
+    )
+
+
+async def test_the_final_pass_keeps_the_fused_order_when_the_service_declines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same bug, reached with a client configured.
+
+    The base returns ``fallback_scores`` unchanged on a service error or an
+    odd-length answer too, so a present-but-failing reranker must not reorder
+    either. Checked separately because the no-client guard would mask it.
+    """
+
+    async def declines(
+        self: Any, query: str, documents: list[str], fallback_scores: list[float]
+    ) -> list[float]:
+        return list(fallback_scores)
+
+    monkeypatch.setattr(HierarchicalRetriever, "_rerank_scores", declines)
+
+    class _Stubbed(HybridRetriever):
+        def __init__(self) -> None:
+            self._settings = HybridSettings()
+            self._rerank_client = object()
+
+    result = await _Stubbed()._rerank_pool(fused_pool(), text="intermediate certificate")
+
+    assert [m.uri for m in result] == ["buried", "decoy"], (
+        "a declined rerank must not be read as a ranking"
+    )

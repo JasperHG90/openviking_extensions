@@ -351,17 +351,30 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
         list[MatchedContext]
             The same contexts, best first. Unchanged when nothing scored.
         """
-        documents = [context.abstract or "" for context in contexts]
         annotate({"ov_ext.retrieval.candidates": len(contexts)})
+        documents = [context.abstract or "" for context in contexts]
         # The same guard the per-directory path uses: a pool with no text to
         # judge would cost a round trip to learn nothing.
         if not any(document.strip() for document in documents):
             annotate({"ov_ext.retrieval.outcome": "nothing_to_rerank"})
             return contexts
 
-        scores = await self._capped_rerank(
-            text, documents, [context.score for context in contexts]
-        )
+        fallback = [context.score for context in contexts]
+        scores = await self._capped_rerank(text, documents, fallback)
+        if scores == fallback:
+            # Nothing scored, so there is nothing to reorder by. The base class
+            # signals that by handing `fallback_scores` straight back, and it
+            # does so from every path where it declines: no rerank client
+            # configured, a service error, an answer of the wrong length.
+            #
+            # This check is the whole guard, and it has to be. Those are the
+            # pool's *vector* scores; sorting by them is sorting by vector
+            # score, which undoes the fusion this pass deliberately runs after
+            # and restores the very ordering the keyword leg existed to
+            # correct. `_finish` warns consumers off exactly this, and the
+            # first version of this method walked into it anyway.
+            annotate({"ov_ext.retrieval.outcome": "nothing_scored"})
+            return contexts
         if len(scores) != len(contexts):
             # The base class promises this cannot happen. It costs one
             # comparison not to reorder the pool by a mismatched list if it
