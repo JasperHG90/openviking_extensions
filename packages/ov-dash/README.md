@@ -233,6 +233,22 @@ just image      # build the container
 just push       # publish it, multi-arch, to GHCR
 ```
 
+Releasing is a workflow, not a recipe: Actions → release, package `ov-dash`. It
+re-runs the gates — including the Vault integration suite, against a throwaway
+Vault it starts — tags `ov-dash-v<version>`, pushes the image to
+`ghcr.io/jasperhg90/ov-dash` for amd64 and arm64, checks both architectures and
+their version labels arrived, and only then moves `latest`. `just push` is the
+hand path for when you need an image without cutting a release; it tags with the
+short commit sha rather than a version.
+
+The first release creates the GHCR package and it inherits the repository's
+visibility, so `ghcr.io/jasperhg90/ov-dash` is public and needs no trip to the
+package settings.
+
+If the release fails after tagging, the tag stands and the workflow will refuse
+that version on a re-run. Finish it by hand with `just push tag=<version>`, or
+delete the tag and start again.
+
 Under `just gates` are the same three npm scripts, if you would rather run one:
 
 ```bash

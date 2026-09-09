@@ -2,7 +2,12 @@
 # node_modules: the server is bundled to one file and the client to static
 # assets, so the runtime image carries only what it runs.
 
-FROM node:22-alpine AS build
+# Pinned to the machine doing the building, not the machine being built for.
+# This stage emits JavaScript and static assets, which are the same bytes on
+# every architecture, so running npm, vite and esbuild under emulation for a
+# cross build costs minutes and buys nothing. Only the runtime stage below is
+# per-architecture.
+FROM --platform=$BUILDPLATFORM node:22-alpine AS build
 WORKDIR /app
 
 # Dependencies first, so a source-only change reuses this layer.

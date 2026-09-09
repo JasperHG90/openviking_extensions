@@ -14,6 +14,7 @@ on:
           - ovx
           - ov-skills
           - ov-clip
+          - ov-dash
       increment:
         description: "Bump of the package's newest tag; ignored when version is set."
         type: choice
@@ -62,9 +63,14 @@ jobs:
   # no way to share a list between workflows, so a new package has to be added
   # in both. ovx used to be on the shell list; it is a Python package now and
   # builds a wheel like ov-postgres.
+  #
+  # The node template runs ov-dash's integration suite too, because a release
+  # is a workflow_dispatch. That is deliberate: the suite signs in against a
+  # real Vault, and sign-in is the one thing a broken dashboard release would
+  # take down.
   test:
     needs: guard
-    if: ${{ !contains(fromJSON('["ov-skills", "ov-clip"]'), inputs.package) }}
+    if: ${{ !contains(fromJSON('["ov-skills", "ov-clip", "ov-dash"]'), inputs.package) }}
     uses: ./.github/workflows/template-check.yaml
     with:
       package: ${{ inputs.package }}
@@ -78,7 +84,7 @@ jobs:
 
   test-node:
     needs: guard
-    if: ${{ contains(fromJSON('["ov-clip"]'), inputs.package) }}
+    if: ${{ contains(fromJSON('["ov-clip", "ov-dash"]'), inputs.package) }}
     uses: ./.github/workflows/template-check-node.yaml
     with:
       package: ${{ inputs.package }}
@@ -200,9 +206,11 @@ jobs:
 
   # Chained via needs: a tag pushed with GITHUB_TOKEN does not trigger
   # workflows. Publishing after tagging means a release only appears with its
-  # artifacts attached; if the build fails the tag stands and a re-run of this
-  # workflow is not needed -- build locally from the tag and attach by hand,
-  # or delete the tag and start over.
+  # artifacts attached; if the build fails the tag stands. Re-running this
+  # workflow for the same version will not work -- the plan step refuses a tag
+  # that exists -- so recovery is either to finish by hand from the tag (for
+  # ov-dash: `just push tag=<version>`, then create the release) or to delete
+  # the tag and start over.
   publish:
     name: build and publish
     needs: release
@@ -216,8 +224,14 @@ jobs:
           && !cancelled()
           && needs.release.result == 'success' }}
     runs-on: ubuntu-latest
+    # A cross build under emulation is the slow path here; without this an
+    # arm64 leg that wedges runs against the six-hour default.
+    timeout-minutes: 45
     permissions:
       contents: write # create the GitHub release
+      # Only ov-dash pushes an image, but a job's permissions cover all of it,
+      # so every package's release runs with this.
+      packages: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -226,25 +240,27 @@ jobs:
           fetch-depth: 0
 
       - uses: astral-sh/setup-uv@v6
-        if: ${{ !contains(fromJSON('["ov-skills", "ov-clip"]'), inputs.package) }}
+        if: ${{ !contains(fromJSON('["ov-skills", "ov-clip", "ov-dash"]'), inputs.package) }}
         with:
           version: ${{ env.UV_VERSION }}
 
       - name: Build package
-        if: ${{ !contains(fromJSON('["ov-skills", "ov-clip"]'), inputs.package) }}
+        if: ${{ !contains(fromJSON('["ov-skills", "ov-clip", "ov-dash"]'), inputs.package) }}
         # By path, not --package: --package resolves workspace members only,
         # and a standalone project like ovx is excluded from the workspace.
         run: uv build packages/${{ inputs.package }} --out-dir dist
 
       - name: Verify the built version matches the tag
-        if: ${{ !contains(fromJSON('["ov-skills", "ov-clip"]'), inputs.package) }}
+        if: ${{ !contains(fromJSON('["ov-skills", "ov-clip", "ov-dash"]'), inputs.package) }}
         env:
           VERSION: ${{ needs.release.outputs.version }}
           PACKAGE: ${{ inputs.package }}
         run: |
           set -euo pipefail
           module="${PACKAGE//-/_}"
-          built=$(ls dist/*.whl | sed -E "s/.*${module}-([^-]+)-py3.*/\1/")
+          # The glob directly, not `ls` piped into sed: the same set of names,
+          # without ls mangling an awkward one.
+          built=$(printf '%s\n' dist/*.whl | sed -E "s/.*${module}-([^-]+)-py3.*/\1/")
           echo "planned=$VERSION built=$built"
           test "$VERSION" = "$built"
 
@@ -372,6 +388,146 @@ jobs:
             echo "profile. Needs an ovx with \`--install-firefox-host\`."
           } > NOTES.md
 
+      # ov-dash ships as a container, not a file on the release page: it is a
+      # server, and the only useful thing to hand someone is an image they can
+      # run. So the release page carries notes and the artifact lives in GHCR.
+      #
+      # Multi-arch because the lab mixes amd64 boxes with arm boards. arm64 is
+      # built under emulation, which is why QEMU is here; it is slow, and a
+      # dashboard released a few times a year does not justify a second runner.
+      - name: Set up QEMU
+        if: ${{ inputs.package == 'ov-dash' }}
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        if: ${{ inputs.package == 'ov-dash' }}
+        uses: docker/setup-buildx-action@v3
+
+      - name: Sign in to GHCR
+        if: ${{ inputs.package == 'ov-dash' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # The name is spelled out rather than built from github.repository_owner,
+      # which is JasperHG90: GHCR paths must be lowercase. It has to match the
+      # `image` variable in packages/ov-dash/justfile, so a hand-pushed image
+      # and a released one land in the same place.
+      - name: Build and push the image
+        if: ${{ inputs.package == 'ov-dash' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: packages/ov-dash
+          platforms: linux/amd64,linux/arm64
+          push: true
+          # The version alone. `latest` is moved further down, once the push
+          # has been checked: pushed here, a build that fails verification
+          # would already be what every `docker pull` returns, and nothing
+          # rolls it back.
+          tags: ghcr.io/jasperhg90/ov-dash:${{ needs.release.outputs.version }}
+          # Nothing in the running dashboard reports its own version, so the
+          # labels are the only place the image says what it is. Read them back
+          # with `docker inspect` when a deployment looks wrong.
+          labels: |
+            org.opencontainers.image.title=ov-dash
+            org.opencontainers.image.version=${{ needs.release.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      # Check the push rather than trust it, the way the other packages check
+      # their stamps. A single-arch push still exits 0, and the arm boards
+      # would find that out at `docker run`.
+      - name: Verify the pushed image
+        if: ${{ inputs.package == 'ov-dash' }}
+        env:
+          IMAGE: ghcr.io/jasperhg90/ov-dash:${{ needs.release.outputs.version }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          manifest=$(docker buildx imagetools inspect "$IMAGE" --raw)
+          for platform in amd64 arm64; do
+            printf '%s' "$manifest" | jq -e \
+              --arg a "$platform" \
+              '.manifests | map(.platform | select(.os == "linux" and .architecture == $a)) | length > 0' \
+              > /dev/null || { echo "::error::$IMAGE has no linux/$platform"; exit 1; }
+          done
+
+          # The label is what a deployment reads to answer "which release is
+          # this?", so a wrong one is worse than none.
+          #
+          # `.Image` is a map keyed by platform, one config per architecture --
+          # every entry is checked rather than the first, so a mismatch on one
+          # cannot hide behind another. Reading it as a single config, the way
+          # a single-arch image allows, fails here with "index of untyped nil".
+          images=$(docker buildx imagetools inspect "$IMAGE" --format '{{ json .Image }}')
+          printf '%s' "$images" | jq -e --arg v "$VERSION" '
+            to_entries
+            | length > 0
+              and all(.[]; .value.config.Labels["org.opencontainers.image.version"] == $v)
+          ' > /dev/null || {
+            echo "::error::$IMAGE is not labelled $VERSION on every architecture"
+            printf '%s' "$images" | jq -r '
+              to_entries[]
+              | "\(.key): \(.value.config.Labels["org.opencontainers.image.version"] // "no version label")"
+            '
+            exit 1
+          }
+          echo "every architecture is labelled $VERSION"
+
+      # Only now, and by pointing at the manifest just verified rather than
+      # building again: a second build could differ from the one that passed.
+      - name: Move latest
+        if: ${{ inputs.package == 'ov-dash' }}
+        env:
+          IMAGE: ghcr.io/jasperhg90/ov-dash
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create -t "$IMAGE:latest" "$IMAGE:$VERSION"
+
+      - name: Write the image's install notes
+        if: ${{ inputs.package == 'ov-dash' }}
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          # The example config is linked at the tag, not at main: someone
+          # running an old image needs the settings that image understands.
+          TAG: ${{ needs.release.outputs.tag }}
+          REPO: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## OpenViking dashboard $VERSION"
+            echo
+            echo "A web UI over OpenViking. It ships as a container; there is"
+            echo "nothing to download from this page."
+            echo
+            echo '```bash'
+            echo "docker pull ghcr.io/jasperhg90/ov-dash:$VERSION"
+            echo '```'
+            echo
+            echo "Built for \`linux/amd64\` and \`linux/arm64\`."
+            echo
+            echo "### Run it"
+            echo
+            echo "The dashboard is configured entirely through the environment."
+            echo "Start from [\`.env.example\`]($REPO/blob/$TAG/packages/ov-dash/.env.example),"
+            echo "fill it in, then:"
+            echo
+            echo '```bash'
+            echo "docker run --rm -p 8080:8080 --env-file .env \\"
+            echo "  -e HOST=0.0.0.0 -e PORT=8080 \\"
+            echo "  ghcr.io/jasperhg90/ov-dash:$VERSION"
+            echo '```'
+            echo
+            echo "A missing setting names itself at boot rather than failing on"
+            echo "the first request that needs it. The exception is"
+            echo "\`PUBLIC_ORIGIN\`, which has a default: leave it wrong and the"
+            echo "server starts happily, then refuses every sign-in whose origin"
+            echo "does not match. Set it to the address people actually reach."
+          } > NOTES.md
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -386,4 +542,14 @@ jobs:
           if [ -f NOTES.md ]; then
             args+=(--notes-file NOTES.md)
           fi
-          gh release create "$TAG" "${args[@]}" dist/*
+
+          # A release does not have to carry files. ov-dash's artifact is an
+          # image in GHCR, so its dist/ is empty and an unguarded `dist/*`
+          # would reach gh as the literal string and fail the release after
+          # the image was already pushed. Appended to args rather than kept in
+          # an array of its own, because expanding an empty one under `set -u`
+          # is itself an error on older bash.
+          if compgen -G 'dist/*' > /dev/null; then
+            args+=(dist/*)
+          fi
+          gh release create "$TAG" "${args[@]}"

@@ -10,7 +10,7 @@ Packages that extend [OpenViking](https://github.com/volcengine/OpenViking), col
 | [`ov-ext`](packages/ov-ext/) | Python | Extensions installed into OpenViking's server in one call: hybrid retrieval today, reflection next |
 | [`ovx`](packages/ovx/) | Python | Run `ov` against a named profile, without leaving an API key on disk |
 | [`ov-skills`](packages/ov-skills/) | Markdown + Bash | `/handoff`, `/continue`, `/learnings`, `/ingest` for Claude Code, opencode, and Hermes |
-| [`ov-dash`](packages/ov-dash/) | TypeScript | A dashboard over OpenViking that logs people in with OIDC and holds their API key server-side |
+| [`ov-dash`](packages/ov-dash/) | TypeScript | A dashboard over OpenViking that signs people in through Vault and keeps their credential server-side |
 | [`ov-clip`](packages/ov-clip/) | TypeScript | Firefox extension that saves the page you are reading into OpenViking, using `ovx`'s Vault login |
 
 Each package has its own README with install and usage instructions.
@@ -51,7 +51,7 @@ uv run --directory packages/ovx pytest        # its own project, its own lock
 
 One workflow, [`ci.yaml`](.github/workflows/ci.yaml), covers the repo: repo-wide checks run once, then each package whose files changed is tested by the template that fits it. [`template-check.yaml`](.github/workflows/template-check.yaml) tests a Python package across its supported interpreters and builds and imports its wheel; [`template-check-shell.yaml`](.github/workflows/template-check-shell.yaml) runs a shell package's suite on both Ubuntu and macOS, since macOS still ships bash 3.2 and rejects syntax every other bash accepts.
 
-Adding a package means adding one filter block to `ci.yaml` and its name to whichever of the three fallback lists matches its template. It also needs an entry in `release.yaml`'s `package` choice, and — for a shell package — its name in the `'["ov-skills"]'` literal that `release.yaml` tests against to pick a template. GitHub Actions cannot share a list between workflows or choose a reusable workflow from an expression, so that list is repeated rather than defined once. A Python package also goes in the workspace members in [`pyproject.toml`](pyproject.toml); a standalone one goes in that file's `exclude` list instead.
+Adding a package means adding one filter block to `ci.yaml` and its name to whichever of the three fallback lists matches its template. It also needs an entry in `release.yaml`'s `package` choice. A Python package needs nothing more there, since that is the branch everything falls into by default. Any other package goes in two more places: the literal naming its template — `'["ov-skills"]'` for a shell package, `'["ov-clip", "ov-dash"]'` for a Node one — and all four `'["ov-skills", "ov-clip", "ov-dash"]'` exclusions, one on the `test` job and three on the publish job's Python steps. Miss the last and the Python template runs against a package that has no wheel. GitHub Actions cannot share a list between workflows or choose a reusable workflow from an expression, so that list is repeated rather than defined once. A Python package also goes in the workspace members in [`pyproject.toml`](pyproject.toml); a standalone one goes in that file's `exclude` list instead.
 
 ## Releases
 
@@ -60,6 +60,10 @@ Each package releases on its own, from the manual [`release.yaml`](.github/workf
 The tag is the only place a version exists. A Python package gets there through hatch-vcs, which reads the tag at build time. A shell package has no wheel and no hatch-vcs, so the release stamps the version in and attaches an installer pinned to the same release — a checkout claims no version, because an untagged working copy has none. `ov-skills` stamps its plugin manifest, which reads `0.0.0` in a checkout, and ships a tarball of `skills/`; its installer defaults to the newest release rather than to `main`, and installing the branch tip is opt-in via `--main`.
 
 `ov-clip` follows the same rule: its `manifest.json` reads `0.0.0` in a checkout and the release stamps the tag in, then checks the stamp took — Firefox refuses to install two builds claiming the same version, so a stamp that silently failed would look like "the update did not apply". With `AMO_JWT_ISSUER` and `AMO_JWT_SECRET` set, the release signs through AMO and attaches an installable `.xpi`; without them it attaches an unsigned `.zip` rather than failing, so a fork can still cut a release.
+
+`ov-dash` is a server, so its release carries no file at all. It builds `ghcr.io/jasperhg90/ov-dash` for `linux/amd64` and `linux/arm64` — the lab mixes amd64 boxes with arm boards — and the GitHub release holds only the notes saying how to pull it. Nothing in the running dashboard reports its own version, so the release stamps OCI labels (`title`, `version`, `revision`, `source`) and then reads `version` back off the pushed manifest, checking every architecture carries it and that both really landed. A single-arch push exits 0, and the arm boards would otherwise discover that at `docker run`. Only then does `latest` move, by pointing at the manifest that passed rather than by building again: pushed alongside the version tag, a build that failed verification would already be what every `docker pull` returns.
+
+The first release creates the GHCR package, which inherits this repository's visibility — `ov-dash-v0.1.0` came out publicly pullable with no manual step. A package created by hand with `just push` instead is owner-scoped with no repository linked, and a release cannot write to it until this repo is added under the package's *Manage Actions access*. If a `docker pull` ever comes back `denied`, that link and the package's visibility are the two things to check.
 
 ## Shared actions
 

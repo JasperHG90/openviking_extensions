@@ -173,6 +173,14 @@ export async function startOpenViking(): Promise<Live | null> {
     "-d",
     "--name",
     CONTAINER,
+    // Docker Desktop resolves host.docker.internal on its own; a Linux daemon
+    // does not, and the embedding config above is written in terms of it. Left
+    // out, the server boots and answers, then every import hangs on an
+    // embedding call that cannot connect: the document never finishes indexing
+    // and the destination lock is never let go, so the next import to the same
+    // place fails with a 409 nobody can explain from the message.
+    "--add-host",
+    "host.docker.internal:host-gateway",
     "-p",
     `${OV_PORT}:1933`,
     "-e",
