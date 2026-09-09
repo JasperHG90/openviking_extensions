@@ -448,7 +448,12 @@ def rerank_by_abstract(monkeypatch: pytest.MonkeyPatch, best: str) -> list[list[
         self: Any, query: str, documents: list[str], fallback_scores: list[float]
     ) -> list[float]:
         seen.append(list(documents))
-        return [1.0 if document == best else 0.0 for document in documents]
+        # Neither value may coincide with a context's vector score. A score
+        # equal to the fallback is how upstream reports that it could not
+        # score that document at all, so a stub returning 0.0 against `ctx`'s
+        # default 0.0 would be claiming the opposite of what it means. Real
+        # cosines and sigmoid rerank scores do not collide exactly.
+        return [0.9 if document == best else 0.1 for document in documents]
 
     monkeypatch.setattr(HierarchicalRetriever, "_rerank_scores", base_rerank)
     return seen
@@ -694,7 +699,14 @@ async def test_blank_abstracts_are_not_ranked_against_a_scored_candidate(
     async def base_rerank(
         self: Any, query: str, documents: list[str], fallback_scores: list[float]
     ) -> list[float]:
-        return [0.2] * len(documents)
+        # Upstream scores only the non-blank documents and leaves the rest on
+        # their vector scores. Returning a flat constant for every document
+        # instead -- which this stub first did -- makes the buggy whole-pool
+        # sort stable, so the test passed against the bug it exists to catch.
+        return [
+            0.2 if document.strip() else fallback
+            for document, fallback in zip(documents, fallback_scores, strict=True)
+        ]
 
     monkeypatch.setattr(HierarchicalRetriever, "_rerank_scores", base_rerank)
 
@@ -712,4 +724,41 @@ async def test_blank_abstracts_are_not_ranked_against_a_scored_candidate(
 
     assert [m.uri for m in result] == ["relevant", "blank-a", "blank-b"], (
         "an unjudged blank must not outrank the one candidate that was judged"
+    )
+
+
+async def test_the_final_pass_applies_the_ranking_and_not_its_inverse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Three scored candidates, so the permutation is not its own inverse.
+
+    Every other test of this pass scores at most two, and swapping two
+    elements looks the same whichever direction the permutation is applied.
+    Writing the placement backwards therefore passed all 293 tests while
+    producing a different order on 219 of 400 random pools. Found by
+    adversarial review.
+    """
+    by_document = {"a doc": 0.1, "b doc": 0.3, "c doc": 0.2}
+
+    async def base_rerank(
+        self: Any, query: str, documents: list[str], fallback_scores: list[float]
+    ) -> list[float]:
+        return [by_document[document] for document in documents]
+
+    monkeypatch.setattr(HierarchicalRetriever, "_rerank_scores", base_rerank)
+
+    class _Stubbed(HybridRetriever):
+        def __init__(self) -> None:
+            self._settings = HybridSettings()
+
+    pool = [
+        ctx("a", abstract="a doc", score=0.0),
+        ctx("b", abstract="b doc", score=0.0),
+        ctx("c", abstract="c doc", score=0.0),
+    ]
+
+    result = await _Stubbed()._rerank_pool(pool, text="q")
+
+    assert [m.uri for m in result] == ["b", "c", "a"], (
+        "best first by rerank score: b 0.3, c 0.2, a 0.1 -- the inverse gives c, a, b"
     )

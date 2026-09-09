@@ -264,7 +264,10 @@ OpenViking already applies when reranking fails, so the worst case is a ranking
 it considers acceptable rather than an error. The `ov_ext.retrieval.rerank` span
 records `rerank_budget_spent` when the call ceiling bites, because a search that
 quietly stopped reranking half way looks exactly like one that never had a
-reranker; `reranked_documents` and `held_back_documents` record the other cap.
+reranker. Two more attributes record the documents rather than the calls:
+`reranked_documents` counts those that came back with a score, and
+`held_back_documents` those never sent — because a cap excluded them, or
+because they carried no text. Neither implies a cap is set.
 
 ### Which cap to reach for
 

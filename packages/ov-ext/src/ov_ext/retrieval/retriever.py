@@ -313,9 +313,11 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
         Returns
         -------
         tuple
-            The merged scores in input order, and the indexes actually scored.
-            The latter is empty when the service declined, which upstream
-            signals by handing ``fallback_scores`` straight back.
+            The merged scores in input order, and the indexes whose score
+            actually changed. The latter is empty when the service declined,
+            which upstream signals by handing ``fallback_scores`` back — for
+            the whole batch on an error, or for one document at a time when
+            its answer was not a finite number.
         """
         sent = [fallback_scores[index] for index in chosen]
         scored: list[float] = await super()._rerank_scores(
@@ -329,20 +331,36 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
                 len(scored),
                 len(chosen),
             )
-        if len(scored) != len(chosen) or scored == sent:
+        if len(scored) != len(chosen):
             annotate({"ov_ext.retrieval.reranked_documents": 0})
             return list(fallback_scores), []
 
         merged = list(fallback_scores)
+        moved: list[int] = []
         for index, score in zip(chosen, scored, strict=True):
             merged[index] = score
+            # Decided per document, not per batch. Upstream's `_finite_score`
+            # substitutes a document's own vector score for a null, a NaN or a
+            # non-number, so one malformed entry in an otherwise good answer
+            # arrives looking exactly like a score. Reporting it as scored
+            # would let `_rerank_pool` rank that cosine against real rerank
+            # scores -- the very cross-scale comparison this return value
+            # exists to prevent, one document at a time.
+            #
+            # A whole-batch comparison cannot see that, which is the mistake
+            # this method was written to stop making. A reranker that returns
+            # a document's exact vector score is indistinguishable from one
+            # that declined it, and treating it as declined costs only a
+            # candidate keeping the place fusion gave it.
+            if score != fallback_scores[index]:
+                moved.append(index)
         annotate(
             {
-                "ov_ext.retrieval.reranked_documents": len(chosen),
+                "ov_ext.retrieval.reranked_documents": len(moved),
                 "ov_ext.retrieval.held_back_documents": len(documents) - len(chosen),
             }
         )
-        return merged, chosen
+        return merged, moved
 
     @traced("ov_ext.retrieval.rerank_pool")
     async def _rerank_pool(
