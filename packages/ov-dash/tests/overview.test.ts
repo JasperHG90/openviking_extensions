@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parentOf } from "../src/server/ov";
-import { describeFile } from "../src/server/overview";
+import { describeFile, stripUnrendered } from "../src/server/overview";
 
 /**
  * A folder overview, in the shape OpenViking writes them.
@@ -305,5 +305,106 @@ describe("finding the folder a file sits in", () => {
     expect(parentOf("viking://")).toBe("viking://");
     expect(parentOf("viking://user")).toBe("viking://user");
     expect(parentOf("")).toBe("");
+  });
+});
+
+/**
+ * Descriptions that are really a template that failed to render.
+ *
+ * OpenViking renders memory templates with Jinja's `DebugUndefined`, which
+ * prints the miss into the file instead of raising. Copied from the live
+ * server: this is `viking://user/jasper/memories/cases/.overview.md`, where
+ * every one of eight bullets came out this way because the files under
+ * `cases/` carry none of the fields that memory type declares.
+ */
+const BROKEN_OVERVIEW = `---
+directory: viking://user/jasper/memories/cases/
+---
+
+# Cases Overview
+
+- [{{ no such element: dict object['case_name'] }}](./mem_079fbe147f15.md) — {{ no such element: dict object['task_signature'] }}
+
+- [{{ no such element: dict object['case_name'] }}](./mem_f2fe076b2f78.md) — {{ no such element: dict object['task_signature'] }}
+`;
+
+describe("a description that is a failed render", () => {
+  it("comes back as no description at all", () => {
+    // It used to reach the reading pane verbatim, captioned "What OpenViking
+    // makes of this" — an error message dressed as an opinion about the file.
+    expect(describeFile(BROKEN_OVERVIEW, "mem_079fbe147f15.md")).toBe("");
+    expect(describeFile(BROKEN_OVERVIEW, "mem_f2fe076b2f78.md")).toBe("");
+  });
+
+  it("keeps the words that did arrive around one that did not", () => {
+    const doc = [
+      "# Cases Overview",
+      "",
+      "- [a](./a.md) — Fixes the {{ no such element: dict object['x'] }} import path.",
+    ].join("\n");
+    expect(describeFile(doc, "a.md")).toBe("Fixes the import path.");
+  });
+
+  it("drops a bare unresolved variable too, and closes up after it", () => {
+    // The other shape DebugUndefined emits: a top-level name it never got,
+    // printed as `{{ language }}` rather than as a sentence about elements.
+    // Nothing follows it but a full stop, so the space before it goes as well
+    // — "Written in ." reads as a typo, which is a different kind of broken.
+    const doc = "### notes.md\n\nWritten in {{ language }}.";
+    expect(describeFile(doc, "notes.md")).toBe("Written in.");
+  });
+
+  it("leaves indentation alone on lines nowhere near a placeholder", () => {
+    // The seam is closed where the placeholder was, not everywhere. Collapsing
+    // runs of spaces across the whole text flattened indented code — and it
+    // fired on any text merely containing braces, placeholder or not.
+    const doc = [
+      "### render.md",
+      "",
+      "Renders {{ x }} like so:",
+      "",
+      "    def render(ctx):",
+      "        return tpl.render(ctx)",
+    ].join("\n");
+    expect(describeFile(doc, "render.md")).toBe(
+      "Renders like so:\n\n    def render(ctx):\n        return tpl.render(ctx)",
+    );
+  });
+
+  it("stays linear against a run of whitespace inside a placeholder", () => {
+    // The first draft was quadratic here: `[^{}]*` and the `\s*` after it both
+    // matched spaces, so the engine tried every split. 32k spaces took 561ms
+    // on the single thread that serves every request. Bound is generous on
+    // purpose — the point is the shape of the curve, not the clock.
+    const hostile = `{{ no such element:${" ".repeat(64_000)}`;
+    const started = Date.now();
+    expect(stripUnrendered(hostile)).toBe(hostile.trim());
+    expect(Date.now() - started).toBeLessThan(500);
+  });
+
+  it("is not applied to the overview document itself", () => {
+    // A deliberate hole: `.overview.md` opened for reading should still show
+    // its own failure. Pinned because a comment alone does not stop anyone.
+    const raw =
+      "# Cases Overview\n\n- [a](./a.md) — {{ no such element: dict object['x'] }}";
+    expect(stripUnrendered(raw)).not.toBe(raw);
+    expect(raw.includes("no such element")).toBe(true);
+  });
+
+  it("leaves prose that merely contains braces alone", () => {
+    // A memory about templating is a real description, not a failure. The
+    // shapes above have no spaces inside; an expression does.
+    const doc = "### calc.md\n\nThe template renders {{ 2 + 2 }} as four.";
+    expect(describeFile(doc, "calc.md")).toBe(
+      "The template renders {{ 2 + 2 }} as four.",
+    );
+  });
+
+  it("hands back text with no braces as the very same string", () => {
+    // Identity, not equality-after-cleanup: the old version of this asserted a
+    // trimmed result, which `detailSection` had already trimmed before the
+    // strip ever ran, so it passed with the strip deleted.
+    const real = "A plan, with an em dash — and    aligned    columns.";
+    expect(stripUnrendered(real)).toBe(real);
   });
 });

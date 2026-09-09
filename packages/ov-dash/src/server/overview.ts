@@ -54,6 +54,64 @@ const MAX_LINE = 4000;
 const NAME_CHAR = /[A-Za-z0-9._-]/;
 
 /**
+ * A field the template asked for and did not get.
+ *
+ * OpenViking renders its memory templates with Jinja's `DebugUndefined`, which
+ * prints the miss into the output instead of raising — so a `cases` file with
+ * no `task_signature` gets an overview bullet reading
+ * `{{ no such element: dict object['task_signature'] }}`, and that string is
+ * then the file's description. It is a rendering failure in a description's
+ * clothes: the pane showed it as what OpenViking makes of the file, when what
+ * it means is that the file has no such field.
+ *
+ * Matched by the three shapes `DebugUndefined` actually emits, not by hunting
+ * every `{{ … }}`. An expression is left alone — `{{ 2 + 2 }}`, `{{ x | upper }}`
+ * — because those are prose about templating, not a failure.
+ *
+ * The bare-name branch is the one that costs something, and it is worth being
+ * plain about: `{{ title }}` written on purpose in a description of a Jinja or
+ * Vue file is the same bytes as `{{ title }}` printed by a template that did
+ * not get `title`. Nothing can separate them, so a description that quotes the
+ * plainest template snippet loses it. Kept anyway — a missing field is the
+ * common case by far, and a page of error text is worse than a lost example.
+ *
+ * One space either side is part of the match so the seam can be closed in the
+ * same pass. Collapsing runs of spaces afterwards was the obvious way and the
+ * wrong one: it reached every line in the text, so a description holding an
+ * indented code block came out with its indentation flattened, on lines
+ * nowhere near a placeholder.
+ *
+ * Every quantifier here is bounded by something that cannot match what follows
+ * it, which is what keeps this linear. The first draft ended `[^{}]*\s*\}\}`,
+ * and `[^{}]*` matches spaces too — so the two fought over every space in a
+ * run and the engine tried each split. Measured: 32k spaces after `{{ no such
+ * element:` took 561ms, quadratic, on the thread that is the whole server.
+ * `MAX_LINE` above exists for the same hazard in `INLINE_LINK`.
+ */
+const UNRENDERED =
+  /([^\S\r\n]?)\{\{[^\S\r\n]*(?:(?:no such element:|undefined value printed:)[^{}]*|[A-Za-z_][\w.]*(?:\[[^\]\r\n]*\])?[^\S\r\n]*)\}\}([^\S\r\n]?)/g;
+
+/**
+ * Drop the failed renders out of generated text.
+ *
+ * Whatever survives is still shown: a description that is half real words and
+ * half a missing field is worth the half that arrived, and one that is nothing
+ * but the failure comes back empty, which callers read as "no description".
+ *
+ * A placeholder with words on both sides leaves one space behind, so the
+ * sentence closes up; one at an edge leaves nothing, so "Written in {{ lang }}."
+ * does not come back with a space before its full stop.
+ */
+export function stripUnrendered(text: string): string {
+  if (!text.includes("{{")) return text;
+  return text
+    .replace(UNRENDERED, (_whole, before: string, after: string) =>
+      before && after ? " " : "",
+    )
+    .trim();
+}
+
+/**
  * The description OpenViking wrote for one file, or `""` if it wrote none.
  *
  * @param overview - The folder's overview document (L1).
@@ -62,10 +120,10 @@ const NAME_CHAR = /[A-Za-z0-9._-]/;
 export function describeFile(overview: string, fileName: string): string {
   if (!overview.trim() || !fileName) return "";
   const lines = overview.split(/\r?\n/);
-  return (
+  return stripUnrendered(
     detailSection(lines, fileName, true) ||
-    detailSection(lines, fileName, false) ||
-    navLine(lines, fileName)
+      detailSection(lines, fileName, false) ||
+      navLine(lines, fileName),
   );
 }
 

@@ -87,6 +87,44 @@ describe("placeholder abstracts are not shown", () => {
   it("treats whitespace as nothing", () => {
     expect(usefulAbstract("   \n  ")).toBe("");
   });
+
+  it("drops a folder abstract that is a template that failed to render", () => {
+    // The other way an abstract arrives saying nothing: Jinja's DebugUndefined
+    // prints the miss instead of raising, so the failure is stored as the
+    // abstract and the pane captioned a folder with it.
+    expect(usefulAbstract("{{ no such element: dict object['task_signature'] }}")).toBe(
+      "",
+    );
+    expect(usefulAbstract("{{ overview }}")).toBe("");
+    expect(
+      usefulAbstract(
+        "# viking://user/jasper/memories/cases\n{{ no such element: dict object['case_name'] }}",
+      ),
+    ).toBe("");
+  });
+
+  it("keeps the half of an abstract that did render", () => {
+    expect(
+      usefulAbstract("Cases for {{ no such element: dict object['x'] }} training."),
+    ).toBe("Cases for training.");
+  });
+
+  it("drops an abstract left as nothing but its title, however many words", () => {
+    // The heading strip used to take one token, so "# cases" counted as
+    // titled-and-empty and "# case index" did not — a rule made of word count.
+    // Either way there is nothing under the title but the folder's own name,
+    // which the page prints above it anyway.
+    expect(usefulAbstract("# cases")).toBe("");
+    expect(usefulAbstract("# case index")).toBe("");
+    expect(usefulAbstract("# case index\n{{ no such element: dict object['x'] }}")).toBe(
+      "",
+    );
+  });
+
+  it("keeps a titled abstract that has something under the title", () => {
+    const real = "# case index\n\nPost-mortems from the 2026-09-08 cron runs.";
+    expect(usefulAbstract(real)).toBe(real);
+  });
 });
 
 describe("the OpenViking timeout budget survives a slow grep", () => {

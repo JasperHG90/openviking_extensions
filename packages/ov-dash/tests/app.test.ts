@@ -326,4 +326,33 @@ describe("search", () => {
     expect(body.hits[0]?.match.meaning).toBeCloseTo(0.81);
     expect(body.hits[0]?.match.exact).toEqual(["vault"]);
   });
+
+  it("does not caption a hit with a template that failed to render", async () => {
+    // OpenViking prints a missing field into the text instead of raising, so
+    // an abstract can arrive as its own error message. A result line reading
+    // "no such element: dict object['task_signature']" helps nobody choose it.
+    stubOv((url) => {
+      if (url.includes("/search/grep")) return { matches: [], count: 0 };
+      return {
+        memories: [],
+        resources: [
+          {
+            uri: "viking://user/memories/cases/mem_079fbe147f15.md",
+            score: 0.7,
+            abstract:
+              "A case about {{ no such element: dict object['task_signature'] }} retries.",
+            overview: null,
+            category: "",
+            match_reason: "",
+          },
+        ],
+        skills: [],
+        total: 1,
+      };
+    });
+
+    const response = await appFor().request("/api/search?q=retries&mode=meaning");
+    const body = (await response.json()) as { hits: { snippet: string }[] };
+    expect(body.hits[0]?.snippet).toBe("A case about retries.");
+  });
 });

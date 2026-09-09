@@ -21,6 +21,7 @@ import type {
 } from "../shared/schemas";
 import type { Config } from "./env";
 import type { KeyResolver } from "./keys";
+import { stripUnrendered } from "./overview";
 
 /** Raised when OpenViking refuses or answers with something unusable. */
 export class OvError extends Error {
@@ -381,6 +382,11 @@ export class OvClient {
    * Same contract as `abstract`: a folder OpenViking has not summarised yet
    * has none, and a page that wanted the descriptions inside it should still
    * render without them.
+   *
+   * Left as written, failed renders and all: this is a document, and the one
+   * caller pulls one file's description out of it and cleans that. Scrubbing
+   * the whole overview here would also scrub `.overview.md` when somebody
+   * opens it to read, which is the one place the failure is worth seeing.
    */
   async overview(uri: string): Promise<string> {
     try {
@@ -631,7 +637,9 @@ export class OvClient {
         name,
         relPath: this.displayPath(item.uri),
         kind: kindOf(name, item.uri.endsWith("/")),
-        snippet: (item.abstract || item.overview || "").slice(0, 400),
+        // Cleaned like a description, because that is what it is: a search hit
+        // captioned with a template's error message helps nobody choose it.
+        snippet: stripUnrendered(item.abstract || item.overview || "").slice(0, 400),
         match: { meaning: item.score, exact: [] },
         score: rankScore(index),
       });
@@ -832,9 +840,21 @@ export async function inBatches<T, R>(
  * abstract is treated as no abstract.
  */
 export function usefulAbstract(text: string): string {
-  const trimmed = text.trim();
+  // A template that failed to render is the other way an abstract arrives
+  // saying nothing. Stripped first, so one that was nothing but the failure
+  // falls into the empty check below rather than reaching a page.
+  const trimmed = stripUnrendered(text).trim();
   if (!trimmed) return "";
-  const withoutHeading = trimmed.replace(/^#\s*\S+\s*/, "").trim();
+  // The whole heading line, not its first word. `/^#\s*\S+\s*/` was enough
+  // while this only fed the two bracket tests below, where a partial strip
+  // could not change the verdict. It decides whether anything shows at all
+  // now, and one token meant "# cases" counted as titled-and-empty while
+  // "# case index" did not — a rule made of word count.
+  const withoutHeading = trimmed.replace(/^#{1,6}[^\n]*\n?/, "").trim();
+  // Nothing under the title. Reached when the body was a placeholder or a
+  // failed render and has just been taken out, leaving an abstract that says
+  // only what the folder is called — which the page prints above it anyway.
+  if (!withoutHeading) return "";
   if (/^\[[^\]]*not ready[^\]]*\]$/i.test(withoutHeading)) return "";
   if (/^\[[^\]]*\]$/.test(withoutHeading)) return "";
   return trimmed;
