@@ -37,6 +37,10 @@ class HybridSettings(BaseSettings):
         Weight of the keyword ranking in the fusion, against 1.0 for vectors.
         Below 1.0 by default: the lexical leg is a corrective for terms the
         embedding misses, not an equal partner.
+    keyword_max_chars : int
+        Characters of the query the keyword leg sees; 0 sends all of them.
+        Bounds a document-sized query, which otherwise matches nearly every
+        row and ranks by length.
     rrf_k : int
         Smoothing constant for the fusion.
     pool_factor : int
@@ -89,6 +93,19 @@ class HybridSettings(BaseSettings):
         default=0.7,
         ge=0.0,
         description="Weight of the keyword ranking in RRF, against 1.0 for vectors.",
+    )
+    keyword_max_chars: int = Field(
+        default=1024,
+        ge=0,
+        description=(
+            "Characters of the query the keyword leg sees; 0 sends all of "
+            "them. An agent pasting a whole document as the query turns the "
+            "lexical leg into a disjunction of every word in it, which matches "
+            "nearly every row and then ranks by length, since the longest "
+            "document matches the most words. Clipping keeps the leg doing its "
+            "job -- catching exact terms the embedding missed. Real queries sit "
+            "far below this, so it is a no-op for them."
+        ),
     )
     rrf_k: int = Field(default=RRF_K, ge=0, description="RRF smoothing constant.")
     pool_factor: int = Field(

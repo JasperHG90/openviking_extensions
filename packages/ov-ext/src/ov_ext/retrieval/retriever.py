@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from contextvars import ContextVar
 from typing import Any
 
@@ -59,6 +60,45 @@ _KEYWORD = "keyword"
 # every concurrent request, so a counter on `self` would have them spending
 # each other's budget. None means no ceiling.
 _rerank_budget: ContextVar[int | None] = ContextVar("ov_ext_rerank_budget", default=None)
+
+# The whitespace-plus-word-tail a clip lands in the middle of, matched so the
+# cut can fall before it rather than through it.
+_TRAILING_FRAGMENT = re.compile(r"\s\S*\Z")
+
+
+def _clip_query(text: str, max_chars: int) -> str:
+    """Cut ``text`` to ``max_chars``, ending on a whole word.
+
+    Parameters
+    ----------
+    text :
+        The query as the caller wrote it.
+    max_chars :
+        Ceiling on the result's length. Zero or less returns ``text``
+        untouched, which is how the setting disables clipping.
+
+    Returns
+    -------
+    str
+        ``text`` itself when it already fits, otherwise a prefix of it no
+        longer than ``max_chars``, ending where a word ends. The trailing
+        partial word is dropped rather than kept: a fragment stems to a lexeme
+        of its own and would match rows the query never mentioned. A single
+        word longer than the ceiling has no such boundary and is cut mid-word.
+    """
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    head = text[:max_chars]
+    # The cut is already clean when the next character starts a new word, or
+    # when the last one taken ended the previous word.
+    if head[-1].isspace() or text[max_chars].isspace():
+        return head.rstrip()
+    # Cut at the whitespace before the fragment rather than rebuilding from
+    # words, so the result stays a prefix of what the caller wrote. Stripped
+    # like the branch above, or a cut landing in a run of spaces would end one
+    # character past the word it promises to end on.
+    boundary = _TRAILING_FRAGMENT.search(head)
+    return head[: boundary.start()].rstrip() if boundary else head
 
 
 class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is untyped
@@ -589,6 +629,9 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
         what a user may see. If it is missing -- an upstream rename -- the
         keyword leg is skipped rather than run unscoped.
 
+        ``text`` is clipped to ``keyword_max_chars`` first. The vector leg can
+        absorb a document-sized query; the lexical leg cannot use one.
+
         Returns
         -------
         list[str]
@@ -602,6 +645,20 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
             annotate({"ov_ext.retrieval.outcome": "backend_lacks_keyword_search"})
             return []
 
+        # 1024 is borrowed from memex's `_MAX_SEED_QUERY_CHARS`, but only the
+        # number is: that bound sits in its NER seed path, where a
+        # document-sized query made entity extraction emit thousands of names
+        # and blew the statement's parameter count. memex's own keyword leg
+        # (`KeywordStrategy` in its `strategies.py`) runs unbounded. The shared
+        # part is the trigger -- an agent passing a whole note as the query.
+        clipped = _clip_query(text, self._settings.keyword_max_chars)
+        if clipped != text:
+            logger.debug(
+                "hybrid: clipped a %d-character query to %d for the keyword leg",
+                len(text),
+                len(clipped),
+            )
+
         try:
             scope = build_scope(
                 ctx=ctx,
@@ -611,7 +668,7 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
                 level=level,
             )
             rows = await search(
-                query=text,
+                query=clipped,
                 limit=pool,
                 filter=scope,
                 output_fields=RETRIEVAL_OUTPUT_FIELDS,

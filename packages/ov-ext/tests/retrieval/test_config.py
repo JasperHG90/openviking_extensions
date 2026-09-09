@@ -68,6 +68,23 @@ def test_an_unrelated_variable_is_ignored(monkeypatch: pytest.MonkeyPatch) -> No
     assert HybridSettings().mmr_lambda == 0.7
 
 
+def test_the_keyword_clip_is_on_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A backstop nobody has to switch on. 1024 is memex's number for its own clip."""
+    assert HybridSettings().keyword_max_chars == 1024
+
+    monkeypatch.setenv(f"{ENV_PREFIX}KEYWORD_MAX_CHARS", "256")
+
+    assert HybridSettings().keyword_max_chars == 256
+
+
+def test_a_negative_keyword_clip_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Zero already means no ceiling, so anything below it is a typo."""
+    monkeypatch.setenv(f"{ENV_PREFIX}KEYWORD_MAX_CHARS", "-1")
+
+    with pytest.raises(ValueError):
+        HybridSettings()
+
+
 def test_explicit_arguments_beat_the_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

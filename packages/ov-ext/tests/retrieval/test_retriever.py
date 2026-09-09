@@ -70,6 +70,7 @@ class FakeStore:
         self._similarity = similarity
         self._keyword_error = keyword_error
         self.keyword_calls = 0
+        self.keyword_queries: list[str] = []
         if similarity is not None:
             self._shared_adapter = _FakeAdapter(similarity)
 
@@ -78,6 +79,7 @@ class FakeStore:
 
     async def search_by_keywords(self, **kwargs: Any) -> list[dict[str, Any]]:
         self.keyword_calls += 1
+        self.keyword_queries.append(str(kwargs.get("query", "")))
         if self._keyword_error is not None:
             raise self._keyword_error
         uris = self._keyword_uris or []
@@ -225,6 +227,59 @@ async def test_an_empty_query_skips_the_keyword_leg() -> None:
     await retriever.retrieve(FakeQuery(query="   "), ctx=None, limit=5)
 
     assert store.keyword_calls == 0
+
+
+async def test_a_document_sized_query_is_clipped_before_the_keyword_leg() -> None:
+    """An agent pasting a whole document must not become a 2000-word disjunction.
+
+    That matches nearly every row, so the leg stops narrowing anything, and
+    the ranking then follows document length rather than relevance.
+    """
+    store = FakeStore(keyword_uris=["b"])
+    retriever = make_retriever(
+        store, [ctx("a"), ctx("b")], mmr_enabled=False, rerank_final=False
+    )
+    # Ten characters per word, so the 1024-character cut lands mid-word and
+    # the boundary logic is actually exercised rather than skipped by luck.
+    words = [f"w{n:04d}zzzz" for n in range(200)]
+    document = " ".join(words)
+
+    await retriever.retrieve(FakeQuery(query=document), ctx=None, limit=5)
+
+    assert len(document) > 1024, "the query has to exceed the default ceiling"
+    sent = store.keyword_queries[0]
+    assert len(sent) <= 1024
+    assert document.startswith(sent), "the clip keeps the head of the query"
+    assert sent.split()[-1] in words, "a fragment matches rows nothing asked for"
+
+
+async def test_a_normal_query_reaches_the_keyword_leg_untouched() -> None:
+    """The clip is a safety valve; every real query has to pass through whole."""
+    store = FakeStore(keyword_uris=["b"])
+    retriever = make_retriever(
+        store, [ctx("a"), ctx("b")], mmr_enabled=False, rerank_final=False
+    )
+
+    await retriever.retrieve(FakeQuery(query="vault policy rotation"), ctx=None, limit=5)
+
+    assert store.keyword_queries == ["vault policy rotation"]
+
+
+async def test_the_clip_can_be_turned_off() -> None:
+    """Zero means send it all, the way the rerank ceilings read zero."""
+    store = FakeStore(keyword_uris=["b"])
+    retriever = make_retriever(
+        store,
+        [ctx("a"), ctx("b")],
+        mmr_enabled=False,
+        rerank_final=False,
+        keyword_max_chars=0,
+    )
+    document = " ".join(f"word{n}" for n in range(500))
+
+    await retriever.retrieve(FakeQuery(query=document), ctx=None, limit=5)
+
+    assert store.keyword_queries == [document]
 
 
 async def test_disabling_the_keyword_leg_skips_the_query_entirely() -> None:

@@ -158,6 +158,7 @@ OV_RETRIEVAL_MMR_LAMBDA=0.5 ov-ext-server --config /etc/ov.conf
 |---|---|---|
 | `OV_RETRIEVAL_KEYWORD_ENABLED` | `true` | Run the lexical leg and fuse it in |
 | `OV_RETRIEVAL_KEYWORD_WEIGHT` | `0.7` | Weight of the keyword ranking, against `1.0` for vectors |
+| `OV_RETRIEVAL_KEYWORD_MAX_CHARS` | `1024` (`0` sends all) | Characters of the query the keyword leg sees |
 | `OV_RETRIEVAL_RRF_K` | `60` | RRF smoothing; lower sharpens the preference for rank 1 |
 | `OV_RETRIEVAL_POOL_FACTOR` | `4` | Candidates gathered per requested result before re-ranking |
 | `OV_RETRIEVAL_MMR_ENABLED` | `true` | Apply the diversity pass |
