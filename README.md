@@ -27,7 +27,7 @@ packages/
   ov-clip/         Firefox extension (npm, its own toolchain)
 ```
 
-Two of the four Python packages — `ov-postgres` and `ov-retrieval` — are members of a single [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/): one `uv.lock` and one `.venv` at the root cover both. `ovx` and `ov-skills` stand alone, each with a lock and a `.venv` of its own. Packages in other languages live under `packages/` beside them with their own toolchains.
+Two of the four Python packages — `ov-postgres` and `ov-ext` — are members of a single [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/): one `uv.lock` and one `.venv` at the root cover both. `ovx` and `ov-skills` stand alone, each with a lock and a `.venv` of its own. Packages in other languages live under `packages/` beside them with their own toolchains.
 
 They stand alone because a workspace resolves one Python floor across every member: `ovx` needs 3.11+ for `tomllib` while `ov-postgres` still supports 3.10. `ov-skills` ships markdown and a bash installer rather than Python, but its tests need 3.11+ too, so it carries a `pyproject.toml` of its own and stays out for the same reason. The root `pyproject.toml` names both in `exclude`, which stops uv adopting them when a command runs inside their directories.
 
@@ -38,7 +38,7 @@ uv sync --all-packages             # the two workspace members, with their dev g
 uvx prek@0.2.25 run --all-files    # ruff, mypy, and the Python suites
 ```
 
-`--all-packages` reaches the workspace and stops there, so it installs `ov-postgres` and `ov-retrieval` only. `ovx` and `ov-skills` build their own environments the first time you `uv run --directory` into them.
+`--all-packages` reaches the workspace and stops there, so it installs `ov-postgres` and `ov-ext` only. `ovx` and `ov-skills` build their own environments the first time you `uv run --directory` into them.
 
 `prek` covers the Python packages on a bare checkout, but not the Node ones. Its six Node hooks shell out to each package's own `node_modules`, which nothing at the root installs, so until you have run `npm install` there they fail on a missing `biome` rather than on anything about the code. CI's repo-wide job skips them by name for that reason and runs them in the Node template instead, with the package's pinned toolchain.
 
@@ -59,7 +59,7 @@ One workflow, [`ci.yaml`](.github/workflows/ci.yaml), covers the repo: repo-wide
 
 | Template | Packages | What it runs |
 | --- | --- | --- |
-| [`template-check.yaml`](.github/workflows/template-check.yaml) | `ov-postgres`, `ov-retrieval`, `ovx` | The suite on the floor its `requires-python` names and on the newest interpreter, then builds a wheel and checks it installs and imports on its own. |
+| [`template-check.yaml`](.github/workflows/template-check.yaml) | `ov-postgres`, `ov-ext`, `ovx` | The suite on the floor its `requires-python` names and on the newest interpreter, then builds a wheel and checks it installs and imports on its own. |
 | [`template-check-shell.yaml`](.github/workflows/template-check-shell.yaml) | `ov-skills` | The suite on both Ubuntu and macOS, since macOS still ships bash 3.2 and rejects syntax every other bash accepts. |
 | [`template-check-node.yaml`](.github/workflows/template-check-node.yaml) | `ov-dash`, `ov-clip` | Type-check, lint and tests against the `node_modules` it installs — the gates the repo-wide job cannot run — then builds whatever the package ships: a container where there is a `Dockerfile`, an extension where there is a `manifest.json`. |
 
