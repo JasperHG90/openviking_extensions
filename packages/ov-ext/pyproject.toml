@@ -127,7 +127,7 @@ ignore_missing_imports = true
 # fails; without this the type check passes locally, where an editable install
 # has generated the file, and fails in CI, where nothing has. ov-postgres
 # carries the same override for the same reason.
-module = ["ov_retrieval._version"]
+module = ["ov_ext._version"]
 ignore_missing_imports = true
 
 [tool.uv.sources]
