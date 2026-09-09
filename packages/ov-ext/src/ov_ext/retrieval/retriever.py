@@ -9,7 +9,15 @@ one of those behaviours by construction.
 What this adds around it:
 
 1. a keyword search over the same scope, fused with the vector ranking by RRF;
-2. an MMR pass over the fused pool, so near-duplicates do not fill the answer.
+2. a bound on what reranking costs -- a ceiling on calls during the descent,
+   and a cap on the documents any one call sends;
+3. one final rerank over the fused pool, the only pass that scores every
+   candidate against the same query at the same time;
+4. an MMR pass over that pool, so near-duplicates do not fill the answer.
+
+The order of 3 and 4 is load-bearing. ``mmr_select`` reads relevance from a
+candidate's position rather than its score, so reranking after diversifying
+would undo the diversity pass without saying so.
 
 Every addition degrades to "do nothing" rather than to an error. A backend with
 no keyword search, no pairwise similarity, or an OpenViking whose internals have
@@ -98,6 +106,13 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
             At most ``limit`` matched contexts.
         """
         settings = self._settings
+        # `rerank_final` is deliberately absent from this test. It reads a
+        # wider pool happily when one of the passes below has already asked
+        # for it, but it must not ask on its own: a larger `limit` does not
+        # merely truncate later upstream, it widens every child search and
+        # makes the descent's convergence check harder to satisfy, so the walk
+        # visits more directories and reranks in more of them. A pass added to
+        # cut rerank cost cannot pay for itself by lengthening the descent.
         active = settings.keyword_enabled or (
             settings.mmr_enabled and settings.mmr_lambda < 1.0
         )
@@ -158,6 +173,12 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
                 target_directories=getattr(query, "target_directories", None),
             )
 
+        # Before the diversity pass, never after: `mmr_select` reads relevance
+        # from a candidate's position rather than its score, so reranking
+        # afterwards would silently undo the diversification it just did.
+        if settings.rerank_final and text:
+            contexts = await self._rerank_pool(contexts, text=text)
+
         if settings.mmr_enabled and settings.mmr_lambda < 1.0:
             contexts = await self._diversify(contexts, limit=limit)
 
@@ -176,8 +197,10 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
 
         The base retriever calls this once per directory the descent visits,
         serially, and caps neither the calls nor the directories. On a wide
-        tree that is hundreds of round trips for one search. This adds the
-        ceiling ``rerank_max_calls`` and otherwise defers entirely.
+        tree that is hundreds of round trips for one search. This adds two
+        bounds and otherwise defers entirely: the ceiling ``rerank_max_calls``
+        on how many calls a retrieval may make, and ``rerank_max_documents``
+        on how many documents any one of them sends.
 
         Exhausting the budget returns ``fallback_scores`` -- the vector
         ordering -- which is the same degradation the base class already
@@ -219,11 +242,146 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
                 return fallback_scores
             _rerank_budget.set(remaining - 1)
 
-        scores: list[float] = await super()._rerank_scores(
-            query, documents, fallback_scores
-        )
+        scores = await self._capped_rerank(query, documents, fallback_scores)
         annotate({"ov_ext.retrieval.outcome": "reranked"})
         return scores
+
+    async def _capped_rerank(
+        self,
+        query: str,
+        documents: list[str],
+        fallback_scores: list[float],
+    ) -> list[float]:
+        """Rerank at most ``rerank_max_documents`` of a batch, best first.
+
+        The reranker charges by the document, not by the call: it scores a few
+        query-document pairs per pass through the model, so what a search
+        spends is very nearly the number of documents it sends. Sending only
+        the candidates vector search already ranked plausibly is therefore the
+        cheapest way to buy back latency without giving up the cross-encoder.
+
+        The candidates that miss the cut **keep their vector scores and stay in
+        the running**. That is the base class's own merge -- it starts from
+        ``fallback_scores`` and overwrites only what it scored -- so nothing is
+        dropped and no invented scale appears. The honest caveat is that the
+        result mixes two scales, and a strong vector score can outrank a weak
+        rerank score. Upstream already mixes them for documents it skips, so
+        this widens an existing looseness rather than introducing one.
+
+        Parameters
+        ----------
+        query :
+            Query text handed to the rerank model.
+        documents :
+            Candidate texts, in the batch's own order.
+        fallback_scores :
+            Vector scores, used to choose what to send and kept by the rest.
+
+        Returns
+        -------
+        list[float]
+            One score per input document, in the input order.
+        """
+        cap = self._settings.rerank_max_documents
+        if not cap or len(documents) <= cap:
+            annotate({"ov_ext.retrieval.reranked_documents": len(documents)})
+            scores: list[float] = await super()._rerank_scores(
+                query, documents, fallback_scores
+            )
+            return scores
+
+        # Pick by vector score, then restore the batch's own order before
+        # sending. The reranker scores each pair independently, so order
+        # cannot change a score -- but it keeps the request, the span and the
+        # service's logs reading the same way as an uncapped one.
+        chosen = sorted(
+            range(len(documents)),
+            key=lambda index: fallback_scores[index],
+            reverse=True,
+        )[:cap]
+        chosen.sort()
+
+        capped: list[float] = await super()._rerank_scores(
+            query,
+            [documents[index] for index in chosen],
+            [fallback_scores[index] for index in chosen],
+        )
+        merged = list(fallback_scores)
+        for index, score in zip(chosen, capped, strict=True):
+            merged[index] = score
+        annotate(
+            {
+                "ov_ext.retrieval.reranked_documents": len(chosen),
+                "ov_ext.retrieval.held_back_documents": len(documents) - len(chosen),
+            }
+        )
+        return merged
+
+    @traced("ov_ext.retrieval.rerank_pool")
+    async def _rerank_pool(
+        self, contexts: list[MatchedContext], *, text: str
+    ) -> list[MatchedContext]:
+        """Reorder the whole pool by one more cross-encoder pass.
+
+        The descent scores candidates as it meets them, a directory of siblings
+        at a time, and never sees the pool it ends up with. Two kinds of
+        candidate therefore arrive unjudged: the ones the keyword leg promoted,
+        which no reranker looked at, and the ones a spent call ceiling or
+        document cap left on their vector scores. This is the single pass that
+        scores them all against each other.
+
+        Deliberately not charged against ``rerank_max_calls``. That ceiling
+        exists to bound a descent whose length nobody chose; this call is one
+        the caller asked for. Charging it to the same budget would mean a tight
+        ceiling silently dropped the pass that makes the ceiling affordable.
+
+        Degrades to the input order whenever the base class declines to score
+        -- no rerank client, a service error, an odd-length answer -- because
+        the fused order is already a usable ranking.
+
+        Parameters
+        ----------
+        contexts :
+            The fused pool, in the order fusion left it.
+        text :
+            Query text handed to the rerank model.
+
+        Returns
+        -------
+        list[MatchedContext]
+            The same contexts, best first. Unchanged when nothing scored.
+        """
+        documents = [context.abstract or "" for context in contexts]
+        annotate({"ov_ext.retrieval.candidates": len(contexts)})
+        # The same guard the per-directory path uses: a pool with no text to
+        # judge would cost a round trip to learn nothing.
+        if not any(document.strip() for document in documents):
+            annotate({"ov_ext.retrieval.outcome": "nothing_to_rerank"})
+            return contexts
+
+        scores = await self._capped_rerank(
+            text, documents, [context.score for context in contexts]
+        )
+        if len(scores) != len(contexts):
+            # The base class promises this cannot happen. It costs one
+            # comparison not to reorder the pool by a mismatched list if it
+            # ever does.
+            logger.warning(
+                "hybrid: rerank returned %d scores for %d candidates; keeping order",
+                len(scores),
+                len(contexts),
+            )
+            annotate({"ov_ext.retrieval.outcome": "score_count_mismatch"})
+            return contexts
+
+        # Sort indexes rather than pairs: a tie would otherwise fall through to
+        # comparing MatchedContext, which is not orderable. Python's sort is
+        # stable, so ties keep the order fusion chose.
+        order = sorted(
+            range(len(contexts)), key=lambda index: scores[index], reverse=True
+        )
+        annotate({"ov_ext.retrieval.outcome": "reranked"})
+        return [contexts[index] for index in order]
 
     @classmethod
     def _stored_uri(cls, context: MatchedContext) -> str:

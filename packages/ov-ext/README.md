@@ -35,6 +35,11 @@ redundancy. Both algorithms are ported from
 [memex](https://github.com/JasperHG90/memex), whose retrieval engine already
 runs them.
 
+There is a third gap, and it is one of cost rather than quality: OpenViking
+reranks once per directory it descends into, with no bound on either the calls
+or the documents they carry, which is most of what a slow search is spending.
+[Rerank cost](#rerank-cost) covers what this package does about that.
+
 ## Why RRF rather than a weighted sum
 
 A cosine distance and a `ts_rank_cd` value are not comparable quantities, and
@@ -159,6 +164,13 @@ OV_RETRIEVAL_MMR_LAMBDA=0.5 ov-ext-server --config /etc/ov.conf
 | `OV_RETRIEVAL_MMR_LAMBDA` | `0.7` | Relevance against novelty; `1.0` disables diversity |
 | `OV_RETRIEVAL_MMR_EMBEDDING_WEIGHT` | `0.6` | Weight of embedding cosine in the similarity blend |
 | `OV_RETRIEVAL_MMR_ENTITY_WEIGHT` | `0.4` | Weight of tag overlap in the same blend |
+| `OV_RETRIEVAL_RERANK_POOLING` | `true` | Route rerank calls through one pooled connection |
+| `OV_RETRIEVAL_RERANK_MAX_CALLS` | `0` (no limit) | Cap rerank calls during the descent |
+| `OV_RETRIEVAL_RERANK_MAX_DOCUMENTS` | `0` (no limit) | Cap documents sent in any one call |
+| `OV_RETRIEVAL_RERANK_FINAL` | `true` | Rerank the pool once after fusion, before diversifying |
+
+The four rerank settings are the ones worth understanding before touching, and
+[Rerank cost](#rerank-cost) explains what each trades away.
 
 A misspelled variable is **refused at startup**, naming the settings that do
 exist. Silently ignoring it would leave you tuning a knob connected to nothing.
@@ -205,13 +217,26 @@ so `result_count` reads high by up to this factor.
 ### Turning it off without uninstalling
 
 ```bash
-OV_RETRIEVAL_KEYWORD_ENABLED=false OV_RETRIEVAL_MMR_ENABLED=false
+OV_RETRIEVAL_KEYWORD_ENABLED=false OV_RETRIEVAL_MMR_ENABLED=false \
+OV_RETRIEVAL_RERANK_FINAL=false
 ```
 
-Both off makes the package a genuine no-op: no keyword query is issued, no
-similarity matrix is computed, and no over-fetch happens — retrieval behaves
-exactly as it would without this installed. Useful while a collection is still
-backfilling its bodies, or to A/B a ranking complaint.
+All three off makes the package a genuine no-op for *results*: no keyword query
+is issued, no similarity matrix is computed, no extra rerank call goes out, and
+no over-fetch happens — retrieval returns exactly what it would without this
+installed. Useful while a collection is still backfilling its bodies, or to A/B
+a ranking complaint.
+
+`RERANK_FINAL` has to be in that list. It defaults on and costs one rerank call
+per search, so leaving it out gives you a quieter package rather than an absent
+one.
+
+Two settings are deliberately not in it. `RERANK_MAX_CALLS` and
+`RERANK_MAX_DOCUMENTS` default to no limit, so they already change nothing.
+`RERANK_POOLING` stays on: it swaps the transport underneath OpenViking's
+rerank client without touching what that client sends or how its answers are
+read, so it cannot move a result. Set it to `false` too if you want the process
+untouched as well as the ranking.
 
 ## Rerank cost
 
@@ -225,18 +250,60 @@ every call paid a fresh TCP and TLS handshake. Against a LAN rerank service,
 calls it answered in about 5 ms came back in 15–30 ms: the handshake cost more
 than the inference.
 
-Two settings address that:
+Four settings address that:
 
 | Setting | Default | Does |
 |---|---|---|
 | `OV_RETRIEVAL_RERANK_POOLING` | `true` | Routes rerank calls through one pooled connection and adds a `traceparent` header |
-| `OV_RETRIEVAL_RERANK_MAX_CALLS` | `0` (no limit) | Caps rerank calls per retrieval |
+| `OV_RETRIEVAL_RERANK_MAX_CALLS` | `0` (no limit) | Caps rerank calls during the descent |
+| `OV_RETRIEVAL_RERANK_MAX_DOCUMENTS` | `0` (no limit) | Caps documents sent in any one call |
+| `OV_RETRIEVAL_RERANK_FINAL` | `true` | Reranks the pool once after fusion, before diversifying |
 
-Past the cap, candidates keep their vector scores — the same degradation
+Past either cap, candidates keep their vector scores — the same degradation
 OpenViking already applies when reranking fails, so the worst case is a ranking
 it considers acceptable rather than an error. The `ov_ext.retrieval.rerank` span
-records `rerank_budget_spent` when it bites, because a search that quietly
-stopped reranking half way looks exactly like one that never had a reranker.
+records `rerank_budget_spent` when the call ceiling bites, because a search that
+quietly stopped reranking half way looks exactly like one that never had a
+reranker; `reranked_documents` and `held_back_documents` record the other cap.
+
+### Which cap to reach for
+
+Prefer `RERANK_MAX_DOCUMENTS` to a low `RERANK_MAX_CALLS`. A reranker charges
+by the document — it scores a few query-document pairs per pass through the
+model — so what a search spends is very nearly how many documents it sends, and
+the two caps buy that budget differently. A low call ceiling reranks the first
+few directories properly and the rest not at all. The same budget spread as a
+per-call document cap reranks *at every level of the descent*, which is where
+OpenViking intends the cross-encoder to earn its keep: a wrong prune high in the
+tree is one nothing downstream can undo.
+
+Candidates that miss the cut keep their vector scores and stay in the running.
+The honest caveat is that the result then mixes two scales, and a strong vector
+score can outrank a weak rerank score. Upstream already mixes them for documents
+it skips, so this widens an existing looseness rather than introducing one.
+
+### The final pass
+
+`RERANK_FINAL` adds one call after fusion. It exists because nothing else ever
+scores the pool *as a whole*: the descent judges a directory of siblings at a
+time, so the candidates the keyword leg promoted, and any left on vector scores
+by a cap, reach the answer unjudged.
+
+It runs before the diversity pass, and that order is load-bearing —
+`mmr_select` reads relevance from a candidate's position rather than its score,
+so reranking afterwards would undo the diversification without saying so.
+
+It is deliberately **not** charged against `RERANK_MAX_CALLS`: that ceiling
+bounds a descent whose length nobody chose, while this is one call the caller
+asked for. Charging both to one budget would let a tight ceiling silently drop
+the pass that makes the ceiling affordable.
+
+It also never widens the pool on its own. A larger `limit` does not merely
+truncate later upstream — it widens every child search and makes the descent's
+convergence check harder to satisfy, so the walk visits more directories and
+reranks in more of them. A pass added to cut rerank cost must not pay for itself
+by lengthening the descent. With the keyword or diversity pass on, the pool is
+already wide and the final rerank reads it for free.
 
 Two details of the pooling worth knowing:
 
@@ -257,9 +324,18 @@ Two details of the pooling worth knowing:
   this with a pool of 2 and four rounds of eight concurrent calls.
 
 What this does **not** fix: the calls are still one per directory and still
-serial. Batching a whole round into one call, or issuing them concurrently,
-means overriding `_recursive_search` and copying the descent logic this package
-exists to avoid reimplementing. Both belong upstream.
+serial, and nothing here bounds how many directories the descent visits.
+Changing either means overriding `_recursive_search` and copying the descent
+logic this package exists to avoid reimplementing, so both belong upstream.
+
+Worth knowing before reaching for concurrency there: issuing a round's calls in
+parallel is not the win it looks like when the rerank service is one you host.
+It re-batches whatever arrives into its own small groups — embark's
+`rerank_batch_size` is 4 — so four concurrent calls and four serial ones queue
+the same number of passes through the same model, and the concurrent version
+adds contention. Merging a round into one request is the better shape, and it
+buys round-trips rather than inference. The number that moves is the document
+count, which is what `RERANK_MAX_DOCUMENTS` exists to control.
 
 ## Tracing
 

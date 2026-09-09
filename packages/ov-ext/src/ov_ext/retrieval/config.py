@@ -129,10 +129,36 @@ class HybridSettings(BaseSettings):
         default=0,
         ge=0,
         description=(
-            "Ceiling on rerank calls per retrieval; 0 removes the ceiling. "
-            "Past it, candidates keep their vector scores -- the same "
-            "degradation OpenViking already applies when reranking fails. "
-            "Bounds the tail on a wide tree, where the descent has no cap of "
-            "its own on how many directories it visits."
+            "Ceiling on rerank calls during hierarchical descent; 0 removes "
+            "the ceiling. Past it, candidates keep their vector scores -- the "
+            "same degradation OpenViking already applies when reranking "
+            "fails. Bounds the tail on a wide tree, where the descent has no "
+            "cap of its own on how many directories it visits. The "
+            "``rerank_final`` pass is not charged against it."
+        ),
+    )
+    rerank_max_documents: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Documents sent to the reranker in any one call; 0 sends all of "
+            "them. The rest keep their vector scores and stay in the running. "
+            "Cost is near-linear in documents, because the service batches "
+            "them a few pairs at a time, so this is the knob that decides "
+            "what a search spends. Prefer it to a low ``rerank_max_calls``: "
+            "the same budget spread thinly over many directories reranks at "
+            "every level of the descent, where a low call ceiling reranks the "
+            "first few directories well and the rest not at all."
+        ),
+    )
+    rerank_final: bool = Field(
+        default=True,
+        description=(
+            "Rerank the pool once more, after fusion and before the diversity "
+            "pass. The descent scores candidates as it meets them, one "
+            "directory at a time, so nothing has ever scored the pool as a "
+            "whole -- not the candidates the keyword leg promoted, and not "
+            "the ones a spent call ceiling left on their vector scores. One "
+            "call, and the last word on relevance."
         ),
     )
