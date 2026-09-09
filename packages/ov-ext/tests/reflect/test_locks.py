@@ -110,9 +110,7 @@ def test_build_lock_refuses_when_no_lock_was_chosen() -> None:
 
 def test_build_lock_returns_what_was_asked_for() -> None:
     assert isinstance(build_lock(settings(lock=LockKind.PROCESS)), ProcessLock)
-    postgres = build_lock(
-        settings(lock=LockKind.POSTGRES, lock_dsn="postgresql://x/y")
-    )
+    postgres = build_lock(settings(lock=LockKind.POSTGRES, lock_dsn="postgresql://x/y"))
     assert isinstance(postgres, PostgresAdvisoryLock)
 
 

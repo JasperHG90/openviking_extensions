@@ -46,6 +46,7 @@ from ov_ext.reflect.models import (  # noqa: E402
     Observation,
     ProposedObservations,
 )
+from ov_ext.reflect.locks import ProcessLock
 from ov_ext.reflect.runner import run_sweep  # noqa: E402
 from ov_ext.reflect.viking import VikingStore  # noqa: E402
 from ov_ext.reflect.watermark import Watermark  # noqa: E402
@@ -443,7 +444,13 @@ async def test_a_sweep_writes_an_observation_and_remembers_where_it_got_to(
     llm = FakeLLM([proposal(), Contradictions(relationships=[])])
 
     report = await run_sweep(
-        viking_fs, backend, ctx(), settings(), llm=llm, now=datetime.now(timezone.utc)
+        viking_fs,
+        backend,
+        ctx(),
+        settings(),
+        llm=llm,
+        now=datetime.now(timezone.utc),
+        lock=ProcessLock(),
     )
 
     assert report.written == 1
@@ -464,6 +471,7 @@ async def test_a_sweep_writes_an_observation_and_remembers_where_it_got_to(
         settings(),
         llm=FakeLLM([]),
         now=datetime.now(timezone.utc),
+        lock=ProcessLock(),
     )
     assert again.batches == 0
     await backend.close()
@@ -641,33 +649,113 @@ async def test_two_concurrent_sweeps_produce_one_sweep(
 ) -> None:
     """The guarantee where it matters: at the watermark.
 
-    Both sweeps are handed a model that would write an observation. Without the
-    lock both write, both advance the mark, and each consumes work the other was
-    half-way through. With it, exactly one runs.
+    Both callers are handed a model that would write an observation. Without
+    the lock both write, both advance the mark, and each consumes work the
+    other was half-way through. With it, exactly one runs -- and the loser
+    reports nothing rather than failing, which is what a follower should do.
     """
     from ov_ext.reflect.locks import PostgresAdvisoryLock
 
     when = datetime(2026, 9, 5, tzinfo=timezone.utc)
     await seed(backend, when)
 
-    async def sweep_under_lock() -> bool:
-        lock = PostgresAdvisoryLock(postgres_dsn)
-        async with lock.acquire() as held:
-            if not held:
-                return False
-            await run_sweep(
-                viking_fs,
-                backend,
-                ctx(),
-                settings(),
-                llm=FakeLLM([proposal(), Contradictions(relationships=[])]),
-                now=datetime.now(timezone.utc),
-            )
-            return True
+    async def sweep() -> Any:
+        # A lock of its own, so this is two independent processes as far as
+        # Postgres is concerned -- not two callers sharing one object.
+        return await run_sweep(
+            viking_fs,
+            backend,
+            ctx(),
+            settings(),
+            lock=PostgresAdvisoryLock(postgres_dsn),
+            llm=FakeLLM([proposal(), Contradictions(relationships=[])]),
+            now=datetime.now(timezone.utc),
+        )
 
-    ran = await asyncio.gather(sweep_under_lock(), sweep_under_lock())
+    first, second = await asyncio.gather(sweep(), sweep())
 
-    assert sorted(ran) == [False, True], "exactly one sweep should have run"
-    written = await viking_fs.ls(f"viking://user/{USER}/memories/observations", ctx=ctx())
-    assert len(written) == 1
+    written = sorted([first.written, second.written])
+    assert written == [0, 1], "exactly one sweep should have written"
+    on_disk = await viking_fs.ls(f"viking://user/{USER}/memories/observations", ctx=ctx())
+    assert len(on_disk) == 1
     await backend.close()
+
+
+async def test_a_sweep_whose_lock_connection_is_reaped_is_cancelled(
+    postgres_dsn: str,
+) -> None:
+    """The hole the review found, and the heartbeat that closes it.
+
+    The lock connection is idle for the whole sweep, which is what a reaper
+    acts on. Before the heartbeat, `idle_session_timeout` dropped it mid-sweep
+    and a second caller took the lock while the first was still going -- the
+    exact double-sweep the TTL argument rejects Redis for.
+
+    The lock now disables the timeout for its own session, so this test forces
+    the loss the other way, by terminating the backend. What must happen is not
+    that the lock survives, but that the sweep holding it stops.
+    """
+    import psycopg
+
+    from ov_ext.reflect.locks import PostgresAdvisoryLock
+
+    lock = PostgresAdvisoryLock(postgres_dsn, heartbeat_seconds=0.2)
+    swept_on = False
+
+    async def sweep_under_lock() -> None:
+        nonlocal swept_on
+        async with lock.acquire() as held:
+            assert held is True
+            await asyncio.sleep(3)
+            # Only reached if nothing stopped us after the lock was lost.
+            swept_on = True
+
+    task = asyncio.create_task(sweep_under_lock())
+    await asyncio.sleep(0.5)
+
+    # Kill every backend but our own that holds this key, the way a failover or
+    # an admin would.
+    killer = psycopg.connect(postgres_dsn, autocommit=True)
+    with killer.cursor() as cur:
+        cur.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_locks "
+            "WHERE locktype = 'advisory' AND pid <> pg_backend_pid()"
+        )
+    killer.close()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert swept_on is False, "the sweep must stop when its lock is gone"
+
+
+async def test_the_lock_session_refuses_to_be_reaped_for_being_idle(
+    postgres_dsn: str,
+) -> None:
+    """Prevention, not just detection.
+
+    With `idle_session_timeout` left alone, a sweep longer than the server's
+    timeout loses its lock. The lock sets the timeout to 0 for its own session,
+    so a long sweep keeps it.
+    """
+    import psycopg
+
+    from ov_ext.reflect.locks import PostgresAdvisoryLock
+
+    admin = psycopg.connect(postgres_dsn, autocommit=True)
+    with admin.cursor() as cur:
+        cur.execute("ALTER SYSTEM SET idle_session_timeout = '400ms'")
+        cur.execute("SELECT pg_reload_conf()")
+    try:
+        lock = PostgresAdvisoryLock(postgres_dsn, heartbeat_seconds=5)
+        async with lock.acquire() as held:
+            assert held is True
+            # Several times the server's timeout, with the connection idle.
+            await asyncio.sleep(1.5)
+            async with PostgresAdvisoryLock(postgres_dsn).acquire() as other:
+                assert other is False, "the lock was reaped mid-sweep"
+    finally:
+        with admin.cursor() as cur:
+            cur.execute("ALTER SYSTEM RESET idle_session_timeout")
+            cur.execute("SELECT pg_reload_conf()")
+        admin.close()

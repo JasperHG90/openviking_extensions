@@ -22,6 +22,7 @@ from typing import Any
 
 from .config import ReflectSettings
 from .engine import ReflectionEngine, SweepReport
+from .locks import SweepLock
 from .ports import StructuredLLM
 from .viking import VikingLLM, VikingStore
 from .watermark import Watermark
@@ -42,10 +43,16 @@ async def run_sweep(
     ctx: Any,
     settings: ReflectSettings | None = None,
     *,
+    lock: SweepLock,
     llm: StructuredLLM | None = None,
     now: datetime | None = None,
 ) -> SweepReport:
-    """Load the watermark, sweep, and store the mark the sweep reached.
+    """Load the watermark, sweep under ``lock``, and store the mark it reached.
+
+    The lock is required and keyword-only, so there is no way to sweep
+    unlocked -- not by forgetting an argument, and not by calling this instead
+    of the ticker. A caller that already holds the lock (the ticker does)
+    passes one that grants immediately.
 
     Parameters
     ----------
@@ -57,6 +64,10 @@ async def run_sweep(
         Request context carrying the user and their permissions.
     settings :
         Behaviour toggles. Read from the environment when omitted.
+    lock :
+        Held for the duration of the sweep. Returns an empty report without
+        sweeping when it cannot be taken, which is what a second caller should
+        do rather than run beside the first.
     llm :
         The model. Defaults to OpenViking's configured one; injectable so a
         test can run the whole path without a provider, and so a caller can
@@ -68,10 +79,26 @@ async def run_sweep(
     Returns
     -------
     SweepReport
-        What the sweep did. A disabled or dry-run sweep returns a report and
-        stores nothing.
+        What the sweep did. A disabled sweep, a dry-run one, and one that could
+        not take the lock all return a report and store nothing.
     """
     resolved = settings or ReflectSettings()
+    async with lock.acquire() as held:
+        if not held:
+            logger.debug("ov-ext reflect: sweep lock held elsewhere; not sweeping")
+            return SweepReport()
+        return await _sweep_once(viking_fs, vikingdb, ctx, resolved, llm, now)
+
+
+async def _sweep_once(
+    viking_fs: Any,
+    vikingdb: Any,
+    ctx: Any,
+    resolved: ReflectSettings,
+    llm: StructuredLLM | None,
+    now: datetime | None,
+) -> SweepReport:
+    """One sweep, with the lock already held by the caller."""
     store = VikingStore(viking_fs, vikingdb, ctx, resolved)
     engine = ReflectionEngine(store, llm or VikingLLM(), resolved)
     state_uri = _expand(resolved.state_path, ctx.user.user_id)

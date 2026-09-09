@@ -337,6 +337,26 @@ and closed after it. That lock is **session-scoped**: a crashed process, a
 killed container or a severed network drops the connection and the lock goes
 with it — no TTL to tune, no clock to trust, no lease to renew.
 
+Session-scoped is not the same as sweep-scoped, though, and the difference bit.
+The lock connection sits idle for the whole sweep — everything the sweep does
+goes through OpenViking — and an idle connection is what a database reaps.
+Measured against a real server with `idle_session_timeout = 1500ms` and a
+four-second sweep, a second caller took the lock mid-sweep. So the lock also:
+
+- sets `idle_session_timeout = 0` for its own session, so the server's reaper
+  leaves it alone however long the sweep runs; and
+- pings the connection every few seconds, cancelling the sweep if the ping
+  fails — a lock that is gone means the sweep holding it must stop, not finish
+  unprotected. The exposure is bounded by the heartbeat, not by sweep length.
+
+Two constraints follow, and they are load-bearing:
+
+- the DSN must be a **direct** connection, not PgBouncer in transaction mode —
+  that hands each statement a different backend, which makes a session lock
+  meaningless;
+- every sweeper must name the **same database**. Advisory locks are scoped per
+  database, so two DSNs differing only in database name both grant the lock.
+
 **Why not Redis.** A `SET NX PX` lock expires on a timer, so a holder that
 stalls past its TTL — a GC pause, an IO stall, a frozen VM — loses the lock
 while still believing it holds it, and a second sweeper starts. Closing that
@@ -345,12 +365,14 @@ validates nothing, so there is no token to fence with. Redlock does not fix it.
 Redis would give you a lock that usually works; Postgres gives you one that is
 correct.
 
-The cost of choosing safety is liveness: a holder that is *alive but wedged*
-keeps its connection, keeps the lock, and nothing sweeps until it is killed.
-That is the right trade here — a sweep that does not happen this hour is
-recoverable; one that happens twice corrupts the watermark.
+The remaining cost is liveness: a holder that is alive, connected and wedged
+keeps the lock, and nothing sweeps until it is killed. That is the right trade
+here — a sweep that does not happen this hour is recoverable; one that happens
+twice corrupts the watermark.
 
-`run_sweep(fs, db, ctx)` still runs exactly one sweep, for a script or a test.
+`run_sweep(fs, db, ctx, lock=...)` runs exactly one sweep, for a script or a
+test. The lock is a **required keyword argument** there too: locking lives on
+the one path every sweep goes through, so there is no second, unlocked way in.
 
 | Variable | Default | What it does |
 |---|---|---|
@@ -367,6 +389,7 @@ recoverable; one that happens twice corrupts the watermark.
 | `OV_REFLECT_LOCK` | *(none)* | `process` or `postgres`. Required — there is no default |
 | `OV_REFLECT_LOCK_DSN` | — | Where to take the advisory lock, required by `postgres` |
 | `OV_REFLECT_USER_ID` | *(none)* | Whose memories to reflect on. Required when enabled |
+| `OV_REFLECT_HEARTBEAT` | `5` | Seconds between lock-connection liveness checks |
 | `OV_REFLECT_ACCOUNT_ID` | `default` | Account the sweep's context belongs to |
 | `OV_REFLECT_OBSERVATIONS_ROOT` | `viking://~/memories/observations` | Where observations are written |
 | `OV_REFLECT_STATE_PATH` | `viking://~/resources/reflect/watermark.json` | Where the watermark lives |

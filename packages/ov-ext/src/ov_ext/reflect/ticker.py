@@ -88,9 +88,10 @@ async def run_ticker(
 
     while True:
         try:
-            async with lock.acquire() as held:
-                if held:
-                    await run_sweep(viking_fs, vikingdb, ctx, resolved, llm=llm)
+            # The lock goes to run_sweep rather than being taken here, so the
+            # locking lives on the one path every sweep goes through -- there
+            # is no second, unlocked way in.
+            await run_sweep(viking_fs, vikingdb, ctx, resolved, lock=lock, llm=llm)
         except asyncio.CancelledError:
             logger.info("ov-ext reflect: ticker cancelled")
             raise

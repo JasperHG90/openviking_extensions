@@ -133,7 +133,7 @@ def _start_ticker(service: Any, settings: ReflectSettings) -> None:
         )
         return
 
-    ctx = _root_context()
+    ctx = _root_context(settings)
     if ctx is None:
         return
 
@@ -145,16 +145,23 @@ def _start_ticker(service: Any, settings: ReflectSettings) -> None:
     _task.add_done_callback(_log_if_it_died)
 
 
-def _root_context() -> Any:
+def _root_context(settings: ReflectSettings) -> Any:
     """Build the request context sweeps run under, or ``None`` if it cannot be.
 
     Reflection is not serving a request, so it has no context to inherit and
     has to construct one. It reads and writes one user's memories, named by
-    ``OV_REFLECT_USER_ID``.
-    """
-    from .config import ReflectSettings
+    ``OV_REFLECT_USER_ID`` or by the settings passed to :func:`install`.
 
-    settings = ReflectSettings()
+    Takes the resolved settings rather than reading the environment again: an
+    earlier version built its own, so a caller who configured reflection in
+    code got a ticker that logged that it had started and then silently did
+    not, because the environment it re-read was empty.
+
+    Parameters
+    ----------
+    settings :
+        The same settings the rest of the install used.
+    """
     if not settings.user_id.strip():
         logger.error(
             "ov-ext reflect: OV_REFLECT_USER_ID is not set, so there is no user "
@@ -163,12 +170,17 @@ def _root_context() -> Any:
         return None
     try:
         from openviking.server.identity import RequestContext, Role, UserIdentifier
-    except ImportError:  # pragma: no cover - depends on the OpenViking version
+
+        return RequestContext(
+            user=UserIdentifier(settings.account_id, settings.user_id), role=Role.USER
+        )
+    except Exception:
+        # Broad on purpose. This runs inside OpenViking's startup, and the
+        # docstring on the caller promises a server that cannot reflect still
+        # serves -- an ImportError-only guard let UserIdentifier's own
+        # validation escape and abort the boot.
         logger.exception("ov-ext reflect: cannot build a request context")
         return None
-    return RequestContext(
-        user=UserIdentifier(settings.account_id, settings.user_id), role=Role.USER
-    )
 
 
 def _log_if_it_died(task: asyncio.Task[None]) -> None:

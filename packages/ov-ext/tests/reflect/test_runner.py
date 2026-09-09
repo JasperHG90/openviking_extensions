@@ -8,11 +8,16 @@ re-reflects the whole store.
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import pytest
+
 from ov_ext.reflect.config import ReflectSettings
 from ov_ext.reflect.models import Contradictions, ProposedObservations
+from ov_ext.reflect.locks import ProcessLock
 from ov_ext.reflect.runner import run_sweep
 from ov_ext.reflect.watermark import Watermark
 
@@ -89,7 +94,9 @@ def changed_row(day: int) -> dict[str, Any]:
 
 async def test_a_store_never_swept_starts_from_the_beginning() -> None:
     fs = FakeFS()
-    await run_sweep(fs, FakeDB([]), FakeCtx(), settings(), llm=quiet(), now=NOW)
+    await run_sweep(
+        fs, FakeDB([]), FakeCtx(), settings(), lock=ProcessLock(), llm=quiet(), now=NOW
+    )
     # Nothing changed, so nothing to store -- but it did not crash on the
     # missing file, which is the normal first run.
     assert fs.writes == []
@@ -99,7 +106,9 @@ async def test_a_sweep_that_advanced_stores_the_new_mark() -> None:
     fs = FakeFS()
     db = FakeDB([changed_row(5)])
 
-    await run_sweep(fs, db, FakeCtx(), settings(), llm=quiet(), now=NOW)
+    await run_sweep(
+        fs, db, FakeCtx(), settings(), lock=ProcessLock(), llm=quiet(), now=NOW
+    )
 
     assert [uri for uri, _ in fs.writes if uri == STATE]
     stored = Watermark.loads(fs.files[STATE])
@@ -112,7 +121,9 @@ async def test_a_sweep_resumes_from_the_stored_mark() -> None:
     fs = FakeFS({STATE: mark.dumps()})
     db = FakeDB([changed_row(5)])  # older than the mark
 
-    report = await run_sweep(fs, db, FakeCtx(), settings(), llm=quiet(), now=NOW)
+    report = await run_sweep(
+        fs, db, FakeCtx(), settings(), lock=ProcessLock(), llm=quiet(), now=NOW
+    )
 
     assert report.batches == 0
     assert fs.writes == []
@@ -123,7 +134,15 @@ async def test_a_dry_run_leaves_the_mark_alone() -> None:
     fs = FakeFS()
     db = FakeDB([changed_row(5)])
 
-    await run_sweep(fs, db, FakeCtx(), settings(dry_run=True), llm=quiet(), now=NOW)
+    await run_sweep(
+        fs,
+        db,
+        FakeCtx(),
+        settings(dry_run=True),
+        lock=ProcessLock(),
+        llm=quiet(),
+        now=NOW,
+    )
 
     assert fs.writes == []
 
@@ -133,7 +152,13 @@ async def test_a_disabled_sweep_stores_nothing() -> None:
     db = FakeDB([changed_row(5)])
 
     report = await run_sweep(
-        fs, db, FakeCtx(), settings(enabled=False), llm=quiet(), now=NOW
+        fs,
+        db,
+        FakeCtx(),
+        settings(enabled=False),
+        lock=ProcessLock(),
+        llm=quiet(),
+        now=NOW,
     )
 
     assert report.batches == 0
@@ -144,7 +169,9 @@ async def test_a_corrupt_mark_costs_one_sweep_not_every_sweep() -> None:
     fs = FakeFS({STATE: "{not json"})
     db = FakeDB([changed_row(5)])
 
-    report = await run_sweep(fs, db, FakeCtx(), settings(), llm=quiet(), now=NOW)
+    report = await run_sweep(
+        fs, db, FakeCtx(), settings(), lock=ProcessLock(), llm=quiet(), now=NOW
+    )
 
     assert report.batches == 1
     assert Watermark.loads(fs.files[STATE]).last_seen > datetime(
@@ -156,7 +183,48 @@ async def test_the_stored_mark_is_readable_by_a_person() -> None:
     """It is state an operator will open when a sweep misbehaves."""
     fs = FakeFS()
     await run_sweep(
-        fs, FakeDB([changed_row(5)]), FakeCtx(), settings(), llm=quiet(), now=NOW
+        fs,
+        FakeDB([changed_row(5)]),
+        FakeCtx(),
+        settings(),
+        lock=ProcessLock(),
+        llm=quiet(),
+        now=NOW,
     )
     parsed = json.loads(fs.files[STATE])
     assert set(parsed) == {"last_seen", "swept_at", "stalls"}
+
+
+class NeverLock:
+    """A lock nobody can take, standing in for another process holding it."""
+
+    @asynccontextmanager
+    async def acquire(self) -> AsyncIterator[bool]:
+        yield False
+
+
+async def test_a_sweep_that_cannot_take_the_lock_does_nothing_at_all() -> None:
+    """The guarantee at the only entry point there is.
+
+    run_sweep is exported and documented for scripts, so it -- not the ticker
+    -- is where the lock has to be taken. A caller who cannot get it must read
+    nothing, write nothing, and leave the mark alone.
+    """
+    fs = FakeFS()
+    db = FakeDB([changed_row(5)])
+
+    report = await run_sweep(
+        fs, db, FakeCtx(), settings(), lock=NeverLock(), llm=quiet(), now=NOW
+    )
+
+    assert report.batches == 0
+    assert report.written == 0
+    assert fs.writes == []
+
+
+async def test_the_lock_is_required_not_optional() -> None:
+    """A keyword-only required argument: there is no way to forget it."""
+    with pytest.raises(TypeError):
+        await run_sweep(  # type: ignore[call-arg]
+            FakeFS(), FakeDB([]), FakeCtx(), settings(), llm=quiet(), now=NOW
+        )

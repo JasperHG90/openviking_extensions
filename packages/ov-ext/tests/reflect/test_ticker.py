@@ -22,14 +22,6 @@ from ov_ext.reflect.ticker import run_ticker
 pytestmark = pytest.mark.usefixtures("clean_env")
 
 
-class NeverLock:
-    """A lock nobody can take, standing in for another process holding it."""
-
-    @asynccontextmanager
-    async def acquire(self) -> AsyncIterator[bool]:
-        yield False
-
-
 class CountingLock:
     """A lock that records how many times it was taken."""
 
@@ -93,12 +85,19 @@ async def test_a_disabled_ticker_returns_instead_of_looping(
     assert calls == []
 
 
-async def test_it_sweeps_while_it_holds_the_lock(
+async def test_it_hands_the_lock_to_the_sweep(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The ticker does not take the lock itself; run_sweep does.
+
+    Locking on the one path every sweep goes through means there is no second,
+    unlocked way in -- so what the ticker owes is passing the lock along.
+    """
     swept = asyncio.Event()
+    seen: list[Any] = []
 
     async def sweep(*args: Any, **kwargs: Any) -> None:
+        seen.append(kwargs.get("lock"))
         swept.set()
 
     monkeypatch.setattr("ov_ext.reflect.ticker.run_sweep", sweep)
@@ -108,21 +107,8 @@ async def test_it_sweeps_while_it_holds_the_lock(
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert lock.taken >= 1
 
-
-async def test_it_does_not_sweep_when_another_process_holds_the_lock(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The whole point: a follower ticks, finds the lock taken, and does nothing."""
-    calls: list[int] = []
-
-    async def sweep(*args: Any, **kwargs: Any) -> None:
-        calls.append(1)
-
-    monkeypatch.setattr("ov_ext.reflect.ticker.run_sweep", sweep)
-    await run_briefly(run_ticker(None, None, None, NeverLock(), settings()))
-    assert calls == []
+    assert seen and seen[0] is lock
 
 
 async def test_a_failing_sweep_does_not_end_the_ticker(
@@ -139,9 +125,7 @@ async def test_a_failing_sweep_does_not_end_the_ticker(
         raise RuntimeError("upstream down")
 
     monkeypatch.setattr("ov_ext.reflect.ticker.run_sweep", sweep)
-    task = asyncio.create_task(
-        run_ticker(None, None, None, ProcessLock(), fast())
-    )
+    task = asyncio.create_task(run_ticker(None, None, None, ProcessLock(), fast()))
     await asyncio.wait_for(third.wait(), timeout=2)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -153,9 +137,7 @@ async def test_a_failing_sweep_does_not_end_the_ticker(
 async def test_it_stops_when_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
     """Catching CancelledError broadly would make the task unkillable."""
     monkeypatch.setattr("ov_ext.reflect.ticker.run_sweep", _no_sweep)
-    task = asyncio.create_task(
-        run_ticker(None, None, None, ProcessLock(), settings())
-    )
+    task = asyncio.create_task(run_ticker(None, None, None, ProcessLock(), settings()))
     await asyncio.sleep(0.01)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -174,9 +156,7 @@ async def test_cancelling_mid_sweep_still_stops_it(
         await asyncio.sleep(3600)
 
     monkeypatch.setattr("ov_ext.reflect.ticker.run_sweep", sweep)
-    task = asyncio.create_task(
-        run_ticker(None, None, None, ProcessLock(), settings())
-    )
+    task = asyncio.create_task(run_ticker(None, None, None, ProcessLock(), settings()))
     await asyncio.wait_for(in_sweep.wait(), timeout=1)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -193,24 +173,36 @@ async def test_a_slow_sweep_never_overlaps_itself(
     """
     concurrent = 0
     peak = 0
-    done = asyncio.Event()
-    runs = 0
+    started = asyncio.Event()
+    second = asyncio.Event()
+    starts = 0
 
     async def sweep(*args: Any, **kwargs: Any) -> None:
-        nonlocal concurrent, peak, runs
+        nonlocal concurrent, peak, starts
+        starts += 1
         concurrent += 1
         peak = max(peak, concurrent)
-        await asyncio.sleep(0.01)
+        if starts == 1:
+            started.set()
+        else:
+            second.set()
+        # Far longer than the interval below. With the two equal, the previous
+        # sweep always finished a tick before the next began, so this passed
+        # even when the ticker fired sweeps without awaiting them.
+        await asyncio.sleep(0.5)
         concurrent -= 1
-        runs += 1
-        if runs >= 3:
-            done.set()
 
     monkeypatch.setattr("ov_ext.reflect.ticker.run_sweep", sweep)
     task = asyncio.create_task(
-        run_ticker(None, None, None, ProcessLock(), fast())
+        run_ticker(None, None, None, ProcessLock(), settings(interval_seconds=0.001))
     )
-    await asyncio.wait_for(done.wait(), timeout=3)
+
+    # Wait out many intervals while the first sweep is still running. A ticker
+    # that fires without awaiting starts a second one in that window.
+    await asyncio.wait_for(started.wait(), timeout=2)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(second.wait(), timeout=0.2)
+
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task

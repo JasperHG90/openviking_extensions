@@ -12,6 +12,7 @@ whole subsystem starts off.
 from __future__ import annotations
 
 import os
+import re
 from enum import Enum
 
 from pydantic import Field, model_validator
@@ -22,6 +23,12 @@ from .verify import DEFAULT_MIN_EVIDENCE
 __all__ = ["ENV_PREFIX", "LockKind", "ReflectSettings"]
 
 ENV_PREFIX = "OV_REFLECT_"
+
+# OpenViking's own rule for an identifier segment
+# (openviking/core/identifiers.py). Checked here so a value it would reject
+# fails while an operator is reading a startup log, rather than inside
+# OpenViking's boot where it aborts the server.
+_IDENTIFIER = re.compile(r"^[a-zA-Z0-9_.@-]+$")
 
 
 class LockKind(str, Enum):
@@ -90,19 +97,33 @@ class ReflectSettings(BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def _enabled_reflection_needs_a_user(self) -> ReflectSettings:
-        """Refuse to enable reflection without saying whose memories it reads.
+    def _enabled_reflection_needs_a_usable_user(self) -> ReflectSettings:
+        """Refuse to enable reflection without a user OpenViking would accept.
+
+        Emptiness is not the only way to get this wrong: a padded or punctuated
+        value passes a "not blank" check and is then rejected by
+        ``UserIdentifier`` deep inside OpenViking's startup, which aborts the
+        boot. Both are refused here instead, where the message is readable.
 
         Raises
         ------
         ValueError
-            When ``enabled`` is set and ``user_id`` is empty.
+            When ``enabled`` is set and ``user_id`` is empty or not a valid
+            OpenViking identifier.
         """
-        if self.enabled and not self.user_id.strip():
+        if not self.enabled:
+            return self
+        if not self.user_id.strip():
             raise ValueError(
                 f"{ENV_PREFIX}ENABLED=true requires {ENV_PREFIX}USER_ID: "
                 "reflection serves no request, so it has no user to inherit."
             )
+        for name, value in (("USER_ID", self.user_id), ("ACCOUNT_ID", self.account_id)):
+            if not _IDENTIFIER.match(value):
+                raise ValueError(
+                    f"{ENV_PREFIX}{name}={value!r} is not a valid OpenViking "
+                    "identifier: letters, digits, and _ . @ - only, no spaces."
+                )
         return self
 
     enabled: bool = Field(

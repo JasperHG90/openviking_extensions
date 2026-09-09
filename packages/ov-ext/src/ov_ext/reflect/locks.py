@@ -36,20 +36,52 @@ connection ends. A crashed process, a killed container or a severed network
 drops the connection, and the lock goes with it. No TTL to tune, no clock to
 trust, no renewal to miss.
 
-The cost of choosing safety here is liveness: a holder that is *alive but
-wedged* keeps its connection open, keeps the lock, and nothing sweeps until it
-is killed. That is the right trade for a periodic background job -- a sweep
-that does not happen this hour is recoverable, and one that happens twice
-corrupts the watermark.
+Session-scoped is not the same as sweep-scoped
+---------------------------------------------
+
+The lock lives on a connection, and that connection is *idle* for the whole
+sweep -- everything the sweep does goes through OpenViking, not through here.
+An idle connection is exactly what a database reaps. Postgres 14's
+``idle_session_timeout``, PgBouncer's ``server_idle_timeout``, a failover, or an
+admin running ``pg_terminate_backend`` all drop it, and the lock goes with it
+**while the sweep is still running** -- which is the same double-sweep the TTL
+argument above rejects Redis for. Measured against a real server with
+``idle_session_timeout = 1500ms`` and a four-second sweep: a second caller took
+the lock mid-sweep.
+
+So the lock does two more things:
+
+*It refuses to be reaped.* ``idle_session_timeout`` is set to 0 for the lock
+session, so the server's own reaper leaves it alone however long the sweep runs.
+
+*It checks it still holds what it thinks it holds.* A heartbeat pings the
+connection every :data:`HEARTBEAT_SECONDS`; a ping that fails means the lock is
+gone, and the sweep holding it is cancelled rather than left to finish
+unprotected. The exposure is therefore bounded by the heartbeat interval rather
+than by the length of a sweep.
+
+Two constraints follow, and they are load-bearing:
+
+* the DSN must be a **direct** connection, not a transaction-pooled proxy --
+  PgBouncer in transaction mode hands a different backend to each statement, so
+  a session lock taken on one is invisible to the next;
+* every sweeper must point at the **same database**. Advisory locks are scoped
+  per database, so two DSNs differing only in database name both grant the lock.
+
+The remaining cost is liveness: a holder that is alive, connected and wedged
+keeps the lock, and nothing sweeps until it is killed. That is the right trade
+for a periodic job -- a sweep that does not happen this hour is recoverable, one
+that happens twice corrupts the watermark.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import logging
-from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any, Protocol
 
 __all__ = [
@@ -67,6 +99,12 @@ logger = logging.getLogger(__name__)
 # database -- ov-postgres takes one during schema bootstrap, and OpenViking may
 # take others.
 LOCK_NAMESPACE = "ov_ext.reflect.sweep"
+
+# How often the holder checks its lock connection is still alive. Short enough
+# that a reaped or severed connection is noticed long before a sweep ends, long
+# enough that it costs nothing. Also the upper bound on how long a second
+# sweeper could overlap the first if the connection dies.
+HEARTBEAT_SECONDS = 5.0
 
 
 def advisory_key(namespace: str = LOCK_NAMESPACE) -> int:
@@ -144,16 +182,31 @@ class PostgresAdvisoryLock:
     Parameters
     ----------
     dsn :
-        libpq connection string for the database to lock in. Any reachable
-        PostgreSQL will do -- it is used only for the lock, never queried --
-        but the natural choice is the one already backing the store.
+        libpq connection string for the database to lock in. Every process that
+        sweeps must name the **same database**: advisory locks are scoped per
+        database, so two DSNs differing only in database name both grant the
+        lock and both sweep. It must also be a direct connection -- PgBouncer
+        in transaction mode gives each statement a different backend, which
+        makes a session lock meaningless. The natural choice is the database
+        already backing the store.
     key :
         Advisory lock key. Defaults to a hash of :data:`LOCK_NAMESPACE`.
+    heartbeat_seconds :
+        How often to check the lock connection is still alive, and the upper
+        bound on how long a second sweeper could overlap the first if it is
+        not.
     """
 
-    def __init__(self, dsn: str, key: int | None = None) -> None:
+    def __init__(
+        self,
+        dsn: str,
+        key: int | None = None,
+        *,
+        heartbeat_seconds: float = HEARTBEAT_SECONDS,
+    ) -> None:
         self._dsn = dsn
         self._key = advisory_key() if key is None else key
+        self._heartbeat = heartbeat_seconds
 
     @staticmethod
     def _connect(dsn: str) -> Any:
@@ -171,7 +224,15 @@ class PostgresAdvisoryLock:
                 "Install it, or set OV_REFLECT_LOCK=process if exactly one "
                 "process runs sweeps."
             ) from exc
-        return psycopg.connect(dsn, autocommit=True)
+        conn = psycopg.connect(dsn, autocommit=True)
+        # The lock connection is idle for the whole sweep, which is precisely
+        # what `idle_session_timeout` exists to kill. Disabling it for this
+        # session stops the server dropping the lock out from under a sweep
+        # that is still running. Scoped to this connection, so it changes
+        # nothing for anyone else.
+        with conn.cursor() as cur:
+            cur.execute("SET idle_session_timeout = 0")
+        return conn
 
     @asynccontextmanager
     async def acquire(self) -> AsyncIterator[bool]:
@@ -186,14 +247,27 @@ class PostgresAdvisoryLock:
         # psycopg_pool's async connection, would add a second dependency for
         # one connect per interval.
         conn = await asyncio.to_thread(self._connect, self._dsn)
+        heartbeat: asyncio.Task[None] | None = None
         try:
             got = await asyncio.to_thread(self._try_lock, conn, self._key)
             if not got:
                 logger.debug(
                     "ov-ext reflect: another process holds the sweep lock; skipping"
                 )
+            else:
+                # The task that will run the sweep is this one, because
+                # `acquire` is used as `async with ...: await run_sweep(...)`.
+                # Capturing it here is what lets the heartbeat stop a sweep
+                # that has lost its lock.
+                heartbeat = asyncio.create_task(
+                    self._heartbeat_until_lost(conn, asyncio.current_task())
+                )
             yield got
         finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat
             await asyncio.to_thread(conn.close)
 
     @staticmethod
@@ -203,6 +277,40 @@ class PostgresAdvisoryLock:
             cur.execute("SELECT pg_try_advisory_lock(%s)", (key,))
             row = cur.fetchone()
         return bool(row and row[0])
+
+    async def _heartbeat_until_lost(
+        self, conn: Any, holder: asyncio.Task[Any] | None
+    ) -> None:
+        """Ping the lock connection, cancelling ``holder`` when it stops answering.
+
+        Two jobs in one query. The ping keeps the session from looking idle,
+        which is what a reaper acts on; and a ping that raises means the
+        connection -- and therefore the lock -- is gone, so whatever is
+        sweeping under it must stop rather than run on unprotected.
+
+        psycopg does not reconnect transparently, so a failed statement really
+        does mean the session is dead rather than merely interrupted.
+        """
+        while True:
+            await asyncio.sleep(self._heartbeat)
+            try:
+                await asyncio.to_thread(self._ping, conn)
+            except Exception as exc:
+                logger.error(
+                    "ov-ext reflect: lost the sweep lock mid-sweep (%s); "
+                    "cancelling the sweep so a second one cannot overlap it",
+                    exc,
+                )
+                if holder is not None:
+                    holder.cancel()
+                return
+
+    @staticmethod
+    def _ping(conn: Any) -> None:
+        """Run a trivial statement, raising if the session is gone."""
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
 
 
 def build_lock(settings: Any) -> SweepLock:
