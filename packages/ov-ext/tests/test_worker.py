@@ -187,9 +187,11 @@ def test_the_worker_factory_installs_before_delegating(
     )
     import openviking.server.app as ov_app
 
-    monkeypatch.setattr(
-        ov_app, "create_worker_app", lambda: order.append("factory") or "app"
-    )
+    def openviking_factory() -> str:
+        order.append("factory")
+        return "app"
+
+    monkeypatch.setattr(ov_app, "create_worker_app", openviking_factory)
 
     result = worker_module.create_worker_app()
 
