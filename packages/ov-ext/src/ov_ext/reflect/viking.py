@@ -58,6 +58,13 @@ _ROW_FIELDS = ["uri", "content", "created_at", "updated_at"]
 # query stays a cheap indexed scan.
 _TAIL_WINDOW = 10
 
+# Between two changes to one memory in a batch. Verification normalises
+# whitespace before comparing, so joining with a newline would let a quote run
+# from the end of one change into the start of another -- a span that exists in
+# no memory, verified against a row that only looks like one. The rule is a
+# token normalisation cannot collapse away.
+_DELTA_SEPARATOR = "\n\n---\n\n"
+
 
 class VikingLLM:
     """OpenViking's structured-output model, behind the reflection protocol.
@@ -246,6 +253,7 @@ class VikingStore:
         assert reader is not None  # only reached with a store configured
         pending = await asyncio.to_thread(reader.pending, limit=limit)
         self._consumed = {}
+        self._delta_text = {}
         ordered: list[str] = []
         for record in pending:
             uri = str(record["uri"])
@@ -271,14 +279,26 @@ class VikingStore:
             self._delta_text.pop(uri, None)
 
     def _row_from_deltas(self, uri: str) -> MemoryRow | None:
-        """Build a row whose text is what changed, not the whole memory."""
+        """Build a row whose text is what changed, not the whole memory.
+
+        Only the ``replace`` sides. A delta's ``search`` side is the text that
+        was *removed*, and showing it would let the model quote it: verification
+        would pass, because the quote really is in the row it was shown, and the
+        resulting ``derived_from`` link would carry a ``match_text`` the cited
+        memory no longer contains. OpenViking renders a link by finding that
+        span (``LinkRenderer._find_match_span``), so it would render nothing,
+        and the observation would rest on evidence the store cannot show anyone.
+        A deletion is real information and this drops it; citing a retracted
+        line is worse than missing it.
+
+        Returns ``None`` when nothing citable is left, which is what a batch of
+        pure deletions looks like.
+        """
         records = self._delta_text.get(uri)
         if not records:
             return None
-        # The replace side is the memory's new wording; the search side is what
-        # a deletion removed and is the only text a delete-only change has.
-        lines = [str(record["replace"] or record["search"]).strip() for record in records]
-        text = "\n".join(line for line in lines if line)
+        lines = [str(record["replace"] or "").strip() for record in records]
+        text = _DELTA_SEPARATOR.join(line for line in lines if line)
         if not text:
             return None
         newest = max(parse_timestamp(record["changed_at"]) for record in records)
@@ -296,16 +316,44 @@ class VikingStore:
             against the memory it cites -- see the exception for why falling
             back to ``abstract`` would be worse than stopping.
         """
+        if not uris:
+            return []
+        if self._deltas is not None:
+            # Per URI, not per call. `if any_deltas: return them` looks the same
+            # until one neighbour in a batch happens to have a pending change,
+            # at which point every other neighbour silently vanishes from the
+            # evidence pool and `min_evidence` starves while the sweep looks
+            # healthy.
+            from_deltas = {
+                uri: row
+                for uri, row in ((uri, self._row_from_deltas(uri)) for uri in uris)
+                if row is not None
+            }
+            remaining = [uri for uri in uris if uri not in from_deltas]
+            if not remaining:
+                return list(from_deltas.values())
+            indexed = await self._rows_from_index(remaining)
+            # Delta rows first, so the changed memories keep the low citation
+            # indices the prompt treats as the subject.
+            return list(from_deltas.values()) + indexed
+        return await self._rows_from_index(uris)
+
+    async def _rows_from_index(self, uris: Sequence[str]) -> list[MemoryRow]:
+        """Fetch whole memories for ``uris`` from the vector index.
+
+        The path taken when nothing captured a change for a memory -- every
+        memory before deltas were switched on, and every neighbour drawn in for
+        context.
+
+        Raises
+        ------
+        ContentUnavailableError
+            When rows came back but none carried ``content``.
+        """
         from openviking.storage.expr import In
 
         if not uris:
             return []
-        if self._deltas is not None:
-            from_deltas = [
-                row for row in (self._row_from_deltas(uri) for uri in uris) if row
-            ]
-            if from_deltas:
-                return from_deltas
         records = await self._db.filter(
             filter=In("uri", list(uris)),
             limit=len(uris),

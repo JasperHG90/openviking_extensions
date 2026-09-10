@@ -24,6 +24,13 @@ logger = logging.getLogger(__name__)
 _MIN_POOL = 1
 _MAX_POOL = 4
 
+# How long to wait for the startup probe. `ConnectionPool(open=True)` does not
+# connect synchronously -- the failure surfaces at the first `connection()`,
+# which otherwise waits out psycopg's 30-second default. This runs on the
+# server's startup path, so a delta database that is down would add half a
+# minute to every boot and every restart.
+_PROBE_TIMEOUT_SECONDS = 3.0
+
 
 def build_delta_store(settings: ReflectSettings) -> Any | None:
     """Return a delta store for ``settings``, or ``None``.
@@ -63,7 +70,13 @@ def build_delta_store(settings: ReflectSettings) -> Any | None:
         return None
 
     try:
-        pool = ConnectionPool(dsn, min_size=_MIN_POOL, max_size=_MAX_POOL, open=True)
+        pool = ConnectionPool(
+            dsn,
+            min_size=_MIN_POOL,
+            max_size=_MAX_POOL,
+            timeout=_PROBE_TIMEOUT_SECONDS,
+            open=True,
+        )
         # The sweep may run against a database the vector backend bootstrapped
         # without `keep_deltas`, or against one it has never touched. Creating
         # the table here is idempotent and costs one statement at startup.

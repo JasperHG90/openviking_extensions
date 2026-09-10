@@ -312,6 +312,10 @@ class ReflectionEngine:
                 len(uris),
                 directory,
             )
+            # Read, and nothing citable in them -- a batch of pure deletions
+            # looks exactly like this. Retire them anyway, or every sweep reads
+            # the same changes again and never gets past them.
+            await self._store.mark_reflected(uris)
             return BatchOutcome(complete=True, newest=None, oldest=None)
 
         gathered = await self._gather(changed_rows)
@@ -326,7 +330,10 @@ class ReflectionEngine:
         if complete:
             # Only now: a delta retired by a batch that then failed is a change
             # nothing will ever reflect on.
-            await self._store.mark_reflected([row.uri for row in changed_rows])
+            # Every URI the batch was given, not only those that yielded a row:
+            # one with nothing citable was still read, and leaving it pending
+            # would stall the sweep on it forever.
+            await self._store.mark_reflected(uris)
 
         oldest = min(row.updated_at for row in changed_rows)
         newest = max(row.updated_at for row in changed_rows)

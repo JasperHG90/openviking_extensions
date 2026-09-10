@@ -19,6 +19,8 @@ from ov_ext.reflect.config import ReflectSettings
 from ov_ext.reflect.models import ProposedObservations
 from ov_ext.reflect.locks import ProcessLock
 from ov_ext.reflect.runner import run_sweep
+from ov_ext.reflect.verify import quote_is_present
+from ov_ext.reflect.viking import VikingStore
 from ov_ext.reflect.watermark import Watermark
 
 from .helpers import FakeLLM
@@ -385,3 +387,138 @@ async def test_a_failed_batch_leaves_its_deltas_pending() -> None:
 
     assert deltas.retired == []
     assert len(deltas.pending(limit=10)) == 1
+
+
+def deletion_row(row_id: int, uri: str, removed: str, day: int = 1) -> dict[str, Any]:
+    """A captured deletion: text went away and nothing replaced it."""
+    row = delta_row(row_id, uri, "", day=day)
+    row["search"] = removed
+    return row
+
+
+async def test_deleted_text_is_never_shown_to_the_model() -> None:
+    """Citing a retracted line would produce a link the store cannot render.
+
+    Verification would pass -- the quote really is in the row the model was
+    shown -- and the `derived_from` link's `match_text` would then be absent
+    from the memory it points at. OpenViking renders a link by finding that
+    span, so the observation would rest on evidence nobody can see.
+    """
+    uri = "viking://user/jasper/memories/entities/a.md"
+    deltas = FakeDeltas([deletion_row(1, uri, "- a claim that turned out wrong")])
+    store = VikingStore(FakeFS(), FakeDB([]), FakeCtx(), settings(), deltas=deltas)
+
+    await store.changed_since(datetime(1970, 1, 1, tzinfo=timezone.utc), limit=10)
+    rows = await store.rows([uri])
+
+    assert rows == [], "a pure deletion leaves nothing citable"
+
+
+async def test_a_batch_of_only_deletions_does_not_stall_the_sweep() -> None:
+    """It read them; leaving them pending would re-read them every tick forever."""
+    uri = "viking://user/jasper/memories/entities/a.md"
+    deltas = FakeDeltas([deletion_row(1, uri, "- a claim that turned out wrong")])
+
+    await run_sweep(
+        FakeFS(),
+        FakeDB([]),
+        FakeCtx(),
+        settings(),
+        lock=ProcessLock(),
+        llm=quiet(),
+        now=NOW,
+        deltas=deltas,
+    )
+
+    assert deltas.retired == [1]
+    assert deltas.pending(limit=10) == []
+
+
+async def test_an_edit_shows_the_new_wording_not_the_old() -> None:
+    """The replace side is what the memory says now, so it is what can be cited."""
+    uri = "viking://user/jasper/memories/entities/a.md"
+    record = delta_row(1, uri, "- rerank caps at 6 calls")
+    record["search"] = "- rerank caps at 3 calls"
+    deltas = FakeDeltas([record])
+    store = VikingStore(FakeFS(), FakeDB([]), FakeCtx(), settings(), deltas=deltas)
+
+    await store.changed_since(datetime(1970, 1, 1, tzinfo=timezone.utc), limit=10)
+    rows = await store.rows([uri])
+
+    assert rows[0].text == "- rerank caps at 6 calls"
+    assert "3 calls" not in rows[0].text
+
+
+async def test_a_neighbour_without_deltas_is_not_lost_to_one_that_has_them() -> None:
+    """Per URI, not per call.
+
+    Resolving the whole call from deltas as soon as any URI has them takes every
+    other memory out of the evidence pool -- which starves `min_evidence` while
+    the sweep still looks healthy.
+    """
+    changed = "viking://user/jasper/memories/entities/a.md"
+    plain = "viking://user/jasper/memories/entities/b.md"
+    deltas = FakeDeltas([delta_row(1, changed, "- ships v0.4")])
+    db = FakeDB(
+        [
+            {
+                "uri": plain,
+                "content": "The worker retries failed jobs.",
+                "created_at": NOW,
+                "updated_at": NOW,
+            }
+        ]
+    )
+    store = VikingStore(FakeFS(), db, FakeCtx(), settings(), deltas=deltas)
+
+    await store.changed_since(datetime(1970, 1, 1, tzinfo=timezone.utc), limit=10)
+    rows = await store.rows([changed, plain])
+
+    assert {row.uri for row in rows} == {changed, plain}
+    assert rows[0].uri == changed, "the changed memory keeps the low citation index"
+
+
+async def test_a_quote_cannot_span_two_unrelated_changes() -> None:
+    """Verification collapses whitespace, so a newline join makes them adjacent.
+
+    Two edits made at opposite ends of a 20 KB file would become neighbouring
+    lines, and a quote running across both would verify against a span that
+    exists in no memory.
+    """
+    uri = "viking://user/jasper/memories/entities/a.md"
+    deltas = FakeDeltas(
+        [
+            delta_row(1, uri, "ov-ext ships v0.4"),
+            delta_row(2, uri, "ov-dash uses Svelte"),
+        ]
+    )
+    store = VikingStore(FakeFS(), FakeDB([]), FakeCtx(), settings(), deltas=deltas)
+
+    await store.changed_since(datetime(1970, 1, 1, tzinfo=timezone.utc), limit=10)
+    row = (await store.rows([uri]))[0]
+
+    assert quote_is_present("ov-ext ships v0.4", row.text)
+    assert quote_is_present("ov-dash uses Svelte", row.text)
+    assert not quote_is_present("ov-ext ships v0.4 ov-dash uses Svelte", row.text)
+
+
+async def test_a_read_does_not_serve_text_the_previous_read_loaded() -> None:
+    """`_delta_text` must be reset with `_consumed`, not left to accumulate.
+
+    A batch that failed never retires its URIs, so nothing pops them. The next
+    read would then serve whatever the last one loaded -- for a memory the store
+    no longer reports as changed at all.
+    """
+    gone = "viking://user/jasper/memories/entities/a.md"
+    fresh = "viking://user/jasper/memories/entities/b.md"
+    deltas = FakeDeltas([delta_row(1, gone, "text from the first read")])
+    store = VikingStore(FakeFS(), FakeDB([]), FakeCtx(), settings(), deltas=deltas)
+
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    await store.changed_since(epoch, limit=10)
+
+    # The first URI's deltas go away out of band; a different memory changes.
+    deltas.records = [delta_row(2, fresh, "text from the second read")]
+    await store.changed_since(epoch, limit=10)
+
+    assert await store.rows([gone]) == [], "the first read's text must not survive"
