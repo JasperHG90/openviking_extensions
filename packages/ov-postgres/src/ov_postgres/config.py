@@ -108,6 +108,9 @@ class PgVectorParams(BaseModel):
         Whether to persist each record's ``content`` (its body text). Off by
         default, matching every non-VikingDB backend. When on, ``content``
         also joins the default keyword fields.
+    keep_deltas : bool
+        Whether to record what changed in each memory, for reflection to read
+        instead of the whole file. Off by default.
     keyword_query_mode : KeywordQueryMode
         Whether a natural-language query matches documents holding ``any`` of
         its words or ``all`` of them.
@@ -176,6 +179,15 @@ class PgVectorParams(BaseModel):
             "Persist each record's body text in the 'content' column. Off by "
             "default: OpenViking drops 'content' before the write unless the "
             "adapter asks for it, and only VikingDB-backed backends do."
+        ),
+    )
+    keep_deltas: bool = Field(
+        default=False,
+        description=(
+            "Record what changed in each memory, so reflection can read the "
+            "change rather than the whole file. Off by default: it writes a row "
+            "per edited passage, and nothing reads those rows unless ov-ext's "
+            "reflect sweep is running."
         ),
     )
     keyword_query_mode: KeywordQueryMode = Field(

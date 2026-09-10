@@ -16,16 +16,17 @@ lives.
 
 | File | Source | Code lines | Ported code | Ported text |
 |---|---|---|---|---|
-| `models.py` | `reflect/prompts.py`, `contradiction/signatures.py` | 90 | ~50 (field declarations) | 6-line `EVIDENCE_INDEX_DESCRIPTION`, 15 field descriptions |
-| `citations.py` | `reflect/utils.py` | 40 | ~28 (`citation_map`, `parse_timestamp`) | — |
-| `prompts.py` | `reflect/prompts.py`, `contradiction/signatures.py` | 38 | 0 | 36 lines of instruction, transcribed from the signature docstrings |
-| `verify.py` | `reflect/trends.py` (`verify_evidence_quotes`) | 67 | 0 — the idea, reimplemented | — |
-| `engine.py` | `reflect/reflection.py` | 199 | 0 — phase *sequence* followed, no code lifted | — |
+| `models.py` | `reflect/prompts.py` | 71 | ~30 (field declarations) | 6-line `EVIDENCE_INDEX_DESCRIPTION`, 9 field descriptions |
+| `citations.py` | `reflect/utils.py` | 47 | ~28 (`citation_map`, `parse_timestamp`) | — |
+| `prompts.py` | `reflect/prompts.py` | 27 | 0 | 18 lines of instruction, transcribed from the signature docstring |
+| `verify.py` | `reflect/trends.py` (`verify_evidence_quotes`) | 68 | 0 — the idea, reimplemented | — |
+| `capture.py` | — | 173 | 0 — reads OpenViking's patch blocks, replays them through its own `PatchOp` | — |
+| `engine.py` | `reflect/reflection.py` | 232 | 0 — phase *sequence* followed, no code lifted | — |
 | `viking.py` | — | see below | 0 | — |
 | `config.py`, `register.py`, `runner.py`, `ports.py`, `watermark.py`, `exceptions.py`, `__init__.py` | — | see below | 0 | — |
 
-So: **about 78 code lines are ported**, plus roughly 57 lines of prompt and
-field text carried across near-verbatim. Run the snippet at the foot of this file for the current totals; the ratio matters more than
+So: **about 58 code lines are ported** out of 1,554, plus roughly 39 lines of
+prompt and field text carried across near-verbatim. Run the snippet at the foot of this file for the current totals; the ratio matters more than
 the absolute, and it is low by design. The rest is new, and almost all of it is
 the part that touches OpenViking — which had to be written either way, because
 memex's equivalent is bound to a schema this package does not have.
@@ -72,10 +73,13 @@ OpenViking's file-behind-a-URI model does not pose.
    before classifying them, to avoid classifying hundreds per batch. A sweep
    here sees a handful, so it asks directly.
 
-6. **No authority resolution.** `ContradictionRelationship.authoritative` and
-   the later-date-wins default are dropped. Reflection records that two
-   memories are in tension and leaves the resolution to a person, so a field
-   naming a winner would be one nothing reads.
+6. **No contradiction detection at all.** memex's `contradiction/` package
+   was ported and then removed on 2026-09-10, so nothing from it survives here.
+   A batch is grouped by directory rather than by subject, so the model was
+   being asked whether a note about a package rename contradicted a line from a
+   README -- and it answered, because it was asked to. Every pair it returned
+   was an artifact of the question. `ContradictionRelationship` (and memex's
+   `authoritative` field, which was already dropped) are gone with it.
 
 7. **Tail sampling reads a window, then samples it.** `_sample_tail_memories`
    uses `ORDER BY random()`. OpenViking's filter API has no random ordering, so
@@ -111,7 +115,8 @@ OpenViking's file-behind-a-URI model does not pose.
 ## Not ported at all
 
 `reflect/reflection.py` (2090 lines), `reflect/queue_service.py` (706),
-`contradiction/engine.py` (458), `confidence.py` (256), `reflect/trends.py`
+the whole of `contradiction/` (`engine.py` 458, `signatures.py` -- ported, then
+removed, see decision 6), `confidence.py` (256), `reflect/trends.py`
 (119 — the trend computation itself is queued, not dropped),
 `reflect/entity_locks.py` (54 — needed only for parallel workers),
 `reflect/exceptions.py` (56 — every one of them describes a CAS failure mode

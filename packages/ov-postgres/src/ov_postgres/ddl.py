@@ -7,6 +7,7 @@ from typing import Any, NamedTuple
 
 from psycopg import sql
 
+from .deltas import delta_table_statements
 from .schema import CollectionSchema, FieldSpec
 
 # What psycopg's execute() accepts.
@@ -94,7 +95,7 @@ def advisory_lock_key(schema_name: str) -> int:
 
 
 def bootstrap_statements(
-    schema_name: str, *, create_extension: bool = True
+    schema_name: str, *, create_extension: bool = True, keep_deltas: bool = False
 ) -> list[Statement]:
     """Build the statements that make a database usable.
 
@@ -113,6 +114,10 @@ def bootstrap_statements(
     create_extension :
         Whether to include ``CREATE EXTENSION``. False on managed PostgreSQL,
         where the role cannot create extensions and one already exists.
+    keep_deltas :
+        Whether to also create the memory-delta table. Off by default; nothing
+        in this package reads that table, so a deployment without ov-ext's
+        reflect sweep should not carry it.
 
     Returns
     -------
@@ -154,6 +159,7 @@ def bootstrap_statements(
             )
             """
         ).format(ns, sql.Identifier(REGISTRY_INDEXES)),
+        *(delta_table_statements(schema_name) if keep_deltas else []),
     ]
 
 

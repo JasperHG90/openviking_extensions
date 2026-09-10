@@ -244,6 +244,7 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
                 for statement in ddl.bootstrap_statements(
                     self._params.db_schema,
                     create_extension=self._params.create_extension,
+                    keep_deltas=self._params.keep_deltas,
                 ):
                     cur.execute(statement)
                 cur.execute("SELECT extversion FROM pg_extension WHERE extname='vector'")

@@ -439,6 +439,7 @@ Every key goes under `custom_params`. Unknown keys are **rejected at startup**, 
 | `distance` | from `distance_metric` | `cosine`, `l2`, or `ip` |
 | `keyword_fields` | name, description, abstract, tags, search_tags | Columns in the full-text index |
 | `store_content` | `false` | Persist each record's body text in `content` |
+| `keep_deltas` | `false` | Record what changed in each memory, for ov-ext's reflect sweep |
 | `keyword_query_mode` | `any` | Whether a query needs `any` of its words or `all` |
 | `keyword_rank` | `ts_rank_cd` | `ts_rank_cd` or `ts_rank` |
 | `text_search_config` | `simple` | Text search configuration |
