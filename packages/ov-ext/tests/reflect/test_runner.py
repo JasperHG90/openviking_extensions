@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 
 from ov_ext.reflect.config import ReflectSettings
-from ov_ext.reflect.models import Contradictions, ProposedObservations
+from ov_ext.reflect.models import ProposedObservations
 from ov_ext.reflect.locks import ProcessLock
 from ov_ext.reflect.runner import run_sweep
 from ov_ext.reflect.watermark import Watermark
@@ -71,14 +71,8 @@ def settings(**overrides: Any) -> ReflectSettings:
 
 
 def quiet() -> FakeLLM:
-    """A model that finds nothing, so a sweep runs end to end and writes none.
-
-    Both shapes, in the order the engine asks for them: observations first,
-    then contradictions.
-    """
-    return FakeLLM(
-        [ProposedObservations(observations=[]), Contradictions(relationships=[])] * 4
-    )
+    """A model that finds nothing, so a sweep runs end to end and writes none."""
+    return FakeLLM([ProposedObservations(observations=[])] * 8)
 
 
 def changed_row(day: int) -> dict[str, Any]:
@@ -193,6 +187,73 @@ async def test_the_stored_mark_is_readable_by_a_person() -> None:
     )
     parsed = json.loads(fs.files[STATE])
     assert set(parsed) == {"last_seen", "swept_at", "stalls"}
+
+
+class BrokenLLM:
+    """A model whose every call fails, standing in for a provider outage."""
+
+    async def complete(self, prompt: str, model: Any) -> Any:
+        raise RuntimeError("provider unreachable")
+
+
+async def test_a_stalled_sweep_stores_the_stall_it_counted() -> None:
+    """Otherwise `max_stalls` is dead code and a failing batch blocks forever.
+
+    A sweep that reads something and cannot advance leaves `last_seen` where it
+    was and raises `stalls`. Storing only on a moved `last_seen` discards that
+    count, so every sweep reloads stalls=0, the step-over never triggers, and
+    the same batch is retried until someone notices by hand.
+    """
+    fs = FakeFS()
+    db = FakeDB([changed_row(5)])
+
+    report = await run_sweep(
+        fs, db, FakeCtx(), settings(), lock=ProcessLock(), llm=BrokenLLM(), now=NOW
+    )
+
+    assert report.failures  # the batch really did fail
+    stored = Watermark.loads(fs.files[STATE])
+    assert stored.last_seen == datetime(1970, 1, 1, tzinfo=timezone.utc)
+    assert stored.stalls == 1
+
+
+async def test_stalls_accumulate_until_the_sweep_steps_over_the_blockage() -> None:
+    """The escape hatch, exercised end to end through the stored mark.
+
+    Each sweep has to read the previous one's stall count for the limit to mean
+    anything, so this runs four sweeps against the same filesystem rather than
+    handing the engine a watermark directly.
+    """
+    fs = FakeFS()
+    db = FakeDB([changed_row(5)])
+    config = settings(max_stalls=3)
+
+    for _ in range(3):
+        await run_sweep(
+            fs, db, FakeCtx(), config, lock=ProcessLock(), llm=BrokenLLM(), now=NOW
+        )
+    assert Watermark.loads(fs.files[STATE]).stalls == 3
+
+    report = await run_sweep(
+        fs, db, FakeCtx(), config, lock=ProcessLock(), llm=BrokenLLM(), now=NOW
+    )
+
+    assert report.stepped_over
+    stored = Watermark.loads(fs.files[STATE])
+    assert stored.last_seen == datetime(1970, 1, 6, tzinfo=timezone.utc)
+    assert stored.stalls == 0
+
+
+async def test_a_sweep_that_read_nothing_still_writes_nothing() -> None:
+    """The mark is state in someone's store; an idle sweep must not churn it."""
+    mark = Watermark(last_seen=datetime(1970, 1, 20, tzinfo=timezone.utc), swept_at=NOW)
+    fs = FakeFS({STATE: mark.dumps()})
+
+    await run_sweep(
+        fs, FakeDB([]), FakeCtx(), settings(), lock=ProcessLock(), llm=quiet(), now=NOW
+    )
+
+    assert fs.writes == []
 
 
 class NeverLock:

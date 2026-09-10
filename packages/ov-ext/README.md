@@ -10,7 +10,7 @@ because the subsystems already depend on each other.
 | Subsystem | What it adds |
 |---|---|
 | [`retrieval`](#retrieval) | A lexical leg fused into vector search, an MMR diversity pass, and a pooled reranker |
-| [`reflect`](#reflect) | A sweep that re-reads recent memory, writes observations with cited evidence, and flags contradictions |
+| [`reflect`](#reflect) | A sweep that re-reads recent memory and writes observations with cited evidence |
 
 Settings are per subsystem and read from the environment — `OV_RETRIEVAL_` for
 retrieval, `OV_REFLECT_` for reflection. The prefixes name the subsystem rather
@@ -394,8 +394,7 @@ request failed would be a lie.
 
 Extraction sees one window and writes what that window says. Nothing goes back
 over it, so a pattern spread across ten memories written on ten days is never
-noticed, and two memories that contradict each other sit side by side
-unremarked. OpenViking names the seam for this — `session/memory/core`
+noticed. OpenViking names the seam for this — `session/memory/core`
 documents a `ConsolidationExtractContextProvider` — and ships only the abstract
 base.
 
@@ -406,14 +405,17 @@ changed = query_L2(updated_at > watermark)     # URIs only
 for dir, uris in group_by_parent(changed):
     scope = read_L1(dir)                       # background, never cited
     mems  = rows(uris) + neighbours() + tail_sample()
-    obs   = propose(scope, mems)               # model call 1
-    con   = contradict(mems)                   # model call 2
+    obs   = propose(scope, mems)               # the one model call
     obs   = verify_quotes(obs, mems)           # code, no model
-    write(obs, con)
+    write(obs)
 ```
 
-Two model calls over one gathered batch, so contradiction detection costs one
-extra call rather than a second pipeline.
+One model call per batch. A second call asked which memories were in tension;
+it was removed. A batch is grouped by directory, not by subject, so the model
+was asked whether a note about a package rename contradicted a line from a
+README — and it answered, because it was asked to. Every pair it returned was
+an artifact of the question, and each one cost a call and wrote a `contradicts`
+edge into somebody's memory.
 
 **Nothing is written on the model's word.** Every quote must appear verbatim in
 the memory it cites, checked by substring in code — a second model asked "is
@@ -512,7 +514,6 @@ the one path every sweep goes through, so there is no second, unlocked way in.
 | `OV_REFLECT_TAIL_SAMPLE` | `3` | Memories drawn from the far end of the store |
 | `OV_REFLECT_MIN_EVIDENCE` | `2` | Distinct memories an observation must cite to survive |
 | `OV_REFLECT_REQUIRE_CROSS_AREA` | `false` | Keep only observations spanning several directories |
-| `OV_REFLECT_CONTRADICTIONS` | `true` | Ask which memories are in tension |
 | `OV_REFLECT_MAX_STALLS` | `3` | Sweeps that may advance nothing before stepping over a failing batch |
 | `OV_REFLECT_INTERVAL_SECONDS` | `900` | Gap between the end of one sweep and the start of the next |
 | `OV_REFLECT_LOCK` | *(none)* | `process` or `postgres`. Required — there is no default |

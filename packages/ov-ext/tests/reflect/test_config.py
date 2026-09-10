@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from pydantic import ValidationError
 
-from ov_ext.reflect.config import ENV_PREFIX, ReflectSettings
+from ov_ext.reflect.config import ENV_PREFIX, RETIRED, ReflectSettings
 from ov_ext.reflect.prompts import propose_prompt
 
 pytestmark = pytest.mark.usefixtures("clean_env")
@@ -46,6 +48,48 @@ def test_a_misspelled_variable_is_refused_by_name(
     monkeypatch.setenv(f"{ENV_PREFIX}MIN_EVIDNCE", "5")
     with pytest.raises(ValidationError, match="MIN_EVIDNCE"):
         ReflectSettings()
+
+
+def test_a_retired_variable_is_tolerated_rather_than_refused(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A deleted setting must not stop a server that still carries it.
+
+    This validator runs inside `ov_ext.install()`, which is fatal by design, so
+    refusing a retired name would take retrieval down with reflection over a
+    line in a config file that no longer does anything.
+    """
+    retired = next(iter(RETIRED))
+    monkeypatch.setenv(retired, "true")
+
+    with caplog.at_level(logging.WARNING):
+        ReflectSettings()
+
+    assert retired in caplog.text
+    assert "no longer does anything" in caplog.text
+
+
+def test_a_retired_variable_does_not_excuse_a_misspelled_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tolerating one must not turn the misspelling guard off for the rest."""
+    monkeypatch.setenv(next(iter(RETIRED)), "true")
+    monkeypatch.setenv(f"{ENV_PREFIX}MIN_EVIDNCE", "5")
+
+    with pytest.raises(ValidationError, match="MIN_EVIDNCE"):
+        ReflectSettings()
+
+
+def test_a_retired_variable_is_matched_case_insensitively(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Environments are not consistent about case, and a miss here is a dead server."""
+    monkeypatch.setenv(next(iter(RETIRED)).lower(), "true")
+
+    with caplog.at_level(logging.WARNING):
+        ReflectSettings()
+
+    assert "no longer does anything" in caplog.text
 
 
 def test_an_out_of_range_value_is_refused_rather_than_clamped(

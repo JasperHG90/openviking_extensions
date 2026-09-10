@@ -6,15 +6,15 @@ where the model gives it nothing useful, which is the common one.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import timedelta
 
 from ov_ext.reflect.config import ReflectSettings
 from ov_ext.reflect.engine import ReflectionEngine, group_by_directory
 from ov_ext.reflect.models import (
     CandidateObservation,
-    ContradictionRelationship,
-    Contradictions,
     EvidenceItem,
+    MemoryRow,
     ProposedObservations,
 )
 from ov_ext.reflect.watermark import Watermark
@@ -31,7 +31,6 @@ def settings(**overrides: object) -> ReflectSettings:
         "enabled": True,
         "neighbour_limit": 0,
         "tail_sample": 0,
-        "contradictions": False,
     }
     base.update(overrides)
     return ReflectSettings.model_construct(**{**ReflectSettings().model_dump(), **base})
@@ -185,87 +184,6 @@ async def test_neighbours_and_tail_widen_what_the_model_sees() -> None:
     assert report.written == 1
     cited = {link[1] for link in fake.links}
     assert old.uri in cited and tail.uri in cited
-
-
-async def test_contradictions_are_recorded_as_links_between_the_pair() -> None:
-    fake = store()
-    llm = FakeLLM(
-        [
-            ProposedObservations(observations=[]),
-            Contradictions(
-                relationships=[
-                    ContradictionRelationship(
-                        left_index=0, right_index=1, relation="contradict", reasoning="r"
-                    )
-                ]
-            ),
-        ]
-    )
-    engine = ReflectionEngine(fake, llm, settings(contradictions=True))
-
-    report, _ = await engine.sweep(Watermark.beginning(), now=EPOCH)
-
-    assert report.contradictions == 1
-    # Changed memories arrive oldest first, so A is index 0 and B is index 1 --
-    # the edge runs in the direction the model named.
-    assert fake.links == [(A, B, "contradicts", None, 0.9)]
-    # No match_text: the claim is about two memories as wholes, and OpenViking
-    # checks match_text verbatim, so inventing a span would fail that check.
-    assert fake.links[0][3] is None
-
-
-async def test_agreement_is_not_worth_an_edge() -> None:
-    """`reinforce` is the normal state of a store; linking it would drown the rest."""
-    fake = store()
-    llm = FakeLLM(
-        [
-            ProposedObservations(observations=[]),
-            Contradictions(
-                relationships=[
-                    ContradictionRelationship(
-                        left_index=0, right_index=1, relation="reinforce", reasoning="r"
-                    )
-                ]
-            ),
-        ]
-    )
-    engine = ReflectionEngine(fake, llm, settings(contradictions=True))
-
-    report, _ = await engine.sweep(Watermark.beginning(), now=EPOCH)
-
-    assert report.contradictions == 0
-    assert fake.links == []
-
-
-async def test_a_contradiction_citing_itself_or_nothing_is_dropped() -> None:
-    fake = store()
-    llm = FakeLLM(
-        [
-            ProposedObservations(observations=[]),
-            Contradictions(
-                relationships=[
-                    ContradictionRelationship(
-                        left_index=0,
-                        right_index=0,
-                        relation="contradict",
-                        reasoning="self",
-                    ),
-                    ContradictionRelationship(
-                        left_index=0,
-                        right_index=42,
-                        relation="contradict",
-                        reasoning="ghost",
-                    ),
-                ]
-            ),
-        ]
-    )
-    engine = ReflectionEngine(fake, llm, settings(contradictions=True))
-
-    report, _ = await engine.sweep(Watermark.beginning(), now=EPOCH)
-
-    assert report.contradictions == 0
-    assert fake.links == []
 
 
 async def test_the_overview_is_offered_as_background_and_never_cited() -> None:
@@ -427,3 +345,37 @@ async def test_progress_clears_a_stall() -> None:
 
     assert mark.last_seen == EPOCH + timedelta(days=1)
     assert mark.stalls == 0
+
+
+class StoreWhoseRowsVanished(FakeStore):
+    """A store whose change query names URIs its row fetch cannot return.
+
+    Not a contrivance: the two run different queries against the index, so a
+    row dropped between them -- or a backend not storing content -- lands here.
+    """
+
+    async def rows(self, uris: Sequence[str]) -> list[MemoryRow]:
+        """Return nothing, whatever was asked for."""
+        return []
+
+
+async def test_a_sweep_that_reads_only_empty_batches_holds_rather_than_churning() -> None:
+    """`changed_since` naming URIs that `rows` cannot fetch is a stuck store.
+
+    Stepping the mark over would clear the stall and rewrite the watermark file
+    on every sweep forever, while fixing nothing -- there is no timestamp to
+    step to, because nothing was read.
+    """
+    fake = StoreWhoseRowsVanished(
+        [
+            row(A, "The scheduler retries failed jobs.", day=1),
+            row(B, "The worker retries failed jobs too.", day=2),
+        ]
+    )
+    engine = ReflectionEngine(fake, FakeLLM([]), settings(max_stalls=1))
+    mark = Watermark(last_seen=EPOCH, swept_at=EPOCH, stalls=5)
+
+    report, after = await engine.sweep(mark, now=EPOCH)
+
+    assert report.stepped_over is False
+    assert after == mark, "an unadvanceable sweep must not rewrite the mark"

@@ -233,7 +233,7 @@ async def test_a_missing_overview_is_absence_not_failure() -> None:
     assert await store().read_overview("viking://user/jasper/memories/entities") is None
 
 
-async def test_a_contradiction_link_is_merged_into_what_the_file_already_has() -> None:
+async def test_a_link_is_merged_into_what_the_file_already_has() -> None:
     """The one write touching a file reflection did not author."""
     from openviking.session.memory.dataclass import MemoryFile
     from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
@@ -253,12 +253,12 @@ async def test_a_contradiction_link_is_merged_into_what_the_file_already_has() -
     fs = FakeFS({"viking://x/a.md": MemoryFileUtils.write(existing)})
 
     await store(fs=fs).link(
-        "viking://x/a.md", "viking://x/b.md", link_type="contradicts", weight=0.9
+        "viking://x/a.md", "viking://x/b.md", link_type="derived_from", weight=0.9
     )
 
     parsed = MemoryFileUtils.read(fs.files["viking://x/a.md"], uri="viking://x/a.md")
     kinds = {link["link_type"] for link in parsed.links}
-    assert kinds == {"related_to", "contradicts"}
+    assert kinds == {"related_to", "derived_from"}
 
 
 # --- pure helpers ----------------------------------------------------------

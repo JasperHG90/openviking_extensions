@@ -10,7 +10,7 @@ already carry the memory text -- OpenViking writes ``strip_all_links(content)``
 into them at index time -- so a sweep can find its changed memories, gather
 neighbours and read every quote it verifies without opening a single file.
 Only two operations reach the document store, and only for conclusions: writing
-an observation, and recording a contradiction on an existing memory.
+an observation, and merging its ``derived_from`` edges back onto it.
 
 Reflection writes observations with ``write_file`` rather than through
 ``remember``. ``remember`` hands text to the extractor, which would rewrite the
@@ -387,9 +387,13 @@ class VikingStore:
     ) -> None:
         """Record a typed edge on an existing memory file.
 
-        This is the one write that touches a file reflection did not author, so
-        it reads, appends and writes back rather than replacing: everything
-        already in the file, links included, stays.
+        Reads, appends and writes back rather than replacing, so everything
+        already in the file -- links included -- stays. That mattered more when
+        reflection also wrote ``contradicts`` edges onto memories it did not
+        author; since that pass was removed the only caller links an observation
+        to its sources, and the file being rewritten is reflection's own. The
+        merge stays anyway: it is what makes writing the same edge twice
+        idempotent, which is what lets a re-run sweep be harmless.
         """
         from openviking.session.memory.merge_op.link_merge import merge_links
         from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils

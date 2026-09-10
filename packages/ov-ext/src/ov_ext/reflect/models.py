@@ -4,9 +4,8 @@ Two families live here. The ``Reflect*Context`` models are what a memory looks
 like once it has been reduced for a prompt -- an integer id, the text, and when
 it happened, nothing else. The rest are output shapes the model fills in.
 
-Ported from memex's ``memory/reflect/prompts.py`` and
-``memory/contradiction/signatures.py``, where they are the payloads of DSPy
-signatures. The field descriptions are the load-bearing part and are kept
+Ported from memex's ``memory/reflect/prompts.py``, where they are the payloads
+of DSPy signatures. The field descriptions are the load-bearing part and are kept
 verbatim: they are what the model actually reads, and they encode a lot of
 learning about how it goes wrong. What changed is the wrapper -- OpenViking
 drives structured output through ``StructuredVLM.complete_model``, which takes
@@ -27,8 +26,6 @@ from pydantic import BaseModel, Field
 
 __all__ = [
     "CandidateObservation",
-    "ContradictionRelationship",
-    "Contradictions",
     "EvidenceItem",
     "MemoryRow",
     "Observation",
@@ -160,37 +157,6 @@ class ProposedObservations(BaseModel):
     observations: list[CandidateObservation] = Field(
         default_factory=list,
         description="New observations found. Empty when the memories support none.",
-    )
-
-
-class ContradictionRelationship(BaseModel):
-    """One non-neutral relationship between two memories.
-
-    Ported from memex's model of the same name, minus its ``authoritative``
-    field. memex uses that to decide which side wins and then applies a
-    confidence delta; reflection here only records that the tension exists and
-    leaves resolution to a person, so nothing reads a winner.
-    """
-
-    left_index: int = Field(description="Index of the first memory in the pair.")
-    right_index: int = Field(description="Index of the second memory in the pair.")
-    relation: str = Field(
-        description=(
-            "One of: reinforce, weaken, contradict. Describes how the first "
-            "memory relates to the second."
-        )
-    )
-    reasoning: str = Field(
-        description="Brief explanation of why this relationship was assigned."
-    )
-
-
-class Contradictions(BaseModel):
-    """Everything the contradiction call returns."""
-
-    relationships: list[ContradictionRelationship] = Field(
-        default_factory=list,
-        description="Non-neutral pairs only. Empty when the memories agree.",
     )
 
 

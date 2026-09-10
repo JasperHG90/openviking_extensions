@@ -11,6 +11,7 @@ whole subsystem starts off.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from enum import Enum
@@ -20,9 +21,24 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .verify import DEFAULT_MIN_EVIDENCE
 
-__all__ = ["ENV_PREFIX", "LockKind", "ReflectSettings"]
+__all__ = ["ENV_PREFIX", "RETIRED", "LockKind", "ReflectSettings"]
+
+logger = logging.getLogger(__name__)
 
 ENV_PREFIX = "OV_REFLECT_"
+
+# Settings that existed once and no longer do. Tolerated with a warning instead
+# of refused, because refusing happens inside `ov_ext.install()`, which is fatal
+# by design -- so a deleted setting would turn a stale line in someone's config
+# into a server that will not start, and take retrieval down with reflection.
+# The value says what happened, since "unknown setting" is not an explanation.
+RETIRED: dict[str, str] = {
+    "OV_REFLECT_CONTRADICTIONS": (
+        "contradiction detection was removed; a batch is grouped by directory, "
+        "so the pairs it found were artifacts of the question rather than "
+        "tensions in the store"
+    ),
+}
 
 # OpenViking's own rule for an identifier segment
 # (openviking/core/identifiers.py). Checked here so a value it would reject
@@ -61,17 +77,29 @@ class ReflectSettings(BaseSettings):
         ignore them with nothing to explain why. The retrieval subsystem
         refuses these the same way.
 
+        A name in :data:`RETIRED` is warned about rather than refused. This
+        validator runs during ``ov_ext.install()``, which is fatal by design, so
+        deleting a setting would otherwise mean a server carrying the old
+        variable refuses to boot -- taking retrieval down with it over a line in
+        a config file that no longer does anything.
+
         Raises
         ------
         ValueError
             Naming the unknown variables and the settings that do exist.
         """
         known = {f"{ENV_PREFIX}{name}".upper() for name in type(self).model_fields}
-        unknown = sorted(
-            name
-            for name in os.environ
-            if name.upper().startswith(ENV_PREFIX) and name.upper() not in known
-        )
+        present = {
+            name.upper() for name in os.environ if name.upper().startswith(ENV_PREFIX)
+        }
+        for name in sorted(present & set(RETIRED)):
+            logger.warning(
+                "ov-ext reflect: %s is set but no longer does anything (%s). "
+                "Remove it from the deployment.",
+                name,
+                RETIRED[name],
+            )
+        unknown = sorted(present - known - set(RETIRED))
         if unknown:
             raise ValueError(
                 f"Unknown setting(s): {', '.join(unknown)}. "
@@ -245,14 +273,6 @@ class ReflectSettings(BaseSettings):
             "`lock` is postgres. Used only to hold the lock, never queried, "
             "though the natural choice is the database already backing the "
             "store."
-        ),
-    )
-    contradictions: bool = Field(
-        default=True,
-        description=(
-            "Ask which memories are in tension and record a `contradicts` link "
-            "for each pair. Costs one model call per batch over memories that "
-            "have already been gathered."
         ),
     )
     observations_root: str = Field(

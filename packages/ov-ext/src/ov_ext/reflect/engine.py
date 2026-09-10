@@ -1,4 +1,4 @@
-"""The sweep: gather, propose, contradict, verify, write.
+"""The sweep: gather, propose, verify, write.
 
 memex runs seven numbered phases against a ``mental_models`` table, with
 compare-and-swap writes, a Postgres work queue and dead-lettering. Almost all
@@ -10,12 +10,17 @@ one function:
 2. group by directory, so one batch is one area of the store;
 3. gather evidence: the changed memories, their semantic neighbours, and a few
    at random;
-4. one model call for observations, one for contradictions;
+4. one model call for observations;
 5. verify every quote in code;
 6. write what survived, and move the watermark.
 
-The two model calls share a single gathered batch and a single citation map,
-so contradiction detection costs one extra call rather than a second pipeline.
+There was a second model call, asking which memories were in tension, and it is
+gone. Contradiction needs two whole memories held side by side to mean anything,
+and a batch does not offer that: its members are grouped by directory, so the
+model was asked whether a note about a package rename contradicted a quote from
+a README. It answered, because it was asked to. Every pair it returned was an
+artifact of the question rather than a tension in the store, and each one cost a
+model call and wrote a ``contradicts`` edge into somebody's memory.
 
 Nothing here raises on a bad batch. A directory whose model call fails, or
 whose observations all fail verification, is counted and skipped -- a sweep
@@ -33,14 +38,13 @@ from ..observability import annotate, record_error, traced
 from .citations import build_memory_context, citation_map
 from .config import ReflectSettings
 from .models import (
-    Contradictions,
     MemoryRow,
     Observation,
     ProposedObservations,
     ReflectMemoryContext,
 )
 from .ports import MemoryStore, StructuredLLM
-from .prompts import contradiction_prompt, propose_prompt
+from .prompts import propose_prompt
 from .verify import verify_observations
 from .watermark import Watermark
 
@@ -50,11 +54,6 @@ logger = logging.getLogger(__name__)
 
 # Span and attribute prefix for this subsystem, matching `ov_ext.retrieval`.
 NAMESPACE = "ov_ext.reflect"
-
-# Relations worth recording. "reinforce" is dropped deliberately: agreement is
-# the normal state of a memory store, so linking it would add an edge to most
-# pairs and drown the disagreements that matter.
-_RECORDED_RELATIONS = {"contradict": 0.9, "weaken": 0.5}
 
 
 @dataclass(frozen=True)
@@ -92,8 +91,6 @@ class SweepReport:
         Observations the model offered, before verification.
     written : int
         Observations that survived and were written.
-    contradictions : int
-        Links recorded between memories in tension.
     dropped : dict[str, int]
         Why observations were discarded, keyed by reason. The ratio of this to
         ``proposed`` is the signal that a prompt change made things worse.
@@ -108,7 +105,6 @@ class SweepReport:
     batches: int = 0
     proposed: int = 0
     written: int = 0
-    contradictions: int = 0
     dropped: dict[str, int] = field(default_factory=dict)
     failures: int = 0
     stepped_over: bool = False
@@ -224,7 +220,6 @@ class ReflectionEngine:
                 "ov_ext.reflect.batches": report.batches,
                 "ov_ext.reflect.proposed": report.proposed,
                 "ov_ext.reflect.written": report.written,
-                "ov_ext.reflect.contradictions": report.contradictions,
                 "ov_ext.reflect.failures": report.failures,
             }
         )
@@ -237,7 +232,23 @@ class ReflectionEngine:
         # failed. Hold, and count it -- but not forever, or one poisoned batch
         # blocks every memory behind it for good.
         if watermark.stalls + 1 > settings.max_stalls:
-            forced = max(every) if every else watermark.last_seen
+            if not every:
+                # Nothing was read to step over to -- every batch resolved to no
+                # rows, so `changed_since` and `rows` disagree about the store.
+                # Forcing the mark to where it already is would clear the stall
+                # and rewrite the file every sweep, forever, while fixing
+                # nothing. Hold instead, and say why.
+                logger.error(
+                    "ov-ext reflect: %d sweeps with no progress and nothing to "
+                    "step over to -- %d batches all read zero rows. The change "
+                    "query and the row fetch disagree; reflection is stuck until "
+                    "that is fixed.",
+                    watermark.stalls + 1,
+                    report.batches,
+                )
+                annotate({"ov_ext.reflect.outcome": "stuck_no_rows"})
+                return report, watermark
+            forced = max(every)
             report.stepped_over = True
             logger.error(
                 "ov-ext reflect: no progress for %d sweeps; stepping the watermark "
@@ -252,6 +263,17 @@ class ReflectionEngine:
             return report, watermark.stepped_over(forced, now=moment)
 
         annotate({"ov_ext.reflect.outcome": "stalled"})
+        logger.warning(
+            "ov-ext reflect: read %d changed memories across %d batches but "
+            "advanced nothing; watermark held at %s, stall %d of %d. Failures "
+            "this sweep: %d.",
+            len(changed),
+            report.batches,
+            watermark.last_seen.isoformat(),
+            watermark.stalls + 1,
+            settings.max_stalls,
+            report.failures,
+        )
         return report, watermark.stalled(now=moment)
 
     @traced("ov_ext.reflect.batch")
@@ -278,7 +300,18 @@ class ReflectionEngine:
 
         changed_rows = await self._store.rows(uris)
         if not changed_rows:
+            # `changed_since` just named these URIs, so finding no rows behind
+            # them means the two queries disagree about the store. Warned rather
+            # than passed over: a batch that reads nothing advances nothing, so
+            # a sweep where every batch lands here repeats forever, and silence
+            # here is what makes that look like an idle sweep.
             annotate({"ov_ext.reflect.outcome": "no_rows"})
+            logger.warning(
+                "ov-ext reflect: %d changed URIs in %s fetched no rows; "
+                "nothing to reflect on and the watermark cannot advance",
+                len(uris),
+                directory,
+            )
             return BatchOutcome(complete=True, newest=None, oldest=None)
 
         gathered = await self._gather(changed_rows)
@@ -288,17 +321,10 @@ class ReflectionEngine:
         annotate({"ov_ext.reflect.gathered": len(gathered)})
 
         scope = await self._store.read_overview(directory)
-        proposed_ok = await self._propose(
-            contexts, scope, index_to_uri, rows_by_uri, report
-        )
-
-        contradicted_ok = True
-        if self._settings.contradictions:
-            contradicted_ok = await self._contradict(contexts, index_to_uri, report)
+        complete = await self._propose(contexts, scope, index_to_uri, rows_by_uri, report)
 
         oldest = min(row.updated_at for row in changed_rows)
         newest = max(row.updated_at for row in changed_rows)
-        complete = proposed_ok and contradicted_ok
         if not complete:
             annotate({"ov_ext.reflect.outcome": "batch_incomplete"})
         return BatchOutcome(complete=complete, newest=newest, oldest=oldest)
@@ -350,11 +376,21 @@ class ReflectionEngine:
             proposed = await self._llm.complete(prompt, ProposedObservations)
         except Exception as exc:  # the model is a network call; a batch may fail
             record_error(exc, "propose_failed", NAMESPACE)
+            # Logged as well as recorded on the span: `record_error` writes only
+            # to the tracer, so a model that fails on every batch left nothing in
+            # the logs but a `failures=` count, and an operator reading stderr saw
+            # a sweep that looked idle rather than broken.
+            logger.warning(
+                "ov-ext reflect: propose call failed; batch skipped", exc_info=exc
+            )
             report.failures += 1
             return False
 
         if proposed is None:
             annotate({"ov_ext.reflect.outcome": "propose_unparsed"})
+            logger.warning(
+                "ov-ext reflect: propose call returned nothing parseable; batch skipped"
+            )
             report.failures += 1
             return False
 
@@ -396,54 +432,3 @@ class ReflectionEngine:
                 weight=1.0 / len(observation.evidence),
             )
         report.written += 1
-
-    async def _contradict(
-        self,
-        contexts: Sequence[ReflectMemoryContext],
-        index_to_uri: dict[int, str],
-        report: SweepReport,
-    ) -> bool:
-        """Ask which memories are in tension; record an edge per pair.
-
-        Returns
-        -------
-        bool
-            False when the model call failed or returned nothing parseable.
-        """
-        try:
-            found = await self._llm.complete(
-                contradiction_prompt(contexts),
-                Contradictions,
-            )
-        except Exception as exc:
-            record_error(exc, "contradict_failed", NAMESPACE)
-            report.failures += 1
-            return False
-
-        if found is None:
-            annotate({"ov_ext.reflect.outcome": "contradict_unparsed"})
-            report.failures += 1
-            return False
-
-        for relationship in found.relationships:
-            weight = _RECORDED_RELATIONS.get(relationship.relation.strip().lower())
-            if weight is None:
-                continue
-            left = index_to_uri.get(relationship.left_index)
-            right = index_to_uri.get(relationship.right_index)
-            if left is None or right is None or left == right:
-                continue
-            if self._settings.dry_run:
-                logger.info(
-                    "ov-ext reflect (dry run): would link %s contradicts %s", left, right
-                )
-            else:
-                # No match_text: the claim is about two memories taken as
-                # wholes, and OpenViking checks match_text verbatim -- inventing
-                # a span here would fail that check or, worse, pass it by
-                # accident.
-                await self._store.link(
-                    left, right, link_type="contradicts", weight=weight
-                )
-            report.contradictions += 1
-        return True

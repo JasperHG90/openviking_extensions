@@ -40,8 +40,6 @@ from ov_ext.reflect.engine import ReflectionEngine  # noqa: E402
 from ov_ext.reflect.exceptions import ContentUnavailableError  # noqa: E402
 from ov_ext.reflect.models import (  # noqa: E402
     CandidateObservation,
-    Contradictions,
-    ContradictionRelationship,
     EvidenceItem,
     Observation,
     ProposedObservations,
@@ -405,20 +403,18 @@ async def test_an_observation_is_written_as_a_memory_openviking_can_parse(
     assert parsed.memory_type == "observations"
 
 
-async def test_a_contradiction_link_lands_on_a_real_memory_file(
-    backend: Any, viking_fs: Any
-) -> None:
-    """The one write that touches a file reflection did not author."""
+async def test_a_link_lands_on_a_real_memory_file(backend: Any, viking_fs: Any) -> None:
+    """Linking against a real memory file, through OpenViking's own merge."""
     from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 
     await viking_fs.write_file(A, f"# scheduler\n\n{A_TEXT}\n", ctx=ctx())
     store = VikingStore(viking_fs, backend, ctx(), settings())
 
-    await store.link(A, B, link_type="contradicts", weight=0.9)
+    await store.link(A, B, link_type="derived_from", weight=0.9)
     parsed = MemoryFileUtils.read(await viking_fs.read_file(A, ctx=ctx()), uri=A)
 
     assert [link["to_uri"] for link in parsed.links] == [B]
-    assert parsed.links[0]["link_type"] == "contradicts"
+    assert parsed.links[0]["link_type"] == "derived_from"
     # The body survives, because the link is merged in rather than replacing it.
     assert A_TEXT in parsed.content
 
@@ -441,7 +437,7 @@ async def test_a_sweep_writes_an_observation_and_remembers_where_it_got_to(
 
     when = datetime(2026, 9, 5, tzinfo=timezone.utc)
     await seed(backend, when)
-    llm = FakeLLM([proposal(), Contradictions(relationships=[])])
+    llm = FakeLLM([proposal()])
 
     report = await run_sweep(
         viking_fs,
@@ -505,9 +501,7 @@ async def test_a_fabricated_quote_never_reaches_the_real_store(
         ]
     )
     store = VikingStore(viking_fs, backend, ctx(), settings())
-    engine = ReflectionEngine(
-        store, FakeLLM([invented, Contradictions(relationships=[])]), settings()
-    )
+    engine = ReflectionEngine(store, FakeLLM([invented]), settings())
 
     report, _ = await engine.sweep(Watermark.beginning(), now=datetime.now(timezone.utc))
 
@@ -516,39 +510,6 @@ async def test_a_fabricated_quote_never_reaches_the_real_store(
     assert report.dropped["quote_not_found"] == 1
     with pytest.raises(Exception):
         await viking_fs.ls(f"viking://user/{USER}/memories/observations", ctx=ctx())
-    await backend.close()
-
-
-async def test_a_contradiction_found_in_a_sweep_lands_on_the_memory(
-    backend: Any, viking_fs: Any
-) -> None:
-    from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
-
-    await seed(backend, datetime(2026, 9, 5, tzinfo=timezone.utc))
-    await viking_fs.write_file(A, f"# scheduler\n\n{A_TEXT}\n", ctx=ctx())
-    llm = FakeLLM(
-        [
-            ProposedObservations(observations=[]),
-            Contradictions(
-                relationships=[
-                    ContradictionRelationship(
-                        left_index=0,
-                        right_index=1,
-                        relation="contradict",
-                        reasoning="different retry policies",
-                    )
-                ]
-            ),
-        ]
-    )
-    store = VikingStore(viking_fs, backend, ctx(), settings())
-    engine = ReflectionEngine(store, llm, settings())
-
-    report, _ = await engine.sweep(Watermark.beginning(), now=datetime.now(timezone.utc))
-
-    assert report.contradictions == 1
-    parsed = MemoryFileUtils.read(await viking_fs.read_file(A, ctx=ctx()), uri=A)
-    assert [link["link_type"] for link in parsed.links] == ["contradicts"]
     await backend.close()
 
 
@@ -668,7 +629,7 @@ async def test_two_concurrent_sweeps_produce_one_sweep(
             ctx(),
             settings(),
             lock=PostgresAdvisoryLock(postgres_dsn),
-            llm=FakeLLM([proposal(), Contradictions(relationships=[])]),
+            llm=FakeLLM([proposal()]),
             now=datetime.now(timezone.utc),
         )
 

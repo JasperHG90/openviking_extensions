@@ -114,16 +114,21 @@ async def _sweep_once(
 
     if resolved.dry_run:
         logger.info("ov-ext reflect (dry run): watermark left at %s", before.last_seen)
-    elif after.last_seen != before.last_seen:
+    elif after != before:
+        # The whole mark, not just `last_seen`. A stalled sweep returns the same
+        # `last_seen` with `stalls` one higher, so comparing only the timestamp
+        # threw the counter away every time and `max_stalls` could never trip --
+        # a batch that fails on every sweep blocked everything behind it for
+        # good, which is the exact outcome the counter exists to prevent. A
+        # sweep that read nothing returns the mark it was given, so this still
+        # writes nothing when there is nothing to record.
         await viking_fs.write_file(state_uri, after.dumps(), ctx=ctx)
 
     logger.info(
-        "ov-ext reflect: batches=%d proposed=%d written=%d contradictions=%d "
-        "failures=%d dropped=%s",
+        "ov-ext reflect: batches=%d proposed=%d written=%d failures=%d dropped=%s",
         report.batches,
         report.proposed,
         report.written,
-        report.contradictions,
         report.failures,
         report.dropped,
     )

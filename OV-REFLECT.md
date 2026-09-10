@@ -1,10 +1,18 @@
 # ov-reflect
 
 Reflection for OpenViking: periodically re-read a slice of memory, synthesize
-observations with cited evidence, detect contradictions, write back. Ported
-selectively from [memex](https://github.com/JasperHG90/memex)
-(`packages/core/src/memex_core/memory/{reflect,contradiction}`), adapted to
-OpenViking's primitives.
+observations with cited evidence, write back. Ported selectively from
+[memex](https://github.com/JasperHG90/memex)
+(`packages/core/src/memex_core/memory/reflect`), adapted to OpenViking's
+primitives.
+
+> **This is the original design record, kept as written.** One decision in it
+> has since been reversed: contradiction detection (call 2 below, and points 6
+> and 8 under Decisions) was built and then removed on 2026-09-10. A batch is
+> grouped by directory rather than by subject, so the model was asked whether a
+> note about a package rename contradicted a line from a README, and it
+> answered because it was asked to. Every pair it returned was an artifact of
+> the question. The rest of the document still describes the shipped design.
 
 ## Why
 

@@ -11,8 +11,8 @@ retrieval counter that reflection prioritises on has to live in the retriever.
     A lexical leg fused with OpenViking's vector search, plus an MMR diversity
     pass and a pooled reranker. Ported from memex.
 ``reflect``
-    Periodically re-reads recent memory, synthesizes observations with cited
-    evidence, and flags contradictions. Ported from memex.
+    Periodically re-reads recent memory and synthesizes observations with
+    cited evidence. Ported from memex.
 
 Settings are per subsystem and read from the environment: ``OV_RETRIEVAL_`` for
 retrieval, ``OV_REFLECT_`` for reflection. The prefixes name the subsystem
