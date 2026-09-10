@@ -19,10 +19,21 @@ the one method every memory upsert passes: the streaming updater, the
 compressor, the trainers and the extractor all construct a ``MemoryUpdater`` and
 call it. Wrapping it once on the class catches every path.
 
-Only what actually landed is recorded. ``apply_operations`` does not raise on a
-failed operation -- it collects the error and carries on -- so the batch handed
-in is a list of *intentions*. The URIs in the returned result are what happened,
-and a delta is kept only when its URI is among them.
+Only what actually landed is recorded, as far as the result allows.
+``apply_operations`` does not raise on a failed operation -- it collects the
+error and carries on -- so the batch handed in is a list of *intentions*. Three
+filters narrow it to what happened: the URI must be in the result's written or
+edited list, it must not also be in its errors, and each block is replayed
+through OpenViking's own matcher and kept only if it changes the text.
+
+One gap is not closeable from out here. ``MemoryUpdateResult`` reports URIs, not
+operations, so when two operations touch the same memory in one batch there is
+no way to tell which of them moved it. Such a URI is dropped, which loses real
+deltas rather than inventing false ones. The same seam means ``before`` is the
+operation's pre-fetched copy while the updater re-reads from disk, so a second
+patch to a memory already patched in the same batch replays against stale text.
+The reflect sweep can live with both: a missed delta is re-derived the next time
+that memory changes.
 
 Not everything is covered, and the gaps are structural rather than bugs:
 
@@ -144,30 +155,44 @@ def _block_sides(block: Any) -> tuple[str, str] | None:
     return str(search), str(getattr(block, "replace", "") or "")
 
 
-def _previous_value(operation: Any, field: str) -> str:
-    """The field's text before this operation, or ``""`` when there is none.
+def _previous_value(operation: Any, field: str) -> str | None:
+    """The field's value before this operation, or ``None`` when it had none.
 
-    Resolved the way ``MemoryUpdater._apply_upsert`` resolves it: ``content``
-    comes from the rendered body, every other field from ``extra_fields``. Using
-    the body for all of them would compare a ``soul.core_truths`` patch against
-    prose that never contains it, and silently drop every edit to the four
-    memory types whose patched fields are not ``content``.
+    Resolved exactly the way ``MemoryUpdater._apply_upsert`` resolves it:
+    ``content`` from the rendered body, every other field from
+    ``extra_fields``. Using the body for all of them would compare a
+    ``soul.core_truths`` patch against prose that never contains it, and drop
+    every edit to the four memory types whose patched fields are not
+    ``content``.
+
+    ``None`` and ``""`` are different answers, not two spellings of one.
+    ``PatchOp.apply`` routes a ``None`` to ``_extract_replace_when_no_original``
+    and writes the blocks' joined ``replace`` sides, while ``""`` goes to the
+    matcher and finds nothing. Collapsing them loses every first write to a
+    patch field -- a ``skills`` memory that later gains ``guidelines``, a
+    ``tools`` one that gains ``optimal_params``.
     """
     before = getattr(operation, "old_memory_file_content", None)
     if before is None:
-        return ""
+        return None
     try:
         if field == "content":
             return str(before.plain_content() or "")
-        return str((before.extra_fields or {}).get(field) or "")
-    except Exception:
+        value = (before.extra_fields or {}).get(field)
+        return None if value is None else str(value)
+    except Exception as exc:
         # A MemoryFile that cannot render its own value is not worth failing a
-        # capture over; treating it as empty drops that field's deltas, which
-        # is the safe direction.
-        return ""
+        # capture over. Logged rather than swallowed: silence here looks
+        # exactly like a memory that did not change.
+        logger.debug(
+            "ov-ext reflect: could not read %s before the patch", field, exc_info=exc
+        )
+        return None
 
 
-async def _applied_blocks(blocks: Sequence[Any], before: str) -> list[tuple[str, str]]:
+async def _applied_blocks(
+    blocks: Sequence[Any], before: str | None
+) -> list[tuple[str, str]]:
     """Return the ``(search, replace)`` pairs that really changed the text.
 
     Replays the blocks through OpenViking's own ``PatchOp`` rather than
@@ -189,18 +214,38 @@ async def _applied_blocks(blocks: Sequence[Any], before: str) -> list[tuple[str,
     blocks :
         The patch blocks, in the order the model emitted them.
     before :
-        The field's text before the patch.
+        The field's value before the patch, or ``None`` when it had none --
+        passed through untouched, because upstream treats the two differently.
 
     Returns
     -------
     list[tuple[str, str]]
-        One pair per block that changed the text, in order.
+        One pair per block that changed the text, in order. When ``before`` is
+        ``None`` the field had no value and the blocks are its first, so each
+        non-empty ``replace`` is returned with an empty ``search``.
     """
     from openviking.session.memory.merge_op.base import FieldType, StrPatch
     from openviking.session.memory.merge_op.patch import PatchOp
 
+    if before is None:
+        # The field is being populated for the first time. Upstream does not
+        # match anything here -- `_extract_replace_when_no_original` joins the
+        # blocks' `replace` sides and writes that -- so there is nothing to
+        # replay against, and the blocks carry no history. A first write also
+        # tends to arrive with `search` equal to `replace`, since the model has
+        # nothing to search for, which the no-op guard below would drop.
+        return [
+            ("", replace)
+            for _, replace in (
+                sides
+                for sides in (_block_sides(block) for block in blocks)
+                if sides is not None
+            )
+            if replace.strip()
+        ]
+
     patch_op = PatchOp(FieldType.STRING)
-    working = before
+    working: str = before
     applied: list[tuple[str, str]] = []
 
     for block in blocks:
@@ -214,9 +259,13 @@ async def _applied_blocks(blocks: Sequence[Any], before: str) -> list[tuple[str,
             continue
         try:
             after = await patch_op.apply(working, StrPatch(blocks=[block]))
-        except Exception:
+        except Exception as exc:
             # A block that raises did not land. The batch as a whole may still
-            # have succeeded on its other blocks.
+            # have succeeded on its other blocks. Logged, because a shape bug
+            # here would otherwise present as "this memory did not change".
+            logger.debug(
+                "ov-ext reflect: block did not replay, not recorded", exc_info=exc
+            )
             continue
         if after == working:
             # Belt and braces. Measured against OpenViking 0.4.17, a one-block
@@ -259,6 +308,14 @@ async def deltas_from(operations: Any, result: Any) -> list[MemoryDelta]:
     """
     landed = set(getattr(result, "written_uris", []) or [])
     landed |= set(getattr(result, "edited_uris", []) or [])
+    # A URI can be in both: `apply_operations` records success and failure per
+    # operation, and two operations in one batch can touch the same memory. The
+    # result says which URIs moved, not which operations moved them, so a URI
+    # that also failed is dropped rather than credited to whichever operation
+    # is asked about it. That loses real deltas in a mixed batch; recording
+    # invented ones would be worse.
+    failed = {uri for uri, _ in getattr(result, "errors", []) or []}
+    landed -= failed
     if not landed:
         return []
 

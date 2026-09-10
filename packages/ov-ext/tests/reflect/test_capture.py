@@ -451,3 +451,77 @@ async def test_an_overlapping_block_that_could_not_land_is_dropped() -> None:
     deltas = await deltas_from(operations(operation), applied(edited=[URI]))
 
     assert [(d.search, d.replace) for d in deltas] == [("one two", "ONE TWO")]
+
+
+async def test_a_field_gaining_its_first_value_is_captured() -> None:
+    """`None` and `""` are different answers upstream, not two spellings of one.
+
+    `PatchOp.apply` routes a `None` to `_extract_replace_when_no_original` and
+    writes the blocks' joined `replace` sides; `""` goes to the matcher and
+    finds nothing. A `skills` memory that later gains `guidelines` takes the
+    first branch, so collapsing them loses every first write to a patch field.
+    """
+    operation = ResolvedOperation(
+        old_memory_file_content=MemoryFile(
+            uri=URI, content="body", extra_fields={"recommendation": "use it"}
+        ),
+        memory_fields={
+            "guidelines": StrPatch(
+                blocks=[
+                    SearchReplaceBlock(
+                        search="- deploy on green", replace="- deploy on green"
+                    )
+                ]
+            )
+        },
+        memory_type="skills",
+        uris=[URI],
+    )
+
+    deltas = await deltas_from(operations(operation), applied(edited=[URI]))
+
+    assert [(d.field, d.search, d.replace) for d in deltas] == [
+        ("guidelines", "", "- deploy on green")
+    ]
+
+
+async def test_a_uri_that_both_landed_and_failed_is_dropped() -> None:
+    """The result reports URIs, not operations.
+
+    Two operations can touch one memory in a batch. When one succeeds and one
+    fails, there is no way out here to tell which blocks moved it, so the URI is
+    dropped -- losing real deltas rather than inventing false ones.
+    """
+    ops = operations(
+        edit(URI, blocks=[SearchReplaceBlock(search="alpha", replace="beta")]),
+        edit(URI, blocks=[SearchReplaceBlock(search="delta", replace="DELTA")]),
+    )
+    result = applied(edited=[URI])
+    result.add_error(URI, ValueError("second operation did not apply"))
+
+    assert await deltas_from(ops, result) == []
+
+
+async def test_upstream_still_raises_or_changes_on_a_single_block() -> None:
+    """Pins the invariant the `after == working` guard is held in reserve for.
+
+    Capture treats "the text changed" as the definition of applied, while
+    OpenViking defines it as `applied_count`. Today a one-block apply either
+    raises or changes the text, so the two agree. If that stops being true this
+    fails, rather than capture quietly recording a block that did nothing.
+    """
+    from openviking.session.memory.merge_op.base import FieldType
+    from openviking.session.memory.merge_op.patch import PatchOp
+
+    patch_op = PatchOp(FieldType.STRING)
+    before = "hello world"
+
+    with pytest.raises(Exception):
+        await patch_op.apply(
+            before, StrPatch(blocks=[SearchReplaceBlock(search="absent", replace="X")])
+        )
+
+    after = await patch_op.apply(
+        before, StrPatch(blocks=[SearchReplaceBlock(search="hello", replace="goodbye")])
+    )
+    assert after != before
