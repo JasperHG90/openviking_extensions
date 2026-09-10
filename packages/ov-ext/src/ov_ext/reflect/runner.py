@@ -46,6 +46,7 @@ async def run_sweep(
     lock: SweepLock,
     llm: StructuredLLM | None = None,
     now: datetime | None = None,
+    deltas: Any | None = None,
 ) -> SweepReport:
     """Load the watermark, sweep under ``lock``, and store the mark it reached.
 
@@ -75,6 +76,9 @@ async def run_sweep(
     now :
         Treated as the current time when stamping the mark. Passed in so tests
         stay deterministic.
+    deltas :
+        Captured changes to read instead of whole memories. Omitted means the
+        sweep reads whole memories, as it did before deltas existed.
 
     Returns
     -------
@@ -87,7 +91,7 @@ async def run_sweep(
         if not held:
             logger.debug("ov-ext reflect: sweep lock held elsewhere; not sweeping")
             return SweepReport()
-        return await _sweep_once(viking_fs, vikingdb, ctx, resolved, llm, now)
+        return await _sweep_once(viking_fs, vikingdb, ctx, resolved, llm, now, deltas)
 
 
 async def _sweep_once(
@@ -97,9 +101,10 @@ async def _sweep_once(
     resolved: ReflectSettings,
     llm: StructuredLLM | None,
     now: datetime | None,
+    deltas: Any | None = None,
 ) -> SweepReport:
     """One sweep, with the lock already held by the caller."""
-    store = VikingStore(viking_fs, vikingdb, ctx, resolved)
+    store = VikingStore(viking_fs, vikingdb, ctx, resolved, deltas=deltas)
     engine = ReflectionEngine(store, llm or VikingLLM(), resolved)
     state_uri = _expand(resolved.state_path, ctx.user.user_id)
 

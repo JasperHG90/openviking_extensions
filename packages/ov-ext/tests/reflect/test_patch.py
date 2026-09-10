@@ -188,7 +188,9 @@ async def test_settings_passed_in_code_are_the_ones_used(
     """
     seen: list[Any] = []
 
-    async def fake_ticker(fs: Any, db: Any, ctx: Any, lock: Any, cfg: Any) -> None:
+    async def fake_ticker(
+        fs: Any, db: Any, ctx: Any, lock: Any, cfg: Any, **kwargs: Any
+    ) -> None:
         seen.append(ctx)
         await asyncio.sleep(3600)
 

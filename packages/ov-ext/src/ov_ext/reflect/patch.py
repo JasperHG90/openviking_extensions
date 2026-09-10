@@ -23,7 +23,9 @@ import asyncio
 import logging
 from typing import Any
 
+from . import capture
 from .config import ReflectSettings
+from .deltas import build_delta_store
 from .locks import build_lock
 from .ticker import run_ticker
 
@@ -39,6 +41,11 @@ _METHOD = "initialize"
 # state because the patch is process-global, as is the task it starts.
 _original: Any = None
 _task: asyncio.Task[None] | None = None
+
+# The delta store, built once at startup. Written to by the capture hook on every
+# memory write, read by each sweep -- one object, so the sweep sees what capture
+# recorded and there is one pool rather than two.
+_deltas: Any = None
 
 
 def install(settings: ReflectSettings | None = None) -> None:
@@ -89,6 +96,14 @@ def install(settings: ReflectSettings | None = None) -> None:
         _start_ticker(service, resolved)
         return result
 
+    # Capture starts now, not with the service: memories are written by paths
+    # that do not wait for `initialize`, and a change missed before the ticker
+    # starts is a change no sweep will ever see.
+    global _deltas
+    _deltas = build_delta_store(resolved)
+    if _deltas is not None:
+        capture.install(_deltas)
+
     _original = original
     setattr(service_class, _METHOD, initialize_and_start)
     logger.info("ov-ext reflect: ticker will start with the service")
@@ -99,7 +114,9 @@ def uninstall() -> None:
 
     Safe to call when nothing was installed.
     """
-    global _original, _task
+    global _original, _task, _deltas
+    capture.uninstall()
+    _deltas = None
     if _task is not None:
         _task.cancel()
         _task = None
@@ -138,7 +155,9 @@ def _start_ticker(service: Any, settings: ReflectSettings) -> None:
         return
 
     _task = asyncio.create_task(
-        run_ticker(viking_fs, vikingdb, ctx, build_lock(settings), settings)
+        run_ticker(
+            viking_fs, vikingdb, ctx, build_lock(settings), settings, deltas=_deltas
+        )
     )
     # Without a reference the loop may garbage-collect the task mid-sweep;
     # `_task` is that reference, and it is also what uninstall() cancels.

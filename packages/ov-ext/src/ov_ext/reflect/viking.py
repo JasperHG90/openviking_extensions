@@ -22,6 +22,7 @@ serializes it so the format is theirs rather than ours.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import random
@@ -123,6 +124,11 @@ class VikingStore:
         Source of randomness for the tail sample. Injectable so a test can make
         it deterministic; left to the system otherwise, because varying between
         sweeps is the point.
+    deltas :
+        Captured changes, when the backend is recording them. This is the whole
+        point of the delta work: with it, a changed memory is shown to the model
+        as the lines that changed rather than the twenty kilobytes around them.
+        Without it the sweep reads whole memories, which is what it always did.
     """
 
     def __init__(
@@ -132,11 +138,20 @@ class VikingStore:
         ctx: Any,
         settings: ReflectSettings | None = None,
         rng: random.Random | None = None,
+        deltas: Any | None = None,
     ) -> None:
         self._fs = viking_fs
         self._db = vikingdb
         self._ctx = ctx
         self._settings = settings or ReflectSettings()
+        self._deltas = deltas
+        # Row ids consumed by the current sweep, so a completed batch can retire
+        # exactly what it read. Keyed by URI because that is what the engine
+        # hands back.
+        self._consumed: dict[str, list[int]] = {}
+        # The delta rows behind each URI in the current batch, so `rows`
+        # can build a memory whose text is the change rather than the file.
+        self._delta_text: dict[str, list[dict[str, Any]]] = {}
         # Unseeded on purpose: the tail sample exists to vary between sweeps,
         # so reproducibility here would defeat it. Tests inject their own.
         self._rng = rng or random.Random()
@@ -168,7 +183,16 @@ class VikingStore:
         )
 
     async def changed_since(self, moment: datetime, *, limit: int) -> list[str]:
-        """Return stored URIs of memory rows updated after ``moment``."""
+        """Return stored URIs of memory rows updated after ``moment``.
+
+        Reads the delta table when one is configured. The watermark is not
+        consulted then: a delta is pending until the sweep that consumed it
+        retires it, which is a better record of what is outstanding than a
+        timestamp that cannot express "read but not finished".
+        """
+        if self._deltas is not None:
+            return await self._changed_from_deltas(limit=limit)
+
         from openviking.storage.expr import And, Eq, PathScope, TimeRange
 
         # level=2 is the memory itself. Levels 0 and 1 are the generated
@@ -211,6 +235,56 @@ class VikingStore:
             if record.get("uri") and parse_timestamp(record.get("updated_at")) > moment
         ]
 
+    async def _changed_from_deltas(self, *, limit: int) -> list[str]:
+        """Return URIs with pending deltas, oldest change first.
+
+        Records which rows each URI accounts for, so :meth:`mark_reflected` can
+        retire exactly what was read rather than everything that happens to be
+        pending when the batch finishes.
+        """
+        reader = self._deltas
+        assert reader is not None  # only reached with a store configured
+        pending = await asyncio.to_thread(reader.pending, limit=limit)
+        self._consumed = {}
+        ordered: list[str] = []
+        for record in pending:
+            uri = str(record["uri"])
+            if uri not in self._consumed:
+                self._consumed[uri] = []
+                ordered.append(uri)
+            self._consumed[uri].append(int(record["id"]))
+            self._delta_text.setdefault(uri, []).append(record)
+        return ordered
+
+    async def mark_reflected(self, uris: Sequence[str]) -> None:
+        """Retire the deltas the given URIs accounted for."""
+        if self._deltas is None:
+            return
+        ids = [row_id for uri in uris for row_id in self._consumed.get(uri, [])]
+        if not ids:
+            return
+        await asyncio.to_thread(
+            self._deltas.mark_reflected, ids, when=datetime.now(timezone.utc)
+        )
+        for uri in uris:
+            self._consumed.pop(uri, None)
+            self._delta_text.pop(uri, None)
+
+    def _row_from_deltas(self, uri: str) -> MemoryRow | None:
+        """Build a row whose text is what changed, not the whole memory."""
+        records = self._delta_text.get(uri)
+        if not records:
+            return None
+        # The replace side is the memory's new wording; the search side is what
+        # a deletion removed and is the only text a delete-only change has.
+        lines = [str(record["replace"] or record["search"]).strip() for record in records]
+        text = "\n".join(line for line in lines if line)
+        if not text:
+            return None
+        newest = max(parse_timestamp(record["changed_at"]) for record in records)
+        oldest = min(parse_timestamp(record["changed_at"]) for record in records)
+        return MemoryRow(uri=uri, text=text, created_at=oldest, updated_at=newest)
+
     async def rows(self, uris: Sequence[str]) -> list[MemoryRow]:
         """Fetch the text and timestamps for specific URIs.
 
@@ -226,6 +300,12 @@ class VikingStore:
 
         if not uris:
             return []
+        if self._deltas is not None:
+            from_deltas = [
+                row for row in (self._row_from_deltas(uri) for uri in uris) if row
+            ]
+            if from_deltas:
+                return from_deltas
         records = await self._db.filter(
             filter=In("uri", list(uris)),
             limit=len(uris),
@@ -269,7 +349,7 @@ class VikingStore:
             for uri in (self._stored_uri(context) for context in result.memories or [])
             if uri is not None and uri != row.uri
         ]
-        return await self.rows(uris[:limit])
+        return self._as_context(await self.rows(uris[:limit]))
 
     @staticmethod
     def _stored_uri(context: Any) -> str | None:
@@ -321,8 +401,31 @@ class VikingStore:
             if row is not None
         ]
         if len(rows) <= limit:
-            return rows
-        return self._rng.sample(rows, limit)
+            return self._as_context(rows)
+        return self._as_context(self._rng.sample(rows, limit))
+
+    def _as_context(self, rows: Sequence[MemoryRow]) -> list[MemoryRow]:
+        """Trim rows shown only as background to ``context_chars``.
+
+        A changed memory is delta-sized already; a neighbour is the whole file,
+        and five of them undo the delta work on their own. Safe because quotes
+        are verified against the row text the model was shown, so a quote can
+        only come from the part that was sent.
+        """
+        cap = self._settings.context_chars
+        if not cap:
+            return list(rows)
+        return [
+            row
+            if len(row.text) <= cap
+            else MemoryRow(
+                uri=row.uri,
+                text=row.text[:cap],
+                created_at=row.created_at,
+                updated_at=row.updated_at,
+            )
+            for row in rows
+        ]
 
     async def read_overview(self, directory: str) -> str | None:
         """Return a directory's generated L1 overview, or ``None`` if absent."""

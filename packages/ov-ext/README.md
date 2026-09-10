@@ -401,14 +401,25 @@ base.
 One sweep:
 
 ```
-changed = query_L2(updated_at > watermark)     # URIs only
+changed = pending_deltas()                     # what changed, not the files
 for dir, uris in group_by_parent(changed):
     scope = read_L1(dir)                       # background, never cited
-    mems  = rows(uris) + neighbours() + tail_sample()
+    mems  = deltas(uris) + neighbours() + tail_sample()
     obs   = propose(scope, mems)               # the one model call
     obs   = verify_quotes(obs, mems)           # code, no model
     write(obs)
 ```
+
+A changed memory is shown to the model as the lines that changed, not the
+file they sit in — measured on a real 23 KB memory, two edited lines, that is
+83 characters instead of 23,003. OpenViking computes the change itself when it
+applies a `patch` field and then discards it, so ov-ext catches the blocks on
+the way through `MemoryUpdater.apply_operations` and keeps them in Postgres.
+Without `OV_REFLECT_DELTAS_DSN` the sweep reads whole memories, as before.
+
+Neighbours and tail samples are still whole memories, so they are capped at
+`OV_REFLECT_CONTEXT_CHARS`. Safe, because quotes are verified against exactly
+the text the model was shown.
 
 One model call per batch. A second call asked which memories were in tension;
 it was removed. A batch is grouped by directory, not by subject, so the model
@@ -509,6 +520,9 @@ the one path every sweep goes through, so there is no second, unlocked way in.
 |---|---|---|
 | `OV_REFLECT_ENABLED` | `false` | Register the memory type and allow sweeps. Off until you turn it on |
 | `OV_REFLECT_DRY_RUN` | `false` | Read, prompt and verify; report what it would write |
+| `OV_REFLECT_DELTAS_DSN` | _(unset)_ | Read what changed in each memory instead of the whole file. Needs ov-postgres with `keep_deltas` on |
+| `OV_REFLECT_DELTAS_SCHEMA` | `public` | Schema holding the delta table |
+| `OV_REFLECT_CONTEXT_CHARS` | `1200` | Cap on any one memory shown as background (a neighbour or tail sample) |
 | `OV_REFLECT_BATCH_LIMIT` | `50` | Most changed memories per sweep |
 | `OV_REFLECT_NEIGHBOUR_LIMIT` | `8` | Semantic neighbours per changed memory |
 | `OV_REFLECT_TAIL_SAMPLE` | `3` | Memories drawn from the far end of the store |

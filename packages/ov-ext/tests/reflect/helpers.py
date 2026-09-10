@@ -65,6 +65,7 @@ class FakeStore:
         self._overview = overview
         self.written: list[Observation] = []
         self.links: list[tuple[str, str, str, str | None, float]] = []
+        self.reflected: list[str] = []
 
     async def changed_since(self, moment: datetime, *, limit: int) -> list[str]:
         """Return URIs of rows updated after ``moment``, oldest first.
@@ -79,6 +80,10 @@ class FakeStore:
     async def rows(self, uris: Sequence[str]) -> list[MemoryRow]:
         """Return the rows for ``uris`` that exist."""
         return [self._rows[uri] for uri in uris if uri in self._rows]
+
+    async def mark_reflected(self, uris: Sequence[str]) -> None:
+        """Record which URIs a completed batch retired."""
+        self.reflected.extend(uris)
 
     async def neighbours(self, row: MemoryRow, *, limit: int) -> list[MemoryRow]:
         """Return whatever neighbours were configured for this row."""

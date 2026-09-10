@@ -46,6 +46,7 @@ async def run_ticker(
     settings: ReflectSettings | None = None,
     *,
     llm: StructuredLLM | None = None,
+    deltas: Any | None = None,
 ) -> None:
     """Sweep on an interval until cancelled, one sweep at a time.
 
@@ -67,6 +68,8 @@ async def run_ticker(
         Behaviour toggles. Read from the environment when omitted.
     llm :
         The model. Defaults to OpenViking's configured one.
+    deltas :
+        Captured changes to read instead of whole memories.
 
     Raises
     ------
@@ -91,7 +94,9 @@ async def run_ticker(
             # The lock goes to run_sweep rather than being taken here, so the
             # locking lives on the one path every sweep goes through -- there
             # is no second, unlocked way in.
-            await run_sweep(viking_fs, vikingdb, ctx, resolved, lock=lock, llm=llm)
+            await run_sweep(
+                viking_fs, vikingdb, ctx, resolved, lock=lock, llm=llm, deltas=deltas
+            )
         except asyncio.CancelledError:
             logger.info("ov-ext reflect: ticker cancelled")
             raise

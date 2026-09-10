@@ -323,6 +323,11 @@ class ReflectionEngine:
         scope = await self._store.read_overview(directory)
         complete = await self._propose(contexts, scope, index_to_uri, rows_by_uri, report)
 
+        if complete:
+            # Only now: a delta retired by a batch that then failed is a change
+            # nothing will ever reflect on.
+            await self._store.mark_reflected([row.uri for row in changed_rows])
+
         oldest = min(row.updated_at for row in changed_rows)
         newest = max(row.updated_at for row in changed_rows)
         if not complete:

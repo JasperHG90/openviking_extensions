@@ -289,3 +289,99 @@ async def test_the_lock_is_required_not_optional() -> None:
         await run_sweep(  # type: ignore[call-arg]
             FakeFS(), FakeDB([]), FakeCtx(), settings(), llm=quiet(), now=NOW
         )
+
+
+class FakeDeltas:
+    """A delta store holding what capture would have recorded."""
+
+    def __init__(self, records: list[dict[str, Any]] | None = None) -> None:
+        self.records = records or []
+        self.retired: list[int] = []
+
+    def pending(self, *, limit: int, since: Any = None) -> list[dict[str, Any]]:
+        return [r for r in self.records if r["id"] not in self.retired][:limit]
+
+    def mark_reflected(self, ids: Any, *, when: datetime) -> int:
+        self.retired.extend(ids)
+        return len(list(ids))
+
+
+def delta_row(row_id: int, uri: str, replace: str, day: int = 1) -> dict[str, Any]:
+    """One captured change, as the store hands it back."""
+    return {
+        "id": row_id,
+        "uri": uri,
+        "memory_type": "entities",
+        "field": "content",
+        "search": "",
+        "replace": replace,
+        "created": False,
+        "changed_at": datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(days=day),
+    }
+
+
+async def test_a_sweep_reads_the_change_not_the_whole_memory() -> None:
+    """The point of the delta work, end to end through run_sweep.
+
+    The vector store here returns nothing at all. If the sweep still reached for
+    whole memories it would find none and do nothing; the batch it runs can only
+    have come from the delta store.
+    """
+    fs = FakeFS()
+    uri = "viking://user/jasper/memories/entities/a.md"
+    deltas = FakeDeltas(
+        [delta_row(1, uri, "- ships v0.4"), delta_row(2, uri, "- adds MMR")]
+    )
+
+    report = await run_sweep(
+        fs,
+        FakeDB([]),
+        FakeCtx(),
+        settings(),
+        lock=ProcessLock(),
+        llm=quiet(),
+        now=NOW,
+        deltas=deltas,
+    )
+
+    assert report.batches == 1, "the batch came from the delta store"
+
+
+async def test_a_completed_batch_retires_the_deltas_it_read() -> None:
+    """Otherwise every sweep re-reads the same changes forever."""
+    uri = "viking://user/jasper/memories/entities/a.md"
+    deltas = FakeDeltas([delta_row(1, uri, "- ships v0.4")])
+
+    await run_sweep(
+        FakeFS(),
+        FakeDB([]),
+        FakeCtx(),
+        settings(),
+        lock=ProcessLock(),
+        llm=quiet(),
+        now=NOW,
+        deltas=deltas,
+    )
+
+    assert deltas.retired == [1]
+    assert deltas.pending(limit=10) == []
+
+
+async def test_a_failed_batch_leaves_its_deltas_pending() -> None:
+    """A delta retired by a sweep that failed is a change nothing reflects on."""
+    uri = "viking://user/jasper/memories/entities/a.md"
+    deltas = FakeDeltas([delta_row(1, uri, "- ships v0.4")])
+
+    await run_sweep(
+        FakeFS(),
+        FakeDB([]),
+        FakeCtx(),
+        settings(),
+        lock=ProcessLock(),
+        llm=BrokenLLM(),
+        now=NOW,
+        deltas=deltas,
+    )
+
+    assert deltas.retired == []
+    assert len(deltas.pending(limit=10)) == 1

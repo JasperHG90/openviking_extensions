@@ -18,13 +18,13 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime
-from typing import Protocol, TypeVar
+from typing import Any, Protocol, TypeVar
 
 from pydantic import BaseModel
 
 from .models import MemoryRow, Observation
 
-__all__ = ["MemoryStore", "StructuredLLM"]
+__all__ = ["DeltaReader", "MemoryStore", "StructuredLLM"]
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -41,6 +41,25 @@ class StructuredLLM(Protocol):
 
     async def complete(self, prompt: str, model: type[T]) -> T | None:
         """Answer ``prompt`` as an instance of ``model``, or ``None``."""
+        ...
+
+
+class DeltaReader(Protocol):
+    """The captured changes reflection reads instead of whole memories.
+
+    Implemented by ov-postgres's ``PgDeltaStore``. Structural, so neither
+    package imports the other -- ov-ext states the shape it needs and ov-postgres
+    happens to have it.
+    """
+
+    def pending(
+        self, *, limit: int, since: datetime | None = None
+    ) -> list[dict[str, Any]]:
+        """Return deltas not yet reflected on, oldest first."""
+        ...
+
+    def mark_reflected(self, ids: Sequence[int], *, when: datetime) -> int:
+        """Mark deltas as reflected on, after the sweep's write succeeded."""
         ...
 
 
@@ -100,6 +119,15 @@ class MemoryStore(Protocol):
 
         The choice must vary between sweeps. Returning the same rows every time
         is a constant, and a constant cannot break an echo chamber.
+        """
+        ...
+
+    async def mark_reflected(self, uris: Sequence[str]) -> None:
+        """Retire the deltas a completed batch consumed.
+
+        Called only after the batch's observations are written, never before: a
+        delta retired by a sweep that then failed is a change nothing will ever
+        reflect on. A no-op for a store reading whole memories.
         """
         ...
 

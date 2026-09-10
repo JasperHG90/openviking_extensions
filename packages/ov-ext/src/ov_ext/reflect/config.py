@@ -275,6 +275,30 @@ class ReflectSettings(BaseSettings):
             "store."
         ),
     )
+    deltas_dsn: str = Field(
+        default="",
+        description=(
+            "libpq connection string for the captured-change table. Set it and "
+            "the sweep reads what changed in each memory instead of the whole "
+            "file, which is the difference between a prompt the model answers "
+            "and one it times out on. Needs ov-postgres with `keep_deltas` on."
+        ),
+    )
+    deltas_schema: str = Field(
+        default="public",
+        description="PostgreSQL schema holding the delta table.",
+    )
+    context_chars: int = Field(
+        default=1200,
+        ge=0,
+        description=(
+            "Most characters of any one memory shown to the model as context -- "
+            "a neighbour or a tail sample, never a changed memory, which is "
+            "already delta-sized. Quotes are verified against exactly what was "
+            "shown, so truncating here cannot produce a citation to text the "
+            "model never saw. 0 disables the cap."
+        ),
+    )
     observations_root: str = Field(
         default="viking://~/memories/observations",
         description=(
