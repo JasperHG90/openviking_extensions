@@ -45,7 +45,7 @@ from .models import (
     ProposedObservations,
     ReflectMemoryContext,
 )
-from .ports import MemoryStore, StructuredLLM
+from .ports import MemoryStore, Sampler, StructuredLLM
 from .prompts import consolidate_prompt, propose_prompt
 from .verify import normalise, verify_observations
 from .watermark import Watermark
@@ -157,14 +157,24 @@ class ReflectionEngine:
         store: MemoryStore,
         llm: StructuredLLM,
         settings: ReflectSettings | None = None,
-        rng: random.Random | None = None,
+        rng: Sampler | None = None,
     ) -> None:
         self._store = store
         self._llm = llm
         self._settings = settings or ReflectSettings()
         # Unseeded on purpose: two sweeps sampling identically would ask the
         # same questions twice. Tests inject their own.
-        self._rng = rng or random.Random()
+        self._rng: Sampler = rng or random.Random()
+
+    @property
+    def _reads_deltas(self) -> bool:
+        """Whether the store reads captured changes rather than whole memories.
+
+        Changes what "no progress" means: with deltas, pendingness tracks the
+        work and the watermark tracks nothing, so a stalled sweep has skipped
+        no memory however long it stalls.
+        """
+        return getattr(self._store, "reads_deltas", False)
 
     @traced("ov_ext.reflect.sweep")
     async def sweep(
@@ -264,6 +274,22 @@ class ReflectionEngine:
                 return report, watermark
             forced = max(every)
             report.stepped_over = True
+            if self._reads_deltas:
+                # The watermark is not what tracks progress here -- pendingness
+                # is, and a failed batch retires nothing -- so nothing is being
+                # stepped over and no memory is dropped. Said plainly, because
+                # the operator most likely to read this is one debugging the
+                # outage that caused it.
+                logger.error(
+                    "ov-ext reflect: no progress for %d sweeps. Reading captured "
+                    "changes, so the watermark is unused and NOTHING has been "
+                    "skipped -- every pending change is still pending and will be "
+                    "read again. Failures this sweep: %d.",
+                    watermark.stalls + 1,
+                    report.failures,
+                )
+                annotate({"ov_ext.reflect.outcome": "stepped_over"})
+                return report, watermark.stepped_over(forced, now=moment)
             logger.error(
                 "ov-ext reflect: no progress for %d sweeps; stepping the watermark "
                 "over %s to %s. The memories in the failing batch will NOT be "
@@ -339,34 +365,47 @@ class ReflectionEngine:
         annotate({"ov_ext.reflect.gathered": len(gathered)})
 
         scope = await self._store.read_overview(directory)
-        kept, complete = await self._passes(
+        kept, covered, every_pass_ran = await self._passes(
             contexts, scope, index_to_uri, rows_by_uri, report
         )
-        if complete:
-            # Writing an incomplete batch would write AND retry it: the deltas
-            # stay pending, the next sweep reads the same changes, and
-            # `write_observation` names a file after the title, which the model
-            # does not repeat word for word -- so each retry lands somewhere new
-            # instead of merging. Those duplicates then become evidence for
-            # further observations, which is the thing consolidation exists to
-            # stop. Nothing is lost by holding: the deltas are still pending, so
-            # the batch runs again whole.
-            for observation in await self._consolidate(kept, report):
-                await self._write(observation, report)
-        elif kept:
+        # Written before anything is retired: `write_observation` names a file
+        # after the title, which the model does not repeat word for word, so a
+        # change read twice lands somewhere new rather than merging -- and those
+        # duplicates become evidence for further observations, which is what
+        # consolidation exists to stop. Retiring exactly what a pass looked at
+        # keeps that from happening while still crediting the passes that
+        # worked.
+        for observation in await self._consolidate(kept, report):
+            await self._write(observation, report)
+
+        # A URI nothing read stays pending. On the delta path that is the whole
+        # record of outstanding work, so it is read again next sweep.
+        retiring = [uri for uri in uris if uri in covered]
+        if retiring:
+            await self._store.mark_reflected(retiring)
+        missed = len(uris) - len(retiring)
+        if missed:
             logger.info(
-                "ov-ext reflect: %d observations held back; a pass in this batch "
-                "failed and the batch is retried whole next sweep",
-                len(kept),
+                "ov-ext reflect: %d of %d changed memories went unread this "
+                "batch; they stay pending for the next sweep",
+                missed,
+                len(uris),
             )
 
-        if complete:
-            # Only now: a delta retired by a batch that then failed is a change
-            # nothing will ever reflect on.
-            # Every URI the batch was given, not only those that yielded a row:
-            # one with nothing citable was still read, and leaving it pending
-            # would stall the sweep on it forever.
-            await self._store.mark_reflected(uris)
+        # What "complete" means depends on what records progress.
+        #
+        # With deltas, pendingness does, and `mark_reflected` has just retired
+        # exactly what was read -- so the batch is complete when nothing was
+        # missed, and anything left over is picked up next sweep.
+        #
+        # Without them the watermark is the only record, and `mark_reflected` is
+        # a no-op. Coverage cannot mean completion there: a sample is drawn from
+        # the changed memories *plus* their neighbours, so most changed URIs are
+        # in no sample even when every call succeeds. Reporting that as no
+        # progress makes a healthy sweep stall, and the step-over then forces
+        # the mark past memories nothing ever read -- losing them for good, on
+        # the default configuration, to fix a problem that path never had.
+        complete = (not missed) if self._reads_deltas else every_pass_ran
 
         oldest = min(row.updated_at for row in changed_rows)
         newest = max(row.updated_at for row in changed_rows)
@@ -457,7 +496,7 @@ class ReflectionEngine:
         index_to_uri: dict[int, str],
         rows_by_uri: dict[str, MemoryRow],
         report: SweepReport,
-    ) -> tuple[list[Observation], bool]:
+    ) -> tuple[list[Observation], set[str], bool]:
         """Look at the batch several times, each through a different sample.
 
         One call sees one arrangement of the memories and finds the patterns
@@ -470,30 +509,57 @@ class ReflectionEngine:
 
         Returns
         -------
-        tuple[list[Observation], bool]
-            Everything that survived verification across the passes, and whether
-            every pass completed. A batch where one pass failed is incomplete,
-            so its memories are tried again rather than retired half-read.
+        tuple[list[Observation], set[str], bool]
+            What survived verification, the URIs a successful pass was shown,
+            and whether every pass ran.
+
+            Both of the last two are reported because the two store kinds judge
+            a batch differently. With deltas, coverage is what matters:
+            requiring every pass to succeed makes recovery cube with the failure
+            rate -- a median of 26 sweeps rather than 2 at a 70% failure rate --
+            and the batch is the whole sweep, so one bad call would cost
+            everything. A failed pass means one sample went unlooked-at, not
+            that a memory was missed.
+
+            Without deltas the watermark is the only record of progress, and
+            coverage cannot speak to it: a sample is drawn from the changed
+            memories *plus* their neighbours, so most changed URIs are in no
+            sample even when nothing fails. There the question is only whether
+            every pass ran.
         """
         settings = self._settings
         if len(contexts) <= settings.pass_size:
             # Everything fits in one call. Sampling would show the model the
             # same memories in a different order and charge for it.
             kept = await self._propose(contexts, scope, index_to_uri, rows_by_uri, report)
-            return (kept or [], kept is not None)
+            if kept is None:
+                return [], set[str](), False
+            return (
+                kept,
+                {
+                    index_to_uri[c.index_id]
+                    for c in contexts
+                    if c.index_id in index_to_uri
+                },
+                True,
+            )
 
         pooled: list[Observation] = []
-        complete = True
+        covered: set[str] = set()
+        every_pass_ran = True
         for number in range(settings.passes):
             sample = self._rng.sample(list(contexts), settings.pass_size)
             sample.sort(key=lambda context: context.index_id)
             annotate({"ov_ext.reflect.pass": number + 1})
             kept = await self._propose(sample, scope, index_to_uri, rows_by_uri, report)
             if kept is None:
-                complete = False
+                every_pass_ran = False
                 continue
             pooled.extend(kept)
-        return pooled, complete
+            covered |= {
+                index_to_uri[c.index_id] for c in sample if c.index_id in index_to_uri
+            }
+        return pooled, covered, every_pass_ran
 
     async def _consolidate(
         self, observations: Sequence[Observation], report: SweepReport
@@ -541,7 +607,15 @@ class ReflectionEngine:
         merged: list[Observation] = []
         claimed: set[int] = set()
         for group in grouped.groups:
-            wanted = [index for index in group.indices if 0 <= index < len(observations)]
+            # Deduped, order kept. A group naming an index twice would
+            # otherwise carry the same observation twice into `merged` -- two
+            # writes and two link calls for one claim, and a `consolidated`
+            # count that goes negative.
+            wanted = list(
+                dict.fromkeys(
+                    index for index in group.indices if 0 <= index < len(observations)
+                )
+            )
             members = [observations[i] for i in wanted if i not in claimed]
             if not members:
                 continue

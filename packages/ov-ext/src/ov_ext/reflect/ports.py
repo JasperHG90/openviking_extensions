@@ -24,7 +24,7 @@ from pydantic import BaseModel
 
 from .models import MemoryRow, Observation
 
-__all__ = ["DeltaReader", "MemoryStore", "StructuredLLM"]
+__all__ = ["DeltaReader", "MemoryStore", "Sampler", "StructuredLLM"]
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -41,6 +41,19 @@ class StructuredLLM(Protocol):
 
     async def complete(self, prompt: str, model: type[T]) -> T | None:
         """Answer ``prompt`` as an instance of ``model``, or ``None``."""
+        ...
+
+
+class Sampler(Protocol):
+    """Whatever draws the passes' samples.
+
+    Narrower than ``random.Random`` because the engine calls exactly one method
+    on it -- which lets a test hand over the samples a case needs instead of
+    hunting for a seed that happens to produce them.
+    """
+
+    def sample(self, population: list[Any], k: int) -> list[Any]:
+        """Return ``k`` members of ``population``, without replacement."""
         ...
 
 
@@ -83,6 +96,15 @@ class MemoryStore(Protocol):
         Oldest first, so ``limit`` truncates the newest and the remainder is
         still ahead of the watermark next sweep. Newest-first truncation would
         strand everything below the cut permanently.
+        """
+        ...
+
+    @property
+    def reads_deltas(self) -> bool:
+        """Whether the store reads captured changes rather than whole memories.
+
+        Read by the engine to decide what a stalled sweep means: with deltas,
+        pendingness tracks outstanding work and the watermark tracks nothing.
         """
         ...
 

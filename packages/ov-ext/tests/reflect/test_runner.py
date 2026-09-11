@@ -529,55 +529,32 @@ async def test_a_read_does_not_serve_text_the_previous_read_loaded() -> None:
     assert await store.rows([gone]) == [], "the first read's text must not survive"
 
 
-async def test_an_incomplete_batch_writes_nothing_and_keeps_its_deltas() -> None:
-    """Writing a partly-failed batch writes AND retries it.
+async def test_a_batch_whose_every_pass_failed_retires_nothing() -> None:
+    """Nothing was read, so nothing may be retired.
 
-    `write_observation` names a file after the title, which the model does not
-    repeat word for word, so each retry lands somewhere new instead of merging --
-    and those duplicates become evidence for further observations. Holding costs
-    nothing: the deltas stay pending and the batch runs again whole.
+    On the delta path pendingness is the whole record of outstanding work: a
+    change retired without being looked at is one nothing will ever reflect on.
     """
-    # Two memories, so the batch is larger than `pass_size` and samples.
     a = "viking://user/jasper/memories/entities/a.md"
     b = "viking://user/jasper/memories/entities/b.md"
     deltas = FakeDeltas([delta_row(1, a, "- ships v0.4"), delta_row(2, b, "- adds MMR")])
-    # A model that finds something twice and then fails. The observations must
-    # be real, or "wrote nothing" would hold whatever the code did.
-    found = ProposedObservations(
-        observations=[
-            CandidateObservation(
-                title="both shipped",
-                content="Both changed in this sweep.",
-                evidence=[
-                    EvidenceItem(
-                        memory_index=0, quote="- ships v0.4", relevance_explanation="r"
-                    ),
-                    EvidenceItem(
-                        memory_index=1, quote="- adds MMR", relevance_explanation="r"
-                    ),
-                ],
-            )
-        ]
-    )
-    llm = FakeLLM([found, found, RuntimeError("provider unreachable")])
     fs = FakeFS()
 
     report = await run_sweep(
         fs,
         FakeDB([]),
         FakeCtx(),
-        settings(pass_size=1, passes=3),
+        settings(pass_size=1, passes=2),
         lock=ProcessLock(),
-        llm=llm,
+        llm=FakeLLM([RuntimeError("down"), RuntimeError("down")]),
         now=NOW,
         deltas=deltas,
     )
 
-    assert report.failures == 1
-    # `fs.writes` also carries the watermark, which is not an observation.
-    observations = [uri for uri, _ in fs.writes if "/observations/" in uri]
-    assert observations == [], "a batch with a failed pass must write no observation"
-    assert deltas.retired == [], "and must leave its changes for the next sweep"
+    assert report.failures == 2
+    assert [uri for uri, _ in fs.writes if "/observations/" in uri] == []
+    assert deltas.retired == []
+    assert len(deltas.pending(limit=10)) == 2
 
 
 async def test_a_complete_batch_does_write_what_its_passes_found() -> None:
@@ -607,9 +584,9 @@ async def test_a_complete_batch_does_write_what_its_passes_found() -> None:
         fs,
         FakeDB([]),
         FakeCtx(),
-        settings(pass_size=1, passes=2),
+        settings(pass_size=2, passes=2),
         lock=ProcessLock(),
-        llm=FakeLLM([found, found, Consolidation(groups=[])]),
+        llm=FakeLLM([found, Consolidation(groups=[])]),
         now=NOW,
         deltas=deltas,
     )

@@ -6,14 +6,19 @@ where the model gives it nothing useful, which is the common one.
 
 from __future__ import annotations
 
+import random
 from collections.abc import Sequence
+from typing import Any
 from datetime import timedelta
 
 from ov_ext.reflect.config import ReflectSettings
-from ov_ext.reflect.engine import ReflectionEngine, group_by_directory
+from ov_ext.reflect.engine import ReflectionEngine, SweepReport, group_by_directory
 from ov_ext.reflect.models import (
     CandidateObservation,
+    Consolidation,
     EvidenceItem,
+    Observation,
+    ObservationGroup,
     MemoryRow,
     ProposedObservations,
 )
@@ -379,3 +384,194 @@ async def test_a_sweep_that_reads_only_empty_batches_holds_rather_than_churning(
 
     assert report.stepped_over is False
     assert after == mark, "an unadvanceable sweep must not rewrite the mark"
+
+
+async def test_a_failed_pass_costs_only_the_memories_it_was_shown() -> None:
+    """Requiring every pass to succeed makes recovery cube with the failure rate.
+
+    At a 70% call failure rate that is a median of 26 sweeps rather than 2, and
+    on the delta path the batch is the whole sweep -- so one bad call would cost
+    everything. A failed pass means one sample went unlooked-at, not that a
+    memory was missed.
+    """
+    rows = [
+        row(f"viking://user/j/memories/entities/x/{i}.md", f"note {i}", day=i + 1)
+        for i in range(4)
+    ]
+    # The delta store, because that is where retirement means anything:
+    # `VikingStore.mark_reflected` returns early without one, so a whole-memory
+    # fake would record a retirement production never makes.
+    fake = DeltaReadingStore(rows)
+    engine = ReflectionEngine(
+        fake,
+        FakeLLM([ProposedObservations(observations=[]), RuntimeError("down")]),
+        settings(pass_size=2, passes=2),
+        rng=Samples((0, 1), (2, 3)),
+    )
+
+    report, _ = await engine.sweep(Watermark.beginning(), now=EPOCH)
+
+    assert report.failures == 1
+    assert 0 < len(fake.reflected) < 4, (
+        "the successful pass retires its own, and only its own"
+    )
+
+
+async def test_a_group_naming_one_observation_twice_writes_it_once() -> None:
+    """`[1, 2, 2]` where 1 is already claimed left two copies of observation 2.
+
+    Two writes and two link calls for one claim, and a `consolidated` count
+    that goes negative.
+    """
+    made = [
+        Observation(
+            title=f"o{i}",
+            content=f"content {i}",
+            evidence=((f"viking://user/j/memories/entities/x/{i}.md", f"q{i}"),),
+            areas=frozenset({"viking://user/j/memories/entities/x"}),
+        )
+        for i in range(3)
+    ]
+    engine = ReflectionEngine(
+        store(),
+        FakeLLM(
+            [
+                Consolidation(
+                    groups=[
+                        ObservationGroup(indices=[0, 1], title="first", content="c"),
+                        ObservationGroup(indices=[1, 2, 2], title="second", content="c"),
+                    ]
+                )
+            ]
+        ),
+        settings(),
+    )
+    report = SweepReport()
+
+    merged = await engine._consolidate(made, report)
+
+    titles = [o.title for o in merged]
+    assert len(titles) == len(set(titles)), f"an observation was kept twice: {titles}"
+    assert report.consolidated >= 0, "the metric must not go negative"
+
+
+async def test_a_healthy_whole_memory_sweep_advances_the_watermark() -> None:
+    """Without a delta store the watermark is the only record of progress.
+
+    `mark_reflected` is a no-op there, so if a sweep where every call succeeded
+    reports no progress, the stall counter climbs and the step-over eventually
+    forces the mark past memories no pass ever read. Those are gone for good.
+
+    Sampling draws from the changed memories *plus* their neighbours, so most
+    changed URIs are in no sample even when nothing fails -- which is why
+    coverage cannot be what "complete" means on this path.
+    """
+    changed = [
+        row(f"viking://user/j/memories/entities/x/{i}.md", f"note {i}", day=i + 1)
+        for i in range(10)
+    ]
+    neighbours = {
+        r.uri: [
+            row(f"viking://user/j/memories/entities/y/{i}.md", f"near {i}", day=1)
+            for i in range(8)
+        ]
+        for r in changed
+    }
+    fake = FakeStore(changed, neighbours=neighbours)
+    engine = ReflectionEngine(
+        fake,
+        FakeLLM([ProposedObservations(observations=[])] * 8),
+        settings(pass_size=12, passes=3, neighbour_limit=8),
+        rng=random.Random(7),
+    )
+
+    report, after = await engine.sweep(Watermark.beginning(), now=EPOCH)
+
+    assert report.failures == 0
+    assert after.stalls == 0, "a sweep where nothing failed has made progress"
+    assert after.last_seen > Watermark.beginning().last_seen
+
+
+class Samples:
+    """Hands out the exact samples a case needs, in order.
+
+    `self._rng` is used for one call in the whole engine, so replacing it says
+    what a test means instead of leaning on CPython's Mersenne Twister to
+    supply it -- and a reader can see *why* these particular samples matter.
+    """
+
+    def __init__(self, *picks: tuple[int, ...]) -> None:
+        self._picks = list(picks)
+
+    def sample(self, population: list[Any], k: int) -> list[Any]:
+        """Return the next configured pick, by position in ``population``."""
+        return [population[i] for i in self._picks.pop(0)]
+
+
+class DeltaReadingStore(FakeStore):
+    """A store that reads captured changes, where pendingness records progress."""
+
+    @property
+    def reads_deltas(self) -> bool:
+        return True
+
+
+async def test_a_delta_sweep_that_covered_everything_advances() -> None:
+    """On this path coverage IS completion: what was read has just been retired.
+
+    Holding the mark because a pass failed would be the cubic recovery again --
+    and here there is nothing to recover, because every memory was read.
+    """
+    changed = [
+        row(f"viking://user/j/memories/entities/x/{i}.md", f"note {i}", day=i + 1)
+        for i in range(3)
+    ]
+    fake = DeltaReadingStore(changed)
+    engine = ReflectionEngine(
+        fake,
+        FakeLLM([ProposedObservations(observations=[])] * 4),
+        # Everything fits one call, so every URI is covered.
+        settings(pass_size=12, passes=3),
+        rng=random.Random(3),
+    )
+
+    report, after = await engine.sweep(Watermark.beginning(), now=EPOCH)
+
+    assert report.failures == 0
+    assert sorted(fake.reflected) == sorted(r.uri for r in changed)
+    assert after.stalls == 0
+
+
+async def test_a_delta_sweep_covered_by_the_passes_that_worked_still_advances() -> None:
+    """The case where the two rules disagree.
+
+    Two passes between them saw every memory; a third failed. Nothing is
+    outstanding -- everything was read and retired -- so treating the failed
+    pass as reason to hold would be the cubic recovery again, for a batch with
+    nothing left to recover.
+    """
+    changed = [
+        row(f"viking://user/j/memories/entities/x/{i}.md", f"note {i}", day=i + 1)
+        for i in range(4)
+    ]
+    fake = DeltaReadingStore(changed)
+    engine = ReflectionEngine(
+        fake,
+        FakeLLM(
+            [
+                ProposedObservations(observations=[]),
+                ProposedObservations(observations=[]),
+                RuntimeError("the third pass fell over"),
+            ]
+        ),
+        settings(pass_size=3, passes=3),
+        # Between them the first two passes see every memory; the third falls
+        # over having seen nothing new.
+        rng=Samples((0, 1, 3), (1, 2, 3), (0, 1, 2)),
+    )
+
+    report, after = await engine.sweep(Watermark.beginning(), now=EPOCH)
+
+    assert report.failures == 1
+    assert sorted(fake.reflected) == sorted(r.uri for r in changed)
+    assert after.stalls == 0, "nothing is outstanding, so this is not a stall"

@@ -77,6 +77,11 @@ class FakeStore:
         fresh.sort(key=lambda r: r.updated_at)
         return [r.uri for r in fresh[:limit]]
 
+    @property
+    def reads_deltas(self) -> bool:
+        """This fake serves whole memories, as the real store does without deltas."""
+        return False
+
     def group(self, uris: Sequence[str]) -> dict[str, list[str]]:
         """Batch by directory, like the store reading whole memories."""
         from ov_ext.reflect.engine import group_by_directory

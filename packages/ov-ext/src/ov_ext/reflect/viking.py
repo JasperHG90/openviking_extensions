@@ -103,6 +103,11 @@ class VikingLLM:
     ) -> None:
         self._llm = llm
         self._settings = settings or ReflectSettings()
+        # The reconfigured config, built once. `_get_vlm` is called per request,
+        # so building per call would hand every model call its own HTTP client
+        # and pay a fresh handshake -- on the subsystem whose founding symptom
+        # was calls timing out.
+        self._own_config: Any = None
 
     def _get_llm(self) -> Any:
         """Return the wrapped model, building OpenViking's default on first use."""
@@ -112,12 +117,25 @@ class VikingLLM:
             llm = StructuredLLM()
             chosen = self._settings.model.strip()
             if chosen:
-                llm._get_vlm = lambda: self._own_vlm(chosen)
+                llm._get_vlm = lambda: self._reconfigured(chosen)
             self._llm = llm
         return self._llm
 
+    def _reconfigured(self, model: str) -> Any:
+        """Return the config the sweep runs against, building it at most once."""
+        if self._own_config is None:
+            self._own_config = self._own_vlm(model)
+        return self._own_config
+
     def _own_vlm(self, model: str) -> Any:
-        """Build a model instance for ``model``, on the server's credentials.
+        """Build a config for ``model``, on the server's credentials.
+
+        Returns the ``VLMConfig``, not the client it builds, because that is
+        what ``StructuredLLM`` expects back: it calls
+        ``_get_vlm().get_completion_async(prompt)``, and the config's wrapper is
+        what injects ``thinking``. Handing back the raw client instead drops
+        that setting for reflection alone, and skips the config's own instance
+        cache so every call builds a fresh HTTP client.
 
         The server's ``VLMConfig`` is copied and its ``model`` swapped, so the
         endpoint, key, timeout and retry policy are the ones the deployment was
@@ -158,19 +176,21 @@ class VikingLLM:
                     credential.model_copy(update={"model": model})
                     for credential in own.credentials
                 ]
-            # `_vlm_instance` is a pydantic private, so it lives in
-            # `__pydantic_private__` and `object.__setattr__` writes a shadow
-            # that `get_vlm_instance` never reads -- leaving it returning None.
+            # A pydantic private, so `object.__setattr__` writes a shadow the
+            # real accessor never reads and `get_vlm_instance()` returns None.
+            # `_vlm_instance` on the copy is a *different* dict entry from the
+            # server's -- pydantic's `__copy__` rebuilds `__pydantic_private__`
+            # rather than sharing it -- so clearing it here cannot clear the
+            # server's cache. That is the property the whole approach rests on.
             own.__pydantic_private__["_vlm_instance"] = None
-            instance = own.get_vlm_instance()
         except Exception:
             logger.exception(
                 "ov-ext reflect: could not build %r; falling back to the server's model",
                 model,
             )
-            return configured.get_vlm_instance()
+            return configured
         logger.info("ov-ext reflect: reasoning with %s", model)
-        return instance
+        return own
 
     async def complete(self, prompt: str, model: type[T]) -> T | None:
         """Answer ``prompt`` as an instance of ``model``, or ``None``."""
@@ -243,6 +263,11 @@ class VikingStore:
     def _memory_root(self) -> str:
         """Root under which this user's memories live."""
         return f"viking://user/{self._ctx.user.user_id}/memories"
+
+    @property
+    def reads_deltas(self) -> bool:
+        """Whether this store is reading captured changes, not whole memories."""
+        return self._deltas is not None
 
     @property
     def _user_root(self) -> str:

@@ -16,7 +16,7 @@ import sys
 import threading
 import types
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -660,8 +660,13 @@ class FakeVLMConfig(BaseModel):
 
     model: str
     credentials: list[FakeCredential] = Field(default_factory=list)
+    thinking: bool = True
     _vlm_instance: Any = PrivateAttr(default=None)
     _lock: Any = PrivateAttr(default_factory=threading.Lock)
+
+    # Clients built across all instances, so a test can tell one-per-sweep from
+    # one-per-call. The real cost is an HTTP client and a handshake.
+    builds: ClassVar[int] = 0
 
     def model_copy(self, *, update: Any = None, deep: bool = False) -> FakeVLMConfig:
         if deep:
@@ -676,12 +681,23 @@ class FakeVLMConfig(BaseModel):
             # The credential wins, as it does upstream.
             effective = self.credentials[0].model if self.credentials else self.model
             assert self.__pydantic_private__ is not None
+            type(self).builds += 1
             self.__pydantic_private__["_vlm_instance"] = f"instance-for-{effective}"
         return self._vlm_instance
+
+    async def get_completion_async(self, prompt: str = "", thinking: Any = None) -> str:
+        """The wrapper that injects ``thinking``.
+
+        A raw client has no such method, which is how a test can tell whether
+        the override handed back a config or the thing the config builds.
+        """
+        effective = self.thinking if thinking is None else thinking
+        return f"{self.get_vlm_instance()}|thinking={effective}"
 
 
 def with_server_model(monkeypatch: pytest.MonkeyPatch, model: str) -> FakeVLMConfig:
     """Point `get_openviking_config().vlm` at a fake carrying `model`."""
+    FakeVLMConfig.builds = 0
     config = FakeVLMConfig(model=model, credentials=[FakeCredential(model=model)])
     module = types.ModuleType("openviking_cli.utils.config")
     module.get_openviking_config = lambda: types.SimpleNamespace(vlm=config)  # type: ignore[attr-defined]
@@ -695,15 +711,65 @@ def reflect_settings(**overrides: Any) -> ReflectSettings:
     return ReflectSettings.model_construct(**base)
 
 
+def model_of(config: Any) -> str:
+    """The model a reconfigured config will actually build with."""
+    chosen = config.credentials[0].model if config.credentials else config.model
+    return str(chosen)
+
+
 def test_the_sweep_uses_its_own_model_when_told_to(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     with_server_model(monkeypatch, "ollama/glm-5.3-flash")
     llm = VikingLLM(settings=reflect_settings(model="ollama/deepseek-v4-flash:0731"))
 
-    assert llm._own_vlm("ollama/deepseek-v4-flash:0731") == (
-        "instance-for-ollama/deepseek-v4-flash:0731"
-    )
+    own = llm._own_vlm("ollama/deepseek-v4-flash:0731")
+
+    assert model_of(own) == "ollama/deepseek-v4-flash:0731"
+    assert own.get_vlm_instance() == "instance-for-ollama/deepseek-v4-flash:0731"
+
+
+def test_the_client_is_built_once_however_many_calls_are_made(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_get_vlm` runs per request, not per sweep.
+
+    Rebuilding there hands every model call its own HTTP client and a fresh
+    handshake -- on a subsystem whose founding symptom was calls timing out.
+    """
+    config = with_server_model(monkeypatch, "ollama/glm-5.3-flash")
+    module = types.ModuleType("openviking_cli.utils.llm")
+
+    class Structured:
+        def _get_vlm(self) -> Any:
+            return config
+
+    module.StructuredLLM = Structured  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "openviking_cli.utils.llm", module)
+
+    llm = VikingLLM(settings=reflect_settings(model="ollama/deepseek-v4-flash:0731"))
+    inner = llm._get_llm()
+    for _ in range(5):
+        inner._get_vlm().get_vlm_instance()
+
+    assert FakeVLMConfig.builds == 1, "one client for the whole sweep, not one per call"
+
+
+def test_the_override_hands_back_a_config_not_a_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`StructuredLLM` calls `_get_vlm().get_completion_async(prompt)`.
+
+    The config's wrapper is what injects `thinking`; a raw client's own
+    signature defaults it to False, so returning one drops the setting for
+    reflection alone.
+    """
+    with_server_model(monkeypatch, "ollama/glm-5.3-flash")
+    llm = VikingLLM(settings=reflect_settings(model="ollama/deepseek-v4-flash:0731"))
+
+    own = llm._own_vlm("ollama/deepseek-v4-flash:0731")
+
+    assert hasattr(own, "get_completion_async"), "must be the config, not the client"
 
 
 def test_the_override_clears_the_configs_cached_instance(
@@ -747,7 +813,8 @@ def test_a_model_that_cannot_be_built_falls_back_to_the_servers(
     )
     llm = VikingLLM(settings=reflect_settings(model="nonsense"))
 
-    assert llm._own_vlm("nonsense") == config.get_vlm_instance()
+    # The server's own config, so the sweep keeps its `thinking` and its cache.
+    assert llm._own_vlm("nonsense") is config
 
 
 def test_no_model_configured_leaves_the_server_alone(
@@ -789,4 +856,7 @@ def test_the_override_is_wired_into_the_llm_the_sweep_uses(
 
     llm = VikingLLM(settings=reflect_settings(model="ollama/deepseek-v4-flash:0731"))
 
-    assert llm._get_llm()._get_vlm() == "instance-for-ollama/deepseek-v4-flash:0731"
+    installed = llm._get_llm()._get_vlm()
+
+    assert model_of(installed) == "ollama/deepseek-v4-flash:0731"
+    assert installed.get_vlm_instance() == "instance-for-ollama/deepseek-v4-flash:0731"
