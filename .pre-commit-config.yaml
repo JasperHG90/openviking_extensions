@@ -63,6 +63,25 @@ repos:
         args: [--config-file=packages/ovx/pyproject.toml]
 
       - id: mypy
+        name: mypy (ov-sync)
+        files: ^packages/ov-sync/(src|tests)/
+        additional_dependencies:
+          - httpx>=0.27
+          - pydantic>=2
+          - pydantic-settings>=2
+          # respx and pytest are here for the tests, which build responses and
+          # fixtures the checker has to see typed.
+          - pytest>=8
+          - respx>=0.21
+          - rich>=13
+          - tenacity>=8.2
+          - typer>=0.12
+          # Event-mode watch. The package's mypy config ignores its missing
+          # stubs, but the import still has to resolve.
+          - watchdog>=4
+        args: [--config-file=packages/ov-sync/pyproject.toml]
+
+      - id: mypy
         name: mypy (ov-skills)
         files: ^packages/ov-skills/tests/
         additional_dependencies:
@@ -96,6 +115,14 @@ repos:
         language: system
         pass_filenames: false
         files: ^packages/ovx/
+
+      - id: pytest-unit-ov-sync
+        name: pytest (ov-sync, unit)
+        entry: uv run --directory packages/ov-sync pytest
+        language: system
+        pass_filenames: false
+        files: ^packages/ov-sync/
+        types: [python]
 
       # Same again: what ov-skills tests is markdown and shell, so the trigger
       # cannot be limited to Python files either.
