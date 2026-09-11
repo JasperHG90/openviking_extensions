@@ -12,6 +12,7 @@ on:
           - ov-postgres
           - ov-ext
           - ovx
+          - ov-sync
           - ov-skills
           - ov-clip
           - ov-dash

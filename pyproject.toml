@@ -8,12 +8,11 @@
 # non-Python package lands.
 [tool.uv.workspace]
 members = ["packages/ov-postgres", "packages/ov-ext"]
-# ovx and ov-skills carry a pyproject.toml for their test suites but must not
-# join the workspace: a workspace resolves one Python floor for every member,
-# and their tests need 3.11+ while ov-postgres still supports 3.10. Listing
-# them here keeps uv from adopting them when a command runs inside their
-# directories.
-exclude = ["packages/ovx", "packages/ov-skills"]
+# ovx, ov-skills and ov-sync carry a pyproject.toml but must not join the
+# workspace: a workspace resolves one Python floor for every member, and these
+# need 3.11+ while ov-postgres still supports 3.10. Listing them here keeps uv
+# from adopting them when a command runs inside their directories.
+exclude = ["packages/ovx", "packages/ov-skills", "packages/ov-sync"]
 
 # Repo-wide ruff defaults for loose Python outside any package. Each package
 # carries its own [tool.ruff] and wins for its own files.
