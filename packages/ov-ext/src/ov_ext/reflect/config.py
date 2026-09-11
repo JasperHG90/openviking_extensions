@@ -287,6 +287,18 @@ class ReflectSettings(BaseSettings):
             "expressed."
         ),
     )
+    evidence_types: list[str] = Field(
+        default=["entities", "events", "resources"],
+        description=(
+            "What the sweep may draw on as evidence, as opposed to what it "
+            "reflects *about* (`memory_types`). Wider on purpose: an observation "
+            "is about an entity, but the thing that makes it worth having is "
+            "often somewhere else -- an event recording what happened, or a "
+            "resource you captured because it was interesting. Preferences are "
+            "absent here too: an observation resting on one would read the "
+            "user's own instruction back to them as a finding."
+        ),
+    )
     passes: int = Field(
         default=3,
         ge=1,

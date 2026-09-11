@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+from ov_ext.reflect.config import ReflectSettings
 from ov_ext.reflect.exceptions import ContentUnavailableError
 from ov_ext.reflect.models import MemoryRow, Observation
 from ov_ext.reflect.viking import VikingStore, _digest, _render, _slug
@@ -32,6 +33,14 @@ class FakeDB:
 
     async def filter(self, **kwargs: Any) -> list[dict[str, Any]]:
         self.calls.append(kwargs)
+        # Honour an `In("uri", ...)`, because `rows()` relies on it to fetch
+        # only what it asked for. A fake that returns everything regardless
+        # makes every caller look like it reads the whole store.
+        condition = kwargs.get("filter")
+        wanted = getattr(condition, "values", None)
+        if getattr(condition, "field", None) == "uri" and wanted is not None:
+            allowed = set(wanted)
+            return [r for r in self._records if r.get("uri") in allowed]
         return self._records
 
 
@@ -203,7 +212,11 @@ async def test_the_tail_sample_varies_between_sweeps() -> None:
     """A fixed `ORDER BY oldest LIMIT n` is a constant, and a constant cannot
     break an echo chamber."""
     records = [
-        {"uri": f"viking://x/{i}.md", "content": f"note {i}", "created_at": NOW}
+        {
+            "uri": f"viking://user/jasper/memories/entities/dev_tool/{i}.md",
+            "content": f"note {i}",
+            "created_at": NOW,
+        }
         for i in range(30)
     ]
     adapter = store(FakeDB(records), rng=random.Random(1))
@@ -402,3 +415,125 @@ async def test_different_memories_are_written_to_different_files() -> None:
     assert await store(fs=fs).write_observation(observation()) != await store(
         fs=fs
     ).write_observation(other)
+
+
+# --- what may be drawn on as evidence ---------------------------------------
+
+
+def evidence_store(**overrides: Any) -> VikingStore:
+    """A store with the default evidence scope, unless a test says otherwise."""
+    base = {**ReflectSettings().model_dump(), "enabled": True}
+    base.update(overrides)
+    return store(settings=ReflectSettings.model_construct(**base))
+
+
+@pytest.mark.parametrize(
+    ("uri", "allowed"),
+    [
+        ("viking://user/jasper/memories/entities/dev_tool/ov_ext.md", True),
+        ("viking://user/jasper/memories/events/2026/09/10/a.md", True),
+        ("viking://user/jasper/resources/blog-scraper/nvidia/jetson.md", True),
+        # The user's own instructions. An observation resting on one would read
+        # them back as a finding.
+        ("viking://user/jasper/memories/preferences/jasper/prose_style_rules.md", False),
+        ("viking://user/jasper/memories/cases/post-mortem.md", False),
+        ("viking://user/jasper/memories/patterns/mem_abc.md", False),
+        # Another peer's tree, which this user did not write.
+        ("viking://user/jasper/peers/github.com-x/memories/entities/a.md", False),
+    ],
+)
+def test_what_counts_as_evidence(uri: str, allowed: bool) -> None:
+    assert evidence_store()._is_evidence(uri) is allowed
+
+
+def test_resources_are_evidence_only_while_configured() -> None:
+    resource = "viking://user/jasper/resources/blog-scraper/nvidia/jetson.md"
+    assert evidence_store()._is_evidence(resource) is True
+    assert evidence_store(evidence_types=["entities"])._is_evidence(resource) is False
+
+
+def test_the_evidence_root_reaches_past_memories() -> None:
+    """A resource lives outside the memory root, so a search scoped there is blind."""
+    store = evidence_store()
+    assert store._user_root == "viking://user/jasper"
+    assert store._memory_root.startswith(store._user_root)
+    assert not "viking://user/jasper/resources/x.md".startswith(store._memory_root)
+
+
+class SearchingFS(FakeFS):
+    """A filesystem whose semantic search returns a fixed set, and records the scope."""
+
+    def __init__(self, uris: list[str]) -> None:
+        super().__init__()
+        self._uris = uris
+        self.searched_under: str | None = None
+
+    async def search(self, **kwargs: Any) -> Any:
+        self.searched_under = kwargs.get("target_uri")
+        found = [type("Ctx", (), {"uri": uri})() for uri in self._uris]
+        return type("Result", (), {"memories": found})()
+
+
+NEIGHBOURS = [
+    "viking://user/jasper/memories/entities/dev_tool/ov_dash.md",
+    "viking://user/jasper/memories/preferences/jasper/prose_style_rules.md",
+    "viking://user/jasper/resources/blog-scraper/nvidia/jetson.md",
+]
+
+
+async def test_the_neighbour_search_looks_past_the_memory_root() -> None:
+    """A resource lives outside `memories/`, so scoping there can never find one."""
+    fs = SearchingFS(NEIGHBOURS)
+    adapter = store(FakeDB([]), fs)
+
+    await adapter.neighbours(
+        MemoryRow(
+            uri="viking://user/jasper/memories/entities/a.md",
+            text="the scheduler retries",
+            created_at=NOW,
+            updated_at=NOW,
+        ),
+        limit=3,
+    )
+
+    assert fs.searched_under == "viking://user/jasper"
+
+
+async def test_neighbours_drop_what_may_not_be_evidence() -> None:
+    """A preference returned by search must not reach the model as a neighbour."""
+    records = [
+        {"uri": uri, "content": f"text of {uri}", "created_at": NOW, "updated_at": NOW}
+        for uri in NEIGHBOURS
+    ]
+    fs = SearchingFS(NEIGHBOURS)
+    adapter = store(FakeDB(records), fs)
+
+    found = {
+        r.uri
+        for r in await adapter.neighbours(
+            MemoryRow(
+                uri="viking://user/jasper/memories/entities/a.md",
+                text="the scheduler retries",
+                created_at=NOW,
+                updated_at=NOW,
+            ),
+            limit=3,
+        )
+    }
+
+    assert "viking://user/jasper/resources/blog-scraper/nvidia/jetson.md" in found
+    assert "viking://user/jasper/memories/entities/dev_tool/ov_dash.md" in found
+    assert not any("/preferences/" in uri for uri in found)
+
+
+async def test_the_tail_sample_drops_what_may_not_be_evidence() -> None:
+    records = [
+        {"uri": uri, "content": f"text of {uri}", "created_at": NOW, "updated_at": NOW}
+        for uri in NEIGHBOURS
+    ]
+    adapter = store(FakeDB(records))
+
+    found = {r.uri for r in await adapter.tail_sample(limit=3)}
+
+    assert not any("/preferences/" in uri for uri in found)
+    assert any("/resources/" in uri for uri in found)

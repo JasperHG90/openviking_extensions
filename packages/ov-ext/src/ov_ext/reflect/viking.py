@@ -67,6 +67,11 @@ _TAIL_WINDOW = 10
 # type. Most deltas in a busy store are entities, so a small factor is enough.
 _DELTA_OVERREAD = 4
 
+# How much wider than needed to read before the evidence filter runs. A search
+# over the whole user root returns preferences and peer memories too, and one
+# discarded should not cost a neighbour its slot.
+_EVIDENCE_OVERREAD = 3
+
 _DELTA_SEPARATOR = "\n\n---\n\n"
 
 
@@ -171,6 +176,33 @@ class VikingStore:
     def _memory_root(self) -> str:
         """Root under which this user's memories live."""
         return f"viking://user/{self._ctx.user.user_id}/memories"
+
+    @property
+    def _user_root(self) -> str:
+        """Root covering memories and resources alike.
+
+        Evidence is drawn from here rather than from ``_memory_root``, because
+        a resource lives at ``viking://user/<id>/resources/`` -- outside the
+        memory root entirely, so a search scoped there could never reach one.
+        """
+        return f"viking://user/{self._ctx.user.user_id}"
+
+    def _is_evidence(self, uri: str) -> bool:
+        """Whether a URI may be drawn on as evidence.
+
+        Keyed on the segment after ``memories/`` or on ``resources`` -- the
+        index reports ``context_type`` as ``memory`` for every memory type
+        alike, so it cannot tell an entity from a preference and the URI has to.
+        """
+        allowed = self._settings.evidence_types
+        root = self._user_root
+        if uri.startswith(f"{root}/resources/"):
+            return "resources" in allowed
+        prefix = f"{root}/memories/"
+        if not uri.startswith(prefix):
+            # Peer memories and anything else outside this user's own tree.
+            return False
+        return uri[len(prefix) :].split("/", 1)[0] in allowed
 
     def _row_from_record(self, record: dict[str, Any]) -> MemoryRow | None:
         """Build a :class:`MemoryRow` from an index record, or ``None``.
@@ -435,15 +467,17 @@ class VikingStore:
         """
         result = await self._fs.search(
             query=row.text,
-            target_uri=self._memory_root,
-            limit=limit + 1,
+            target_uri=self._user_root,
+            # Over-ask, because the evidence filter below discards results and a
+            # neighbour dropped for being a preference should not cost a slot.
+            limit=(limit + 1) * _EVIDENCE_OVERREAD,
             level=[2],
             ctx=self._ctx,
         )
         uris = [
             uri
             for uri in (self._stored_uri(context) for context in result.memories or [])
-            if uri is not None and uri != row.uri
+            if uri is not None and uri != row.uri and self._is_evidence(uri)
         ]
         return self._as_context(await self.rows(uris[:limit]))
 
@@ -473,19 +507,24 @@ class VikingStore:
         directly would return the same rows in every batch of every sweep --
         a constant, not a sample, and a constant cannot break an echo chamber.
         """
-        from openviking.storage.expr import And, Eq, PathScope
+        from openviking.storage.expr import And, Eq, In, PathScope
 
         if limit <= 0:
             return []
+        kinds = ["memory"]
+        if "resources" in self._settings.evidence_types:
+            kinds.append("resource")
         records = await self._db.filter(
             filter=And(
                 [
-                    PathScope("uri", self._memory_root),
-                    Eq("context_type", "memory"),
+                    PathScope("uri", self._user_root),
+                    In("context_type", kinds),
                     Eq("level", 2),
                 ]
             ),
-            limit=limit * _TAIL_WINDOW,
+            # Over-read for the same reason as the neighbour search: the rows
+            # this returns are filtered by `_is_evidence` afterwards.
+            limit=limit * _TAIL_WINDOW * _EVIDENCE_OVERREAD,
             output_fields=_ROW_FIELDS,
             order_by="updated_at",
             order_desc=False,
@@ -494,7 +533,7 @@ class VikingStore:
         rows = [
             row
             for row in (self._row_from_record(record) for record in records)
-            if row is not None
+            if row is not None and self._is_evidence(row.uri)
         ]
         if len(rows) <= limit:
             return self._as_context(rows)
