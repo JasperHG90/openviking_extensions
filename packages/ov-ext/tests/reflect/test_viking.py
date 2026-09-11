@@ -537,3 +537,93 @@ async def test_the_tail_sample_drops_what_may_not_be_evidence() -> None:
 
     assert not any("/preferences/" in uri for uri in found)
     assert any("/resources/" in uri for uri in found)
+
+
+# --- how a sweep is batched -------------------------------------------------
+
+BATCH_URIS = [
+    "viking://user/jasper/memories/entities/dev_tool/ov_ext.md",
+    "viking://user/jasper/memories/entities/dev_tool/prek.md",
+    "viking://user/jasper/memories/entities/cli_tool/ovx.md",
+    "viking://user/jasper/memories/entities/software_package/ov_postgres.md",
+]
+
+
+class NoDeltas:
+    """A delta store shaped enough to switch the store into delta mode."""
+
+    def pending(self, *, limit: int, since: Any = None) -> list[dict[str, Any]]:
+        return []
+
+    def mark_reflected(self, ids: Any, *, when: Any) -> int:
+        return 0
+
+
+async def test_a_delta_sweep_is_one_batch() -> None:
+    """The measured reason this exists: four directory batches gave 0
+    observations where one pooled batch gave 2.
+
+    A delta is a line, not a file, so directory grouping scatters a sweep into
+    batches of one or two -- and an observation must cite two distinct memories.
+    """
+    adapter = store(FakeDB([]), deltas=NoDeltas())
+
+    grouped = adapter.group(BATCH_URIS)
+
+    assert len(grouped) == 1, "a delta sweep must not be split by directory"
+    assert sorted(next(iter(grouped.values()))) == sorted(BATCH_URIS)
+
+
+async def test_a_whole_memory_sweep_is_still_batched_by_directory() -> None:
+    """Without deltas nothing changes: a directory's worth is already a prompt."""
+    adapter = store(FakeDB([]))
+
+    grouped = adapter.group(BATCH_URIS)
+
+    assert set(grouped) == {
+        "viking://user/jasper/memories/entities/dev_tool",
+        "viking://user/jasper/memories/entities/cli_tool",
+        "viking://user/jasper/memories/entities/software_package",
+    }
+
+
+async def test_a_pooled_batch_has_no_directory_overview() -> None:
+    """It spans directories, so no one overview describes it."""
+    adapter = store(FakeDB([]), deltas=NoDeltas())
+    assert await adapter.read_overview("") is None
+
+
+async def test_a_large_delta_is_capped_like_any_other_context() -> None:
+    """ "A changed memory is delta-sized already" holds for an edit, not a create.
+
+    A created memory records its whole new body as one `replace`, and a dozen of
+    those rebuild the prompt the delta work exists to shrink.
+    """
+    uri = "viking://user/jasper/memories/entities/dev_tool/ov_ext.md"
+    huge = "x" * 40_000
+
+    class OneBigDelta:
+        def pending(self, *, limit: int, since: Any = None) -> list[dict[str, Any]]:
+            return [
+                {
+                    "id": 1,
+                    "uri": uri,
+                    "memory_type": "entities",
+                    "field": "content",
+                    "search": "",
+                    "replace": huge,
+                    "created": True,
+                    "changed_at": NOW,
+                }
+            ]
+
+        def mark_reflected(self, ids: Any, *, when: Any) -> int:
+            return 0
+
+    adapter = store(FakeDB([]), deltas=OneBigDelta())
+    await adapter.changed_since(NOW - timedelta(days=1), limit=10)
+
+    rows = await adapter.rows([uri])
+
+    assert len(rows) == 1
+    assert len(rows[0].text) == ReflectSettings().context_chars

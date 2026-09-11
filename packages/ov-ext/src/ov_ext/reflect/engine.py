@@ -47,7 +47,7 @@ from .models import (
 )
 from .ports import MemoryStore, StructuredLLM
 from .prompts import consolidate_prompt, propose_prompt
-from .verify import verify_observations
+from .verify import normalise, verify_observations
 from .watermark import Watermark
 
 __all__ = ["BatchOutcome", "ReflectionEngine", "SweepReport"]
@@ -342,8 +342,23 @@ class ReflectionEngine:
         kept, complete = await self._passes(
             contexts, scope, index_to_uri, rows_by_uri, report
         )
-        for observation in await self._consolidate(kept, report):
-            await self._write(observation, report)
+        if complete:
+            # Writing an incomplete batch would write AND retry it: the deltas
+            # stay pending, the next sweep reads the same changes, and
+            # `write_observation` names a file after the title, which the model
+            # does not repeat word for word -- so each retry lands somewhere new
+            # instead of merging. Those duplicates then become evidence for
+            # further observations, which is the thing consolidation exists to
+            # stop. Nothing is lost by holding: the deltas are still pending, so
+            # the batch runs again whole.
+            for observation in await self._consolidate(kept, report):
+                await self._write(observation, report)
+        elif kept:
+            logger.info(
+                "ov-ext reflect: %d observations held back; a pass in this batch "
+                "failed and the batch is retried whole next sweep",
+                len(kept),
+            )
 
         if complete:
             # Only now: a delta retired by a batch that then failed is a change
@@ -526,19 +541,32 @@ class ReflectionEngine:
         merged: list[Observation] = []
         claimed: set[int] = set()
         for group in grouped.groups:
-            members = [
-                observations[index]
-                for index in group.indices
-                if 0 <= index < len(observations) and index not in claimed
-            ]
+            wanted = [index for index in group.indices if 0 <= index < len(observations)]
+            members = [observations[i] for i in wanted if i not in claimed]
             if not members:
                 continue
-            claimed.update(group.indices)
+            if len(members) < len(wanted):
+                # Overlapping groups. The title and content the model wrote
+                # describe every member it named, and some of those went to an
+                # earlier group -- so the prose would claim more than the
+                # evidence left here supports. Keep the survivors as proposed.
+                merged.extend(members)
+                claimed.update(wanted)
+                continue
+            claimed.update(wanted)
             evidence: list[tuple[str, str]] = []
+            seen: set[tuple[str, str]] = set()
             for member in members:
-                for pair in member.evidence:
-                    if pair not in evidence:
-                        evidence.append(pair)
+                for uri, quote in member.evidence:
+                    # Compared normalised, stored raw: two passes quoting the
+                    # same span with different whitespace are one piece of
+                    # evidence, and counting both would dilute the link weight
+                    # and write two near-identical `derived_from` edges.
+                    key = (uri, normalise(quote))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    evidence.append((uri, quote))
             merged.append(
                 Observation(
                     title=group.title.strip() or members[0].title,

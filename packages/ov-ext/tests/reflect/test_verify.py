@@ -81,6 +81,7 @@ def test_an_observation_whose_quotes_check_out_survives() -> None:
         "bad_index": 0,
         "quote_not_found": 0,
         "too_little_evidence": 0,
+        "only_resources": 0,
         "single_area": 0,
     }
 
@@ -162,10 +163,11 @@ def test_requiring_two_areas_drops_a_single_directory_observation() -> None:
 
 
 def test_requiring_two_areas_keeps_one_that_spans_two_directories() -> None:
-    # Two repositories under the shape OpenViking actually ingests them in --
-    # deep, with the owner and repo below a host segment.
-    left = "viking://user/j/resources/github.com/acme/repo-a/notes.md"
-    right = "viking://user/j/resources/github.com/other/repo-b/notes.md"
+    # Two entity categories, which is what a cross-area observation really
+    # spans. (Resource URIs would be dropped here for a different reason --
+    # see `test_an_observation_resting_only_on_resources_is_dropped`.)
+    left = "viking://user/j/memories/entities/software_project/openviking.md"
+    right = "viking://user/j/memories/entities/embedding_service/embark.md"
     memories = {
         left: row(left, "openviking coalesces requests."),
         right: row(right, "embedder coalesces requests."),
@@ -227,3 +229,45 @@ def test_two_distinct_memories_clear_a_floor_of_two() -> None:
         "viking://user/j/memories/a.md",
         "viking://user/j/memories/b.md",
     }
+
+
+def test_an_observation_resting_only_on_resources_is_dropped() -> None:
+    """Two chunks of one article can clear the evidence floor between them.
+
+    The result is an observation about the article, filed in the user's memory
+    as a finding about them.
+    """
+    left = "viking://user/j/resources/blog-scraper/nvidia/jetson/part_1.md"
+    right = "viking://user/j/resources/blog-scraper/nvidia/jetson/part_2.md"
+    memories = {
+        left: row(left, "speculative decoding raises throughput."),
+        right: row(right, "speculative decoding needs a draft model."),
+    }
+
+    kept, dropped = verify_observations(
+        [observation(cite(0, "speculative decoding"), cite(1, "speculative decoding"))],
+        {0: left, 1: right},
+        memories,
+    )
+
+    assert kept == []
+    assert dropped["only_resources"] == 1
+
+
+def test_a_resource_may_corroborate_something_the_user_wrote() -> None:
+    """Excluded from carrying an observation, not from supporting one."""
+    memory = "viking://user/j/memories/entities/dev_tool/ov_ext.md"
+    resource = "viking://user/j/resources/blog-scraper/nvidia/jetson.md"
+    memories = {
+        memory: row(memory, "reflect batches deltas rather than files."),
+        resource: row(resource, "batching deltas reduces prompt size."),
+    }
+
+    kept, dropped = verify_observations(
+        [observation(cite(0, "batches deltas"), cite(1, "batching deltas"))],
+        {0: memory, 1: resource},
+        memories,
+    )
+
+    assert len(kept) == 1
+    assert dropped["only_resources"] == 0

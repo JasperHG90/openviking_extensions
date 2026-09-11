@@ -4,14 +4,21 @@ Everything here runs without a model call, which is the point: a second model
 asked "is this true?" shares the first one's blind spots, while a substring
 check does not. Three gates, cheapest first:
 
-1. **The index resolves.** A citation outside the range the model was shown is
-   a fabrication, and gets dropped.
+1. **The index resolves.** A citation the map does not know is a fabrication
+   and gets dropped. Note this is weaker than it reads: a sampled pass is shown
+   a subset while the map still holds the whole batch, so an index outside the
+   sample resolves rather than failing. Gate 2 is what actually binds.
 2. **The quote is really there.** The quoted span must appear in the cited
    memory word for word. This is memex's ``verify_evidence_quotes``, and it is
    also exactly what OpenViking already promises about a link's ``match_text``
    -- so passing this gate is what makes the evidence link legal, not merely
    plausible.
-3. **Enough distinct memories survive.** An observation resting on fewer
+3. **Something of the user's own is cited.** Resources are captured
+   third-party text -- an article, a scraped page -- and two chunks of one
+   article can satisfy an evidence floor between them. That writes an
+   observation about the article into the user's memory as a finding about
+   them. Resources may corroborate a claim; they may not carry one alone.
+4. **Enough distinct memories survive.** An observation resting on fewer
    than ``min_evidence`` *different* memories is dropped. The count is over
    source URIs, not quotes: three quotes from one paragraph -- or three nested
    substrings of one sentence -- are one memory restated, which is precisely
@@ -33,7 +40,13 @@ from collections.abc import Mapping, Sequence
 
 from .models import CandidateObservation, MemoryRow, Observation
 
-__all__ = ["areas_covered", "normalise", "quote_is_present", "verify_observations"]
+__all__ = [
+    "areas_covered",
+    "is_resource",
+    "normalise",
+    "quote_is_present",
+    "verify_observations",
+]
 
 # Default floor on distinct cited memories. Two rather than one because an
 # observation resting on a single memory is that memory restated, which is a
@@ -82,6 +95,11 @@ def areas_covered(uris: Sequence[str], rows: Mapping[str, MemoryRow]) -> frozens
     return frozenset(rows[uri].area for uri in uris if uri in rows)
 
 
+def is_resource(uri: str) -> bool:
+    """Whether a URI names captured third-party text rather than a memory."""
+    return "/resources/" in uri
+
+
 def verify_observations(
     candidates: Sequence[CandidateObservation],
     index_to_uri: Mapping[int, str],
@@ -115,7 +133,7 @@ def verify_observations(
     tuple[list[Observation], dict[str, int]]
         The survivors, and counts of why the rest were dropped: keys
         ``bad_index``, ``quote_not_found``, ``too_little_evidence``,
-        ``single_area``. The counts are what tells you whether a prompt change
+        ``only_resources``, ``single_area``. The counts are what tells you whether a prompt change
         made the model worse, so they are returned rather than logged.
     """
     kept: list[Observation] = []
@@ -123,6 +141,7 @@ def verify_observations(
         "bad_index": 0,
         "quote_not_found": 0,
         "too_little_evidence": 0,
+        "only_resources": 0,
         "single_area": 0,
     }
 
@@ -156,6 +175,13 @@ def verify_observations(
         cited = {uri for uri, _ in verified}
         if len(cited) < min_evidence:
             dropped["too_little_evidence"] += 1
+            continue
+
+        if cited and all(is_resource(uri) for uri in cited):
+            # Every source is captured third-party text. Two chunks of one
+            # article clear the floor between them, and the result is an
+            # observation about the article filed as a finding about the user.
+            dropped["only_resources"] += 1
             continue
 
         areas = areas_covered(sorted(cited), rows)

@@ -200,7 +200,9 @@ class VikingStore:
             return "resources" in allowed
         prefix = f"{root}/memories/"
         if not uri.startswith(prefix):
-            # Peer memories and anything else outside this user's own tree.
+            # Everything else, and peer vaults in particular. A peer's memories
+            # are another person's, and writing findings about someone who never
+            # asked to be reflected on is not ours to do.
             return False
         return uri[len(prefix) :].split("/", 1)[0] in allowed
 
@@ -377,13 +379,11 @@ class VikingStore:
         spans directories, so there is no one overview to fetch and the prompt
         runs without that background.
         """
+        from .engine import group_by_directory
+
         if self._deltas is not None:
             return {"": list(uris)}
-        grouped: dict[str, list[str]] = {}
-        for uri in uris:
-            parent = uri.rsplit("/", 1)[0] if "/" in uri else uri
-            grouped.setdefault(parent, []).append(uri)
-        return grouped
+        return group_by_directory(uris)
 
     async def rows(self, uris: Sequence[str]) -> list[MemoryRow]:
         """Fetch the text and timestamps for specific URIs.
@@ -409,6 +409,17 @@ class VikingStore:
                 for uri, row in ((uri, self._row_from_deltas(uri)) for uri in uris)
                 if row is not None
             }
+            # Capped like any other row. "A changed memory is delta-sized
+            # already" holds for a line edit and not for a create, which records
+            # the whole new body as one `replace` -- a dozen of those rebuilds
+            # the prompt this work exists to shrink.
+            from_deltas = dict(
+                zip(
+                    from_deltas,
+                    self._as_context(list(from_deltas.values())),
+                    strict=True,
+                )
+            )
             remaining = [uri for uri in uris if uri not in from_deltas]
             if not remaining:
                 return list(from_deltas.values())
@@ -479,6 +490,13 @@ class VikingStore:
             for uri in (self._stored_uri(context) for context in result.memories or [])
             if uri is not None and uri != row.uri and self._is_evidence(uri)
         ]
+        if len(uris) < limit:
+            logger.debug(
+                "ov-ext reflect: %d of %d neighbours survived the evidence filter for %s",
+                len(uris),
+                limit,
+                row.uri,
+            )
         return self._as_context(await self.rows(uris[:limit]))
 
     @staticmethod
