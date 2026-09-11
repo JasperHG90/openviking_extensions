@@ -860,3 +860,165 @@ def test_the_override_is_wired_into_the_llm_the_sweep_uses(
 
     assert model_of(installed) == "ollama/deepseek-v4-flash:0731"
     assert installed.get_vlm_instance() == "instance-for-ollama/deepseek-v4-flash:0731"
+
+
+# --- where an observation is filed, and under what name ---------------------
+
+
+def observation_over(*evidence: tuple[str, str], title: str = "A claim") -> Observation:
+    """An observation citing the given `(uri, quote)` pairs."""
+    return Observation(
+        title=title,
+        content="Something is true.",
+        evidence=tuple(evidence),
+        areas=frozenset(uri.rsplit("/", 1)[0] for uri, _ in evidence),
+    )
+
+
+ENTITY = "viking://user/jasper/memories/entities/browser_extension/ov_clip.md"
+EVENT = "viking://user/jasper/memories/events/2026/09/07/daily_reflection.md"
+
+
+async def test_an_observation_is_filed_under_the_entity_it_is_about() -> None:
+    fs = FakeFS()
+    await store(fs=fs).write_observation(
+        observation_over((ENTITY, "one"), (EVENT, "two"))
+    )
+
+    uri = fs.writes[0][0]
+    assert "/observations/browser_extension/" in uri
+
+
+async def test_an_event_never_files_an_observation_under_a_day_number() -> None:
+    """`.../events/2026/09/07/x.md` ends in the day of the month.
+
+    Taking the last segment of the area is what gave the store folders called
+    06, 07 and 08.
+    """
+    fs = FakeFS()
+    await store(fs=fs).write_observation(
+        observation_over((EVENT, "one"), (EVENT.replace("07", "09"), "two"))
+    )
+
+    topic = fs.writes[0][0].split("/observations/")[1].split("/")[0]
+    assert topic == "events", f"filed under {topic!r}"
+    assert not topic.isdigit()
+
+
+async def test_the_same_claim_reworded_lands_on_the_same_file() -> None:
+    """The model does not repeat a title word for word.
+
+    Keeping it in the filename meant the source digest could never collide --
+    three files in the live store shared digest 9366b15c with identical
+    evidence, one observation written three times.
+    """
+    first, second = FakeFS(), FakeFS()
+    evidence = ((ENTITY, "a quote"), (EVENT, "another quote"))
+
+    await store(fs=first).write_observation(
+        observation_over(*evidence, title="Jasper consistently measures token usage")
+    )
+    await store(fs=second).write_observation(
+        observation_over(*evidence, title="Token usage is a recurring concern")
+    )
+
+    assert first.writes[0][0] == second.writes[0][0]
+
+
+async def test_a_quote_reflowed_by_the_model_is_the_same_evidence() -> None:
+    """Verification already treats a reflowed quote as the same span."""
+    first, second = FakeFS(), FakeFS()
+
+    await store(fs=first).write_observation(
+        observation_over((ENTITY, "a quote spanning"), (EVENT, "b"))
+    )
+    await store(fs=second).write_observation(
+        observation_over((ENTITY, "a quote\n  spanning"), (EVENT, "b"))
+    )
+
+    assert first.writes[0][0] == second.writes[0][0]
+
+
+async def test_a_different_reading_of_the_same_memories_stays_apart() -> None:
+    """Sources alone would collapse two genuine claims into one file."""
+    first, second = FakeFS(), FakeFS()
+
+    await store(fs=first).write_observation(
+        observation_over((ENTITY, "one span"), (EVENT, "another"))
+    )
+    await store(fs=second).write_observation(
+        observation_over((ENTITY, "a different span"), (EVENT, "and another"))
+    )
+
+    assert first.writes[0][0] != second.writes[0][0]
+
+
+async def test_the_filename_says_what_the_observation_is_about() -> None:
+    fs = FakeFS()
+    await store(fs=fs).write_observation(
+        observation_over((ENTITY, "one"), (EVENT, "two"))
+    )
+
+    name = fs.writes[0][0].rsplit("/", 1)[-1]
+    # Sorted by URI, so the entity sorts before the event.
+    assert name.startswith("ov_clip_daily_reflection-"), name
+
+
+async def test_the_body_writes_no_link_of_its_own() -> None:
+    """OpenViking linkifies the quote from `match_text`.
+
+    An explicit `[uri](uri)` as well gave two links per bullet: the whole URI
+    as its own label, and the quote linkified inside its quotation marks.
+    """
+    fs = FakeFS()
+    await store(fs=fs).write_observation(observation_over((ENTITY, "a quote")))
+
+    body = fs.writes[0][1]
+    assert "](viking://" not in body, "the body must not spell out its own links"
+    # The path below `memories/`, so two files with the same stem in different
+    # categories stay distinguishable.
+    assert "- memories/entities/browser_extension/ov_clip: " in body, body
+
+
+async def test_two_memories_with_the_same_stem_stay_distinguishable() -> None:
+    """`ov_clip.md` exists under two categories; naming both `ov_clip` hides which is which."""
+    fs = FakeFS()
+    other = "viking://user/jasper/memories/entities/software_package/ov_clip.md"
+    await store(fs=fs).write_observation(
+        observation_over((ENTITY, "first quote"), (other, "second quote"))
+    )
+
+    body = fs.writes[0][1]
+    assert "- memories/entities/browser_extension/ov_clip: " in body
+    assert "- memories/entities/software_package/ov_clip: " in body
+
+
+async def test_a_quote_that_cannot_be_linked_is_reported(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`render_links` protects markdown spans and drops the link without a word.
+
+    The bullet still names its source, so provenance survives and only the
+    click is lost -- but this store's memories are about code, so backticked
+    quotes are common and a silent drop is the kind of thing nobody notices.
+    """
+    import logging
+
+    fs = FakeFS()
+    with caplog.at_level(logging.DEBUG, logger="ov_ext.reflect.viking"):
+        await store(fs=fs).write_observation(
+            observation_over(
+                (ENTITY, "the `--no-verify` flag is never used"),
+                (EVENT, "a plain quote"),
+            )
+        )
+
+    assert "will not render a link" in caplog.text
+
+
+async def test_a_resource_chunk_is_named_unambiguously() -> None:
+    """Every chunk of every article is `chunk_N`; the stem alone says nothing."""
+    from ov_ext.reflect.viking import _label
+
+    chunk = "viking://user/jasper/resources/blog-scraper/nvidia/post.md/intro/chunk_3.md"
+    assert _label(chunk) == "resources/blog-scraper/nvidia/post.md/intro/chunk_3"

@@ -36,6 +36,7 @@ from .citations import parse_timestamp
 from .config import ReflectSettings
 from .exceptions import ContentUnavailableError
 from .models import MemoryRow, Observation
+from .verify import normalise
 
 __all__ = ["VikingLLM", "VikingStore"]
 
@@ -694,13 +695,8 @@ class VikingStore:
         from openviking.session.memory.dataclass import MemoryFile
         from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 
-        topic = _slug(sorted(observation.areas)[0].rsplit("/", 1)[-1])
-        # The title alone collides: "Both retry" and "Both retry!" slug the
-        # same, and write_file would overwrite one with the other. The digest
-        # is over the evidence, so re-running a sweep that reaches the same
-        # conclusion from the same memories lands on the same file and merges,
-        # while two different observations stay apart.
-        name = f"{_slug(observation.title)}-{_digest(observation)}"
+        topic = _topic(observation)
+        name = f"{_subject(observation)}-{_digest(observation)}"
         root = self._settings.observations_root.replace(
             "viking://~", f"viking://user/{self._ctx.user.user_id}"
         )
@@ -725,8 +721,34 @@ class VikingStore:
             memory_type="observations",
             extra_fields={"topic": topic, "name": name},
         )
+        self._warn_about_unrenderable(uri, observation)
         await self._fs.write_file(uri, MemoryFileUtils.write(memory_file), ctx=self._ctx)
         return uri
+
+    def _warn_about_unrenderable(self, uri: str, observation: Observation) -> None:
+        """Say when OpenViking will decline to link one of the quotes.
+
+        ``render_links`` protects markdown spans, so a quote containing
+        backticks overlaps a protected span and the link is dropped without a
+        word. The bullet still names its source, so the provenance survives and
+        only the click is lost -- but a silent drop is the kind of thing nobody
+        notices, and this store's memories are about code.
+        """
+        try:
+            from openviking.session.memory.utils.link_renderer import LinkRenderer
+
+            body = _render(observation)
+            for source_uri, quote in observation.evidence:
+                if not LinkRenderer.can_render_link(body, quote, uri, source_uri):
+                    logger.debug(
+                        "ov-ext reflect: %s will not render a link for %r; the "
+                        "bullet names its source but will not be clickable",
+                        uri,
+                        quote[:60],
+                    )
+        except Exception:
+            # Diagnostics only. An upstream rename here must not cost a write.
+            logger.debug("ov-ext reflect: could not check link rendering", exc_info=True)
 
     async def link(
         self,
@@ -770,21 +792,69 @@ class VikingStore:
         )
 
 
+def _topic(observation: Observation) -> str:
+    """The folder an observation is filed under.
+
+    The entity category it is about, when one of its sources is an entity --
+    which is the usual case, since entities are what the sweep reflects on.
+
+    Not the last segment of the first area, which is what this used to be. That
+    reads well for ``memories/entities/dev_tool/x.md`` and absurdly for
+    ``memories/events/2026/09/07/x.md``, where the last segment is the day of
+    the month -- which is how a store ends up with folders called 06, 07 and 08.
+    """
+    for uri in sorted(observation.sources):
+        parts = uri.split("/memories/", 1)
+        if len(parts) != 2:
+            continue
+        segments = parts[1].split("/")
+        if segments[0] == "entities" and len(segments) > 2:
+            return _slug(segments[1])
+    # No entity among the sources: the memory type itself, which is at least a
+    # word rather than a number.
+    for uri in sorted(observation.sources):
+        parts = uri.split("/memories/", 1)
+        if len(parts) == 2:
+            return _slug(parts[1].split("/")[0])
+    return "observations"
+
+
+def _subject(observation: Observation) -> str:
+    """A readable, *stable* name for what the observation is about.
+
+    The memories it cites, not the title the model gave it. A title is the
+    model's wording and it does not survive a re-run: the same claim from the
+    same evidence came back as "Jasper consistently measures and optimizes
+    token usage", "Jasper focuses on token usage" and "Token usage and
+    measurement is a recurring concern" -- three files, one observation, and a
+    digest that was doing its job while the title in the filename cancelled it.
+    """
+    names = []
+    for uri in sorted(observation.sources):
+        stem = uri.rsplit("/", 1)[-1].removesuffix(".md")
+        slug = _slug(stem)
+        if slug not in names:
+            names.append(slug)
+    return "_".join(names[:2]) or "observation"
+
+
 def _digest(observation: Observation) -> str:
     """A short stable hash of what an observation rests on.
 
-    Over the cited memories alone -- not the quotes, and not the title. The
-    same conclusion drawn from the same memories then keeps its filename across
-    sweeps and merges into itself, even when the model picks slightly different
-    spans the second time.
+    Over the cited memories *and the spans cited in them*, both normalised.
+    Sources alone would collapse two genuinely different readings of the same
+    two memories into one file; adding the wording would stop a re-run
+    colliding at all, which is the bug this replaced. The quotes are the
+    middle: they are what the claim is built from, and the same claim drawn
+    again from the same evidence quotes the same spans.
 
-    It still changes when the *set of memories* changes, which the random tail
-    sample makes possible: an observation that happens to cite a tail memory
-    lands somewhere new next sweep. Living with that until the compare/merge
-    pass exists, because the alternative -- hashing the title -- collides two
-    unrelated observations into one file.
+    Whitespace is normalised because the model reflows -- a quote differing
+    only in a line break is the same quote, and the verifier already treats it
+    that way.
     """
-    material = "\n".join(sorted(observation.sources))
+    material = "\n".join(
+        sorted(f"{uri}\x00{normalise(quote)}" for uri, quote in observation.evidence)
+    )
     return hashlib.sha256(material.encode()).hexdigest()[:8]
 
 
@@ -795,13 +865,38 @@ def _slug(text: str) -> str:
     return "_".join(words[:5]) or "untitled"
 
 
+def _label(uri: str) -> str:
+    """Name a cited memory readably, and unambiguously.
+
+    The path below the user root, without the extension. The file stem alone is
+    not enough: an observation citing ``entities/browser_extension/ov_clip.md``
+    and ``entities/software_package/ov_clip.md`` would name both ``ov_clip``,
+    and a reader could not tell which quote came from which. Splitting below
+    the user root rather than below ``memories/`` covers resources too, where
+    every chunk of every article is called ``chunk_1``, ``chunk_2``...
+    """
+    marker = (
+        f"/user/{uri.split('/user/', 1)[1].split('/', 1)[0]}/" if "/user/" in uri else ""
+    )
+    tail = uri.split(marker, 1)[1] if marker and marker in uri else uri.rsplit("/", 1)[-1]
+    return tail.removesuffix(".md")
+
+
 def _render(observation: Observation) -> str:
     """Format an observation as the Markdown body of its memory file.
 
     The shape matches what ``observations.yaml`` tells the extractor to expect:
     a title, the claim, then an Evidence section whose bullets are the verified
     quotes. Every quote here has already been found in the memory it cites.
+
+    The source is named, not spelled out as a URI, and nothing here writes a
+    markdown link. OpenViking's ``LinkRenderer`` makes one itself: each
+    ``derived_from`` link carries the quote as its ``match_text``, and
+    rendering finds that span in this body and turns it into the link. Writing
+    an explicit ``[uri](uri)`` as well produced two links per bullet -- the
+    whole URI as its own label, and the quote linkified inside its quotation
+    marks.
     """
     lines = [f"# {observation.title}", "", observation.content, "", "## Evidence", ""]
-    lines += [f'- [{uri}]({uri}): "{quote}"' for uri, quote in observation.evidence]
+    lines += [f'- {_label(uri)}: "{quote}"' for uri, quote in observation.evidence]
     return "\n".join(lines)

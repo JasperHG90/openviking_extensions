@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from .config import ReflectSettings
+from .config import ENV_PREFIX, ReflectSettings
 
 __all__ = ["build_delta_store"]
 
@@ -52,6 +52,17 @@ def build_delta_store(settings: ReflectSettings) -> Any | None:
     """
     dsn = settings.deltas_dsn.strip()
     if not dsn:
+        # Said out loud, because the half-configured case is silent and looks
+        # like success: ov-postgres's `keep_deltas` creates the table, this
+        # setting is what fills it, and they live in different packages. An
+        # operator who set only the first sees a table that stays empty with
+        # nothing anywhere explaining why.
+        logger.info(
+            "ov-ext reflect: %sDELTAS_DSN is not set, so no memory changes are "
+            "captured and the sweep reads whole memories. If ov-postgres has "
+            "`keep_deltas` on, its table will stay empty until this is set.",
+            ENV_PREFIX,
+        )
         return None
     try:
         from psycopg_pool import ConnectionPool
