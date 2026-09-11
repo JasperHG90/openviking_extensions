@@ -299,6 +299,18 @@ class ReflectSettings(BaseSettings):
             "user's own instruction back to them as a finding."
         ),
     )
+    model: str = Field(
+        default="",
+        description=(
+            "Model the sweep reasons with. Empty inherits the server's, which "
+            "is the vision model everything else uses -- and reflection needs "
+            "no vision, only the ability to finish. Measured against the lab "
+            "deployment: `ollama/glm-5.3-flash` spent ~11k tokens deliberating "
+            "and timed out at Bifrost's 120s ceiling on roughly half its calls, "
+            "while `ollama/deepseek-v4-flash:0731` answered the same prompts "
+            "10 times out of 10 in 20-60s."
+        ),
+    )
     passes: int = Field(
         default=3,
         ge=1,

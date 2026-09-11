@@ -105,7 +105,7 @@ async def _sweep_once(
 ) -> SweepReport:
     """One sweep, with the lock already held by the caller."""
     store = VikingStore(viking_fs, vikingdb, ctx, resolved, deltas=deltas)
-    engine = ReflectionEngine(store, llm or VikingLLM(), resolved)
+    engine = ReflectionEngine(store, llm or VikingLLM(settings=resolved), resolved)
     state_uri = _expand(resolved.state_path, ctx.user.user_id)
 
     try:

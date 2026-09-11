@@ -92,18 +92,85 @@ class VikingLLM:
     llm :
         Something with ``complete_json_async(prompt, schema=...)``. Built from
         OpenViking's configured model when omitted.
+    settings :
+        Behaviour toggles. Read for ``model``, which overrides the model the
+        server was configured with -- reflection needs no vision and does need
+        to finish, and those are not the same model.
     """
 
-    def __init__(self, llm: Any | None = None) -> None:
+    def __init__(
+        self, llm: Any | None = None, settings: ReflectSettings | None = None
+    ) -> None:
         self._llm = llm
+        self._settings = settings or ReflectSettings()
 
     def _get_llm(self) -> Any:
         """Return the wrapped model, building OpenViking's default on first use."""
         if self._llm is None:
             from openviking_cli.utils.llm import StructuredLLM
 
-            self._llm = StructuredLLM()
+            llm = StructuredLLM()
+            chosen = self._settings.model.strip()
+            if chosen:
+                llm._get_vlm = lambda: self._own_vlm(chosen)
+            self._llm = llm
         return self._llm
+
+    def _own_vlm(self, model: str) -> Any:
+        """Build a model instance for ``model``, on the server's credentials.
+
+        The server's ``VLMConfig`` is copied and its ``model`` swapped, so the
+        endpoint, key, timeout and retry policy are the ones the deployment was
+        configured with -- only the model differs. Building a config from
+        scratch would default to OpenAI, which is how
+        ``StructuredVLM``'s own constructor goes wrong.
+
+        The copy is shallow and its cached instance cleared. Shallow because a
+        deep copy cannot walk the cached client's thread lock; cleared because
+        otherwise ``get_vlm_instance()`` hands back the instance the server
+        already built for the old name, and reflection quietly keeps using it.
+
+        Falls back to the server's model when the copy or the build fails: a
+        sweep on the wrong model is worth more than a sweep that cannot start.
+        A *missing* OpenViking config is not caught, because there is then no
+        server model to fall back to and nothing else in the process works
+        either -- the same error the unmodified ``StructuredLLM`` would raise.
+        """
+        from openviking_cli.utils.config import get_openviking_config
+
+        configured = get_openviking_config().vlm
+        try:
+            # Shallow. A deep copy walks `__pydantic_private__`, which holds
+            # the cached client -- and that holds a thread lock, so deepcopy
+            # raises `cannot pickle '_thread.lock'` and the override silently
+            # falls back to the server's model. Nothing nested is mutated here;
+            # only `model` is, and that is a string on the copy.
+            own = configured.model_copy()
+            own.model = model
+            # Credentials win over the top-level name:
+            # `_build_vlm_config_dict_for_credential` takes
+            # `credential.model or self.model`, so a config with credentials --
+            # which is what OpenViking writes -- ignores `own.model` entirely
+            # and keeps building the server's. Replaced rather than mutated, so
+            # the server's own credentials are untouched.
+            if own.credentials:
+                own.credentials = [
+                    credential.model_copy(update={"model": model})
+                    for credential in own.credentials
+                ]
+            # `_vlm_instance` is a pydantic private, so it lives in
+            # `__pydantic_private__` and `object.__setattr__` writes a shadow
+            # that `get_vlm_instance` never reads -- leaving it returning None.
+            own.__pydantic_private__["_vlm_instance"] = None
+            instance = own.get_vlm_instance()
+        except Exception:
+            logger.exception(
+                "ov-ext reflect: could not build %r; falling back to the server's model",
+                model,
+            )
+            return configured.get_vlm_instance()
+        logger.info("ov-ext reflect: reasoning with %s", model)
+        return instance
 
     async def complete(self, prompt: str, model: type[T]) -> T | None:
         """Answer ``prompt`` as an instance of ``model``, or ``None``."""

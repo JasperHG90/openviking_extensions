@@ -520,6 +520,11 @@ the one path every sweep goes through, so there is no second, unlocked way in.
 |---|---|---|
 | `OV_REFLECT_ENABLED` | `false` | Register the memory type and allow sweeps. Off until you turn it on |
 | `OV_REFLECT_DRY_RUN` | `false` | Read, prompt and verify; report what it would write |
+| `OV_REFLECT_MODEL` | _(the server's)_ | Model the sweep reasons with. Reflection needs no vision and does need to finish |
+| `OV_REFLECT_PASSES` | `3` | Model calls per sweep, each over a different random sample |
+| `OV_REFLECT_PASS_SIZE` | `12` | Changed entities shown in one pass |
+| `OV_REFLECT_MEMORY_TYPES` | `["entities"]` | What an observation is about |
+| `OV_REFLECT_EVIDENCE_TYPES` | `["entities","events","resources"]` | What may be cited |
 | `OV_REFLECT_DELTAS_DSN` | _(unset)_ | Read what changed in each memory instead of the whole file. Needs ov-postgres with `keep_deltas` on |
 | `OV_REFLECT_DELTAS_SCHEMA` | `public` | Schema holding the delta table |
 | `OV_REFLECT_CONTEXT_CHARS` | `1200` | Cap on any one memory shown as background (a neighbour or tail sample) |

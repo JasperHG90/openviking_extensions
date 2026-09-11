@@ -10,16 +10,22 @@ caught by importing the class and looking.
 
 from __future__ import annotations
 
+import copy
 import random
+import sys
+import threading
+import types
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
 
+from pydantic import BaseModel, Field, PrivateAttr
+
 from ov_ext.reflect.config import ReflectSettings
 from ov_ext.reflect.exceptions import ContentUnavailableError
 from ov_ext.reflect.models import MemoryRow, Observation
-from ov_ext.reflect.viking import VikingStore, _digest, _render, _slug
+from ov_ext.reflect.viking import VikingLLM, VikingStore, _digest, _render, _slug
 
 NOW = datetime(2026, 9, 8, tzinfo=timezone.utc)
 
@@ -627,3 +633,160 @@ async def test_a_large_delta_is_capped_like_any_other_context() -> None:
 
     assert len(rows) == 1
     assert len(rows[0].text) == ReflectSettings().context_chars
+
+
+# --- which model the sweep reasons with -------------------------------------
+
+
+class FakeCredential(BaseModel):
+    """One credential, whose model wins over the config's own."""
+
+    model: str
+
+
+class FakeVLMConfig(BaseModel):
+    """OpenViking's VLMConfig, in the ways that defeated the first attempt.
+
+    A plain stub passes on code that cannot work, so this reproduces all three
+    traps the real class set:
+
+    * ``credentials`` carry their own model, and
+      ``_build_vlm_config_dict_for_credential`` takes ``credential.model or
+      self.model`` -- so setting the top-level name alone changes nothing;
+    * the built client is cached on a **pydantic private**, which
+      ``object.__setattr__`` cannot reach;
+    * that client holds a thread lock, so ``model_copy(deep=True)`` raises.
+    """
+
+    model: str
+    credentials: list[FakeCredential] = Field(default_factory=list)
+    _vlm_instance: Any = PrivateAttr(default=None)
+    _lock: Any = PrivateAttr(default_factory=threading.Lock)
+
+    def model_copy(self, *, update: Any = None, deep: bool = False) -> FakeVLMConfig:
+        if deep:
+            copy.deepcopy(self._lock)  # raises, exactly as pydantic's does
+        copied = super().model_copy(update=update or {})
+        assert copied.__pydantic_private__ is not None
+        copied.__pydantic_private__["_vlm_instance"] = self._vlm_instance
+        return copied
+
+    def get_vlm_instance(self) -> Any:
+        if self._vlm_instance is None:
+            # The credential wins, as it does upstream.
+            effective = self.credentials[0].model if self.credentials else self.model
+            assert self.__pydantic_private__ is not None
+            self.__pydantic_private__["_vlm_instance"] = f"instance-for-{effective}"
+        return self._vlm_instance
+
+
+def with_server_model(monkeypatch: pytest.MonkeyPatch, model: str) -> FakeVLMConfig:
+    """Point `get_openviking_config().vlm` at a fake carrying `model`."""
+    config = FakeVLMConfig(model=model, credentials=[FakeCredential(model=model)])
+    module = types.ModuleType("openviking_cli.utils.config")
+    module.get_openviking_config = lambda: types.SimpleNamespace(vlm=config)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "openviking_cli.utils.config", module)
+    return config
+
+
+def reflect_settings(**overrides: Any) -> ReflectSettings:
+    base = {**ReflectSettings().model_dump(), "enabled": True}
+    base.update(overrides)
+    return ReflectSettings.model_construct(**base)
+
+
+def test_the_sweep_uses_its_own_model_when_told_to(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with_server_model(monkeypatch, "ollama/glm-5.3-flash")
+    llm = VikingLLM(settings=reflect_settings(model="ollama/deepseek-v4-flash:0731"))
+
+    assert llm._own_vlm("ollama/deepseek-v4-flash:0731") == (
+        "instance-for-ollama/deepseek-v4-flash:0731"
+    )
+
+
+def test_the_override_clears_the_configs_cached_instance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real VLMConfig caches what it built.
+
+    Copy it without clearing that and `get_vlm_instance()` hands back the model
+    the server already built -- the setting reads as applied and does nothing.
+    """
+    with_server_model(monkeypatch, "ollama/glm-5.3-flash")
+    llm = VikingLLM(settings=reflect_settings(model="ollama/deepseek-v4-flash:0731"))
+
+    built = llm._own_vlm("ollama/deepseek-v4-flash:0731")
+
+    assert "glm" not in built
+
+
+def test_the_override_does_not_disturb_the_servers_own_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Everything else in the process still uses the model it was configured with."""
+    config = with_server_model(monkeypatch, "ollama/glm-5.3-flash")
+    llm = VikingLLM(settings=reflect_settings(model="ollama/deepseek-v4-flash:0731"))
+
+    llm._own_vlm("ollama/deepseek-v4-flash:0731")
+
+    assert config.model == "ollama/glm-5.3-flash"
+    assert config.get_vlm_instance() == "instance-for-ollama/glm-5.3-flash"
+
+
+def test_a_model_that_cannot_be_built_falls_back_to_the_servers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sweep on the wrong model beats a sweep that cannot start."""
+    config = with_server_model(monkeypatch, "ollama/glm-5.3-flash")
+    monkeypatch.setattr(
+        FakeVLMConfig,
+        "model_copy",
+        lambda self, deep=False: (_ for _ in ()).throw(RuntimeError("no")),
+    )
+    llm = VikingLLM(settings=reflect_settings(model="nonsense"))
+
+    assert llm._own_vlm("nonsense") == config.get_vlm_instance()
+
+
+def test_no_model_configured_leaves_the_server_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default must change nothing for a deployment that never set it."""
+    calls: list[str] = []
+    module = types.ModuleType("openviking_cli.utils.llm")
+
+    class Structured:
+        def _get_vlm(self) -> Any:
+            calls.append("server")
+            return "server-vlm"
+
+    module.StructuredLLM = Structured  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "openviking_cli.utils.llm", module)
+
+    VikingLLM(settings=reflect_settings(model=""))._get_llm()._get_vlm()
+
+    assert calls == ["server"]
+
+
+def test_the_override_is_wired_into_the_llm_the_sweep_uses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Through `_get_llm`, which is what the engine actually calls.
+
+    Building the right instance is no use if nothing installs it.
+    """
+    with_server_model(monkeypatch, "ollama/glm-5.3-flash")
+    module = types.ModuleType("openviking_cli.utils.llm")
+
+    class Structured:
+        def _get_vlm(self) -> Any:
+            return "server-vlm"
+
+    module.StructuredLLM = Structured  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "openviking_cli.utils.llm", module)
+
+    llm = VikingLLM(settings=reflect_settings(model="ollama/deepseek-v4-flash:0731"))
+
+    assert llm._get_llm()._get_vlm() == "instance-for-ollama/deepseek-v4-flash:0731"
