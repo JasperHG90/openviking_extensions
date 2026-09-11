@@ -11,6 +11,7 @@ import {
   type AgentSession,
   type Destinations,
   type FileDetail,
+  type FolderMade,
   type Home,
   type Job,
   type JobState,
@@ -24,6 +25,7 @@ import {
   apiErrorSchema,
   destinationsSchema,
   fileDetailSchema,
+  folderMadeSchema,
   homeSchema,
   jobSchema,
   jobStateSchema,
@@ -249,6 +251,28 @@ export const api = {
     return parsed.data.uri;
   },
 
+  /**
+   * Make a folder to put things in.
+   *
+   * @param into - Where it goes. Empty means wherever an upload with no
+   *   destination would land.
+   * @param name - What to call it. The server cleans it, so the uri and name it
+   *   answers with are what was actually made, not what was asked for.
+   * @param description - What the folder is for. OpenViking stores it as the
+   *   folder's abstract and vectorizes it, so this is what makes the folder
+   *   findable. Optional.
+   */
+  async newFolder(into: string, name: string, description = ""): Promise<FolderMade> {
+    const made = await call(
+      "/api/folder",
+      folderMadeSchema,
+      posting({ into, name, description }),
+    );
+    // The tree has a row it did not have, and the folder above it has a child.
+    invalidate();
+    return made;
+  },
+
   /** Hand a file or folder back to OpenViking to describe again. */
   describe: (uri: string): Promise<Job> =>
     call("/api/describe", jobSchema, posting({ uri })),
@@ -295,6 +319,7 @@ export type {
   Destinations,
   Opened,
   FileDetail,
+  FolderMade,
   Home,
   Job,
   JobState,

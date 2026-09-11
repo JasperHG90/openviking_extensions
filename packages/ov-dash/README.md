@@ -117,7 +117,8 @@ hourly and buy nothing.
 
 The reading pane also acts on what it is showing: **Describe again** hands the
 file back to OpenViking's model, **Delete** removes it, and dragging a row in
-the tree onto a folder moves it there (`fs/mv`). See below for what each of
+the tree onto a folder moves it there (`fs/mv`). The **+** in the Files toolbar
+makes a folder to drag things into (`fs/mkdir`). See below for what each of
 those does and does not do.
 
 Downloads use `content/download`. A folder has no archive endpoint upstream, so
@@ -201,6 +202,56 @@ destination is a *directory*, and copies straight over an existing file without
 a word (`storage/viking_fs/_ops.py`). Dragging `todo.md` into a folder that
 already has one would otherwise destroy the second with nothing on screen to
 say so.
+
+### Making a folder is the other half of the drag
+
+A drag can only move something into a folder that already exists. OpenViking
+has had `fs/mkdir` all along; this dashboard had no way to call it, so getting
+somewhere to put things meant uploading a file into a path that did not exist
+yet, which is backwards. `POST /api/folder` is the other half.
+
+The name is one path segment, cleaned by `safeSegment` in
+`src/shared/names.ts` — the same character rule an uploaded file's name goes
+through. It lives in shared because the New folder box previews the cleaned
+name as you type: type `Q3 notes`, see `Q3_notes`, get `Q3_notes`.
+`folderNameProblem` next to it says why a name will be refused, in the words
+the server will use, so the refusal arrives before the round trip.
+
+Three names are refused rather than cleaned. One that survives to nothing —
+empty, `.`, `..` — because there is no name left to use; this is the one place
+the rule differs from an upload, which has bytes to store either way and so
+gets `upload`. One starting with a dot, because every listing here goes out
+without `-a` and the folder would be invisible, and because `.abstract.md` is
+the file OpenViking writes *inside* a folder — a directory at that name sits
+where OpenViking will later want to write. And one over 255 characters, which
+no filesystem this lands on will take.
+
+The folder it lands in is the one selected in the tree, or the folder holding
+the selected file, and otherwise wherever an upload with no destination would
+go. Leave `into` out and the server works that out with the same
+`resolveTarget` an upload uses, so there is one answer to "where do my files
+live" rather than two. The server stats that parent and refuses a file, exactly
+as a move does, because OpenViking will not: `mkdir` makes the parents it needs
+and `_ensure_parent_dirs` logs what it could not make at debug level and carries
+on, so a folder asked for under `todo.md` comes back as an opaque storage error
+or as a directory nested inside a document.
+
+A parent that is not there *yet* is fine, and that is the same `mkdir`
+behaviour read the other way. Nothing in this dashboard creates the fixed
+`resources` subtree — only OpenViking's own `initialize_user_directories`, from
+routes ov-dash never calls — so refusing a missing parent would mean the first
+folder in an untouched tree could not be made at all. Only a 404 counts as "not
+there": an outage reading the parent still refuses, or a hiccup would have
+`mkdir` build a chain under something that is really a file.
+
+The description is optional and worth filling in. OpenViking writes it into the
+folder's `.abstract.md` and vectorizes it (`service/fs_service.py`, `mkdir`),
+so it is what makes the folder findable; left out, the abstract is the folder's
+own name and nothing else.
+
+The server refuses a name the destination already holds. OpenViking's own
+`mkdir` runs with `exist_ok=False` and would refuse too, but with a message
+about a path on disk — the check here is for the sentence somebody reads.
 
 ### Search is the vector face alone
 
@@ -286,13 +337,26 @@ written plainly, with backslashes, or percent-encoded. It refuses *any* percent
 escape, harmless ones included: allowing them means deciding whose decoding
 wins, ours or OpenViking's, and it is what closes double encoding without a
 decode loop. `requireInScope` in `src/server/app.ts` is the one place that
-says so, and `/api/upload`, `/api/file`, `/api/move` and `/api/describe` all go
-through it.
+says so, and `/api/upload`, `/api/file`, `/api/move`, `/api/folder` and
+`/api/describe` all go through it.
 
 Somewhere to *put* a file may be a scope root; something to act on may not.
 "Delete `viking://user/jasper`", or "rerun the model over all of it", is not a
 request a stray click should be able to make, so delete, move and describe all
-ask for a uri strictly inside a scope.
+ask for a uri strictly inside a scope. A new folder's parent is somewhere to
+put something, so it is allowed to be a scope root, the same as a move's
+destination — nothing in the UI offers one, since the tree's rows start below
+the root. Worth knowing if you call it by hand: a folder made directly under
+`viking://user/<id>` is one you can drag into but never upload into, because
+OpenViking's import validator wants a target under `resources` or `skills`
+(`core/uri_validation.py`, `matches_content_kind`).
+
+The *name* under that parent never reaches `requireInScope` as part of a path
+at all. `safeSegment` has already reduced it to one segment: separators gone,
+and everything outside `[A-Za-z0-9._-]` replaced, so a percent escape comes
+through as text rather than as something the next reader might decode. That is
+an allowlist rather than a denylist, which is what makes appending the name
+*after* the scope check safe. `tests/names.test.ts` pins it directly.
 
 None of this is what stops one person reaching another's tree — the API key is,
 since OpenViking answers as whoever it belongs to. What it stops is a typo, or

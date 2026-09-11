@@ -257,3 +257,13 @@ export type JobState = z.infer<typeof jobStateSchema>;
 /** Where a moved resource ended up. */
 export const movedSchema = z.object({ uri: z.string() });
 export type Moved = z.infer<typeof movedSchema>;
+
+/**
+ * A folder that was just made.
+ *
+ * The name comes back as well as the uri, because the server cleans what was
+ * typed — "Q3 notes" is stored as `Q3_notes` — and the page has to say what it
+ * actually made rather than what it was asked for.
+ */
+export const folderMadeSchema = z.object({ uri: z.string(), name: z.string() });
+export type FolderMade = z.infer<typeof folderMadeSchema>;

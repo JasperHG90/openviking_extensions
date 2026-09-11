@@ -457,6 +457,22 @@ export class OvClient {
   }
 
   /**
+   * Make a folder, and tell OpenViking what it is for.
+   *
+   * The parents it needs are made too — `_ensure_parent_dirs` in
+   * `storage/viking_fs/_ops.py` — which is what lets the first folder in an
+   * untouched tree be made at all. An existing folder is an error, though, not
+   * a quiet success: `mkdir` runs with `exist_ok=False`.
+   *
+   * The description is what OpenViking writes into the folder's `.abstract.md`
+   * and then vectorizes, so it is how the folder becomes findable at all. Left
+   * out, the abstract is the folder's own name and nothing else.
+   */
+  async mkdir(uri: string, description?: string): Promise<void> {
+    await this.guard(`creating ${uri}`, () => this.sdk.mkdir(uri, description));
+  }
+
+  /**
    * Whether anything is at a uri.
    *
    * A missing resource is the answer here, not a failure, so a 404 comes back

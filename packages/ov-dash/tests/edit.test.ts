@@ -1,11 +1,12 @@
 /**
- * The three things a person can now do to a file: delete it, move it, and hand
- * it back to OpenViking to describe again.
+ * What a person can now do to the tree: delete a file, move one, make a folder
+ * to move it into, and hand a file back to OpenViking to describe again.
  *
- * All three are writes, so the interesting cases are the refusals. A delete
+ * All of them are writes, so the interesting cases are the refusals. A delete
  * that reaches outside the caller's scopes, a move that drops a folder inside
- * itself, and a reindex that runs the cheap mode are each a bug you would only
- * notice against a live cluster, which is exactly why they are pinned here.
+ * itself, a folder made on top of one that is already there, and a reindex that
+ * runs the cheap mode are each a bug you would only notice against a live
+ * cluster, which is exactly why they are pinned here.
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -341,6 +342,319 @@ describe("moving a file", () => {
       });
       expect(response.status, JSON.stringify(body)).toBe(400);
     }
+  });
+});
+
+describe("making a folder", () => {
+  const INTO = "viking://user/jasper/resources/notes";
+
+  /** Say what exists, and answer a mkdir with OpenViking's own envelope. */
+  function tree(entries: Record<string, { isDir: boolean } | null>) {
+    return stubOv((url) => {
+      if (url.includes("/fs/mkdir")) return {};
+      return statting(entries)(url);
+    });
+  }
+
+  it("makes it under the folder that was asked for", async () => {
+    const calls = tree({ [INTO]: { isDir: true }, [`${INTO}/drafts`]: null });
+
+    const response = await appFor().request("/api/folder", {
+      method: "POST",
+      headers: FROM_THE_APP,
+      body: JSON.stringify({ into: INTO, name: "drafts" }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ uri: `${INTO}/drafts`, name: "drafts" });
+    const made = calls.find((call) => call.url.includes("/fs/mkdir"));
+    expect(made?.body).toEqual({ uri: `${INTO}/drafts` });
+  });
+
+  it("passes a description through, because that is the folder's abstract", async () => {
+    // OpenViking writes it into `.abstract.md` and vectorizes it — fs_service
+    // mkdir — so this is what makes a new folder findable at all. Dropped on
+    // the way, every folder made here would be a row nothing can search for.
+    const calls = tree({ [INTO]: { isDir: true }, [`${INTO}/drafts`]: null });
+
+    await appFor().request("/api/folder", {
+      method: "POST",
+      headers: FROM_THE_APP,
+      body: JSON.stringify({
+        into: INTO,
+        name: "drafts",
+        description: "  half-written  ",
+      }),
+    });
+
+    expect(calls.find((call) => call.url.includes("/fs/mkdir"))?.body).toEqual({
+      uri: `${INTO}/drafts`,
+      description: "half-written",
+    });
+  });
+
+  it("keeps the name to one segment, so a typed path cannot climb out", async () => {
+    const calls = tree({ [INTO]: { isDir: true }, [`${INTO}/passwd`]: null });
+
+    const response = await appFor().request("/api/folder", {
+      method: "POST",
+      headers: FROM_THE_APP,
+      body: JSON.stringify({ into: INTO, name: "../../etc/passwd" }),
+    });
+
+    // Everything above the last separator is gone before this is a uri at all,
+    // so the `..` never reaches a path anything resolves.
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ uri: `${INTO}/passwd`, name: "passwd" });
+    expect(calls.find((call) => call.url.includes("/fs/mkdir"))?.body).toEqual({
+      uri: `${INTO}/passwd`,
+    });
+  });
+
+  it("stores a typed name the way the box previewed it", async () => {
+    // The New folder box shows the cleaned name as you type, from the same
+    // rule in shared/names.ts. If the two drifted, people would type one name
+    // and find another in the tree.
+    const calls = tree({ [INTO]: { isDir: true }, [`${INTO}/Q3_notes`]: null });
+
+    const response = await appFor().request("/api/folder", {
+      method: "POST",
+      headers: FROM_THE_APP,
+      body: JSON.stringify({ into: INTO, name: "Q3 notes" }),
+    });
+
+    expect(await response.json()).toEqual({ uri: `${INTO}/Q3_notes`, name: "Q3_notes" });
+    expect(calls.find((call) => call.url.includes("/fs/mkdir"))?.body).toEqual({
+      uri: `${INTO}/Q3_notes`,
+    });
+  });
+
+  it("refuses a name that is nothing once it is cleaned", async () => {
+    const calls = stubOv();
+
+    for (const name of ["", "   ", ".", "..", "..."]) {
+      const response = await appFor().request("/api/folder", {
+        method: "POST",
+        headers: FROM_THE_APP,
+        body: JSON.stringify({ into: INTO, name }),
+      });
+      expect(response.status, JSON.stringify(name)).toBe(400);
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  it("refuses a name starting with a dot, which is where OpenViking keeps its own", async () => {
+    // `.abstract.md` is the file OpenViking writes inside a folder, so a
+    // *directory* at that name sits exactly where it will later want to write.
+    // A dotted folder is also invisible: every listing here goes out without
+    // `-a`. The `exists` check would hide the first case behind a confusing
+    // 409 on any folder that had already been described.
+    const calls = stubOv();
+
+    for (const name of [".abstract.md", ".overview.md", ".hidden"]) {
+      const response = await appFor().request("/api/folder", {
+        method: "POST",
+        headers: FROM_THE_APP,
+        body: JSON.stringify({ into: INTO, name }),
+      });
+      expect(response.status, name).toBe(400);
+      const body = (await response.json()) as { error: { message: string } };
+      expect(body.error.message, name).toContain("starting with a dot");
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  it("refuses a name longer than one path component may be", async () => {
+    const calls = stubOv();
+
+    const response = await appFor().request("/api/folder", {
+      method: "POST",
+      headers: FROM_THE_APP,
+      body: JSON.stringify({ into: INTO, name: "a".repeat(256) }),
+    });
+
+    // Past this, OpenViking answers with whatever the storage layer says about
+    // a path component, which is not a sentence anybody can act on.
+    expect(response.status).toBe(400);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("refuses a parent that is a file", async () => {
+    // OpenViking will not stop this: `mkdir` makes the parents it needs, and
+    // `_ensure_parent_dirs` logs what it could not make and carries on. So the
+    // answer would be an opaque storage error, or a directory nested inside a
+    // document. `/api/move` refuses the same shape for the same reason.
+    const calls = tree({ "viking://user/jasper/resources/todo.md": { isDir: false } });
+
+    const response = await appFor().request("/api/folder", {
+      method: "POST",
+      headers: FROM_THE_APP,
+      body: JSON.stringify({
+        into: "viking://user/jasper/resources/todo.md",
+        name: "kid",
+      }),
+    });
+
+    expect(response.status).toBe(400);
+    expect(calls.some((call) => call.url.includes("/fs/mkdir"))).toBe(false);
+  });
+
+  it("refuses a name the folder already holds", async () => {
+    // OpenViking's own mkdir runs with exist_ok=False, so this would fail
+    // anyway — with a message about a path on disk. The point of checking here
+    // is the sentence somebody reads.
+    const calls = tree({ [INTO]: { isDir: true }, [`${INTO}/drafts`]: { isDir: true } });
+
+    const response = await appFor().request("/api/folder", {
+      method: "POST",
+      headers: FROM_THE_APP,
+      body: JSON.stringify({ into: INTO, name: "drafts" }),
+    });
+
+    expect(response.status).toBe(409);
+    const body = (await response.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("ALREADY_EXISTS");
+    expect(body.error.message).toBe("notes already holds something called drafts");
+    expect(calls.some((call) => call.url.includes("/fs/mkdir"))).toBe(false);
+  });
+
+  it("does not read an outage as a free name", async () => {
+    // `exists` answers false on a 404 and rethrows everything else. Were a 502
+    // swallowed as well, an OpenViking hiccup would look like an empty slot and
+    // mkdir would be asked for a folder that is already there.
+    //
+    // Only the child's stat fails. Failing every call would have the parent's
+    // stat throw first, and this would pass while testing nothing about
+    // `exists` at all.
+    const calls = stubOv((url) => {
+      const uri = decodeURIComponent(new URL(url).searchParams.get("uri") ?? "");
+      if (uri === `${INTO}/drafts`) {
+        return new Response(
+          JSON.stringify({
+            status: "error",
+            error: { code: "UNAVAILABLE", message: "upstream is down" },
+          }),
+          { status: 503, headers: { "content-type": "application/json" } },
+        );
+      }
+      return { name: "notes", uri: INTO, isDir: true, size: 0, modTime: "" };
+    });
+
+    const response = await appFor().request("/api/folder", {
+      method: "POST",
+      headers: FROM_THE_APP,
+      body: JSON.stringify({ into: INTO, name: "drafts" }),
+    });
+
+    expect(response.status).toBe(502);
+    expect(calls.some((call) => call.url.includes("/fs/mkdir"))).toBe(false);
+  });
+
+  it("makes the folder when the parent is not there yet", async () => {
+    // `mkdir` makes the whole chain it needs, and nothing in this dashboard
+    // creates the fixed `resources` subtree — only OpenViking's own
+    // `initialize_user_directories`, from routes ov-dash never calls. Refusing
+    // a missing parent would mean the first folder in an empty tree could not
+    // be made, which is the tree most in need of one.
+    const calls = tree({
+      "viking://user/jasper/resources": null,
+      "viking://user/jasper/resources/drafts": null,
+    });
+
+    const response = await appFor().request("/api/folder", {
+      method: "POST",
+      headers: FROM_THE_APP,
+      body: JSON.stringify({ name: "drafts" }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(calls.find((call) => call.url.includes("/fs/mkdir"))?.body).toEqual({
+      uri: "viking://user/jasper/resources/drafts",
+    });
+  });
+
+  it("still refuses a parent the stat could not be read for", async () => {
+    // Only a 404 means "not there yet". An outage reading the parent must not
+    // read as one, or a hiccup would have mkdir build a chain under a uri that
+    // is really a file.
+    //
+    // The outage is on the parent's stat alone, and the child answers 404.
+    // A stub where everything fails cannot tell you which guard refused: the
+    // parent's catch could swallow the 503 as "not there yet" and the 502 would
+    // still arrive, one call later, from `exists`.
+    const calls = stubOv((url) => {
+      const uri = decodeURIComponent(new URL(url).searchParams.get("uri") ?? "");
+      if (uri !== INTO) return notFound(uri);
+      return new Response(
+        JSON.stringify({
+          status: "error",
+          error: { code: "UNAVAILABLE", message: "upstream is down" },
+        }),
+        { status: 503, headers: { "content-type": "application/json" } },
+      );
+    });
+
+    const response = await appFor().request("/api/folder", {
+      method: "POST",
+      headers: FROM_THE_APP,
+      body: JSON.stringify({ into: INTO, name: "drafts" }),
+    });
+
+    expect(response.status).toBe(502);
+    expect(calls.some((call) => call.url.includes("/fs/mkdir"))).toBe(false);
+  });
+
+  it("falls back to where an upload would land when no folder is named", async () => {
+    const calls = tree({
+      "viking://user/jasper/resources": { isDir: true },
+      "viking://user/jasper/resources/drafts": null,
+    });
+
+    const response = await appFor().request("/api/folder", {
+      method: "POST",
+      headers: FROM_THE_APP,
+      body: JSON.stringify({ name: "drafts" }),
+    });
+
+    expect(response.status).toBe(200);
+    // Not the bare scope root: OpenViking refuses `viking://user/jasper` as a
+    // destination, because that root only holds the fixed subtrees.
+    expect(await response.json()).toEqual({
+      uri: "viking://user/jasper/resources/drafts",
+      name: "drafts",
+    });
+    expect(calls.find((call) => call.url.includes("/fs/mkdir"))?.body).toEqual({
+      uri: "viking://user/jasper/resources/drafts",
+    });
+  });
+
+  it("refuses a parent outside the caller's scopes", async () => {
+    const calls = stubOv();
+
+    const response = await appFor().request("/api/folder", {
+      method: "POST",
+      headers: FROM_THE_APP,
+      body: JSON.stringify({ into: "viking://user/ada/resources", name: "drafts" }),
+    });
+
+    expect(response.status).toBe(403);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("refuses one that did not come from this dashboard", async () => {
+    const calls = stubOv();
+
+    const response = await appFor().request("/api/folder", {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "https://evil.example" },
+      body: JSON.stringify({ into: INTO, name: "drafts" }),
+    });
+
+    expect(response.status).toBe(403);
+    expect(((await response.json()) as { error: { code: string } }).error.code).toBe(
+      "BAD_ORIGIN",
+    );
+    expect(calls).toHaveLength(0);
   });
 });
 

@@ -15,8 +15,10 @@ import type { Context, MiddlewareHandler } from "hono";
 import { csrf } from "hono/csrf";
 import { HTTPException } from "hono/http-exception";
 import { inlineImageType } from "../shared/media";
+import { folderNameProblem, namesNothing, safeSegment } from "../shared/names";
 import type {
   FileDetail,
+  FolderMade,
   Home,
   Job,
   Memory,
@@ -802,6 +804,77 @@ export function createApp(services: Services) {
   });
 
   /**
+   * Make a folder.
+   *
+   * Somewhere to drag things into. OpenViking has had `fs/mkdir` all along;
+   * this dashboard had no way to call it, so the only way to get a folder was
+   * to upload a file into a path that did not exist yet.
+   *
+   * `into` may be left out, and then the folder lands where an upload with no
+   * destination would. The name is one segment, cleaned the way an uploaded
+   * file's name is — the New folder box shows the cleaned name as you type, so
+   * what lands is what was on screen.
+   */
+  app.post("/api/folder", async (c) => {
+    const ov = c.get("ov");
+    const body = await readJson(c);
+    const into = resolveTarget(
+      config,
+      c.get("viewer"),
+      typeof body.into === "string" ? body.into : "",
+    );
+
+    const name = safeSegment(typeof body.name === "string" ? body.name.trim() : "");
+    const problem = folderNameProblem(name);
+    if (problem) throw new OvError(problem, 400, "INVALID_ARGUMENT");
+
+    /*
+     * If there is a parent to look at, it has to be a folder.
+     *
+     * OpenViking will not check this: `mkdir` makes the parents it needs, and
+     * `_ensure_parent_dirs` logs what it could not make at debug level and
+     * carries on. So asking for a folder under `todo.md` comes back either as
+     * an opaque storage error or as a directory nested inside a document.
+     *
+     * A parent that is not there yet is a different matter, and not an error.
+     * `mkdir` makes the whole chain, and nothing in this dashboard creates the
+     * fixed `resources` subtree — only OpenViking's own `initialize_user_
+     * directories` does, from routes ov-dash never calls. Refusing here would
+     * mean the first folder in an empty tree, the tree most in need of one,
+     * could not be made at all.
+     */
+    const parent = await ov.stat(into).catch((error: unknown) => {
+      if (error instanceof OvError && error.status === 404) return null;
+      throw error;
+    });
+    if (parent && !parent.isDir) {
+      throw new OvError(
+        `${parent.name} is a file, not somewhere to put a folder`,
+        400,
+        "INVALID_ARGUMENT",
+      );
+    }
+
+    // Checked here rather than left to OpenViking, which runs `mkdir` with
+    // `exist_ok=False` and refuses with a message about a path on disk. "notes
+    // already holds something called drafts" is the same refusal in words
+    // somebody can act on, and it costs one stat.
+    const uri = `${into}/${name}`;
+    if (await ov.exists(uri)) {
+      throw new OvError(
+        `${parent?.name ?? into.split("/").pop()} already holds something called ${name}`,
+        409,
+        "ALREADY_EXISTS",
+      );
+    }
+
+    const description =
+      typeof body.description === "string" ? body.description.trim() : "";
+    await ov.mkdir(uri, description || undefined);
+    return c.json({ uri, name } satisfies FolderMade);
+  });
+
+  /**
    * Hand one file or folder back to OpenViking to describe again.
    *
    * Descriptions are written once, by a model, and sometimes they do not
@@ -1388,11 +1461,17 @@ async function importWithRetry(
   }
 }
 
-/** Reduce an uploaded name to one safe path segment. */
+/**
+ * Reduce an uploaded name to one safe path segment.
+ *
+ * Same character rule as a typed folder name, which is why it lives in shared.
+ * The difference is what happens to a name that survives to nothing: an upload
+ * has bytes to store either way, so it gets one, where a folder nobody named is
+ * refused.
+ */
 function sanitizeName(name: string): string {
-  const base = name.split(/[/\\]/).pop() ?? "upload";
-  const cleaned = base.replace(/[^A-Za-z0-9._-]/g, "_");
-  return cleaned === "" || cleaned === "." || cleaned === ".." ? "upload" : cleaned;
+  const cleaned = safeSegment(name);
+  return namesNothing(cleaned) ? "upload" : cleaned;
 }
 
 function byNewest(a: Node, b: Node): number {

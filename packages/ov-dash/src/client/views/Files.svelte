@@ -7,6 +7,7 @@
    * pane beside the tree, so the tree keeps its shape and its scroll position
    * and there is nothing to go "back" from.
    */
+  import { MAX_SEGMENT, folderNameProblem, safeSegment } from "../../shared/names";
   import { api, type FileDetail, type Tree } from "../lib/api";
   import Download from "../lib/Download.svelte";
   import Icon from "../lib/Icon.svelte";
@@ -277,6 +278,127 @@
   }
 
   /*
+   * ── Making a folder ──────────────────────────────────────────
+   *
+   * Dragging can only move something into a folder that already exists, and
+   * this dashboard had no way to make one — a place to drag things into had to
+   * be created by uploading a file into it, which is backwards. This is the
+   * other half of the drag.
+   */
+
+  let naming = $state(false);
+  let newName = $state("");
+  let newDesc = $state("");
+  let creating = $state(false);
+  let nameBox: HTMLInputElement | undefined = $state();
+
+  /**
+   * Where a folder goes when nothing in the tree is picked.
+   *
+   * Read off the destinations the Add page uses rather than built from the tree
+   * root, because the server decides where a scope's files actually live and
+   * `viking://user/<id>` is not itself writable.
+   */
+  let defaultParent = $state("");
+
+  /**
+   * Fetch that default, once, when the box is first opened.
+   *
+   * Not at mount: `/api/destinations` is another recursive listing of every
+   * scope, about as expensive as the tree itself, and it feeds one line of
+   * preview text that most visits to this page never see.
+   */
+  async function loadDefaultParent(): Promise<void> {
+    try {
+      const places = await api.destinations();
+      defaultParent = places.scopes[0]?.uri ?? "";
+    } catch {
+      // Only the preview needs it. Sent an empty destination, the server falls
+      // back to the same place on its own.
+    }
+  }
+
+  /**
+   * Where a new folder will land: the folder you have open, the folder holding
+   * the file you have open, and otherwise the default above.
+   */
+  const parentForNew = $derived.by(() => {
+    if (!selected) return defaultParent;
+    const node = allNodes.find((item) => item.uri === selected);
+    if (!node) return defaultParent;
+    return node.isDir ? node.uri : parentUri(node.uri);
+  });
+
+  /** The name as it will be stored, which is what the preview shows. */
+  const cleanName = $derived(safeSegment(newName.trim()));
+  /** Why that name will be refused, in the server's own words, or "". */
+  const nameProblem = $derived(folderNameProblem(cleanName));
+
+  function startNaming(): void {
+    naming = true;
+    newName = "";
+    newDesc = "";
+    if (!defaultParent) void loadDefaultParent();
+  }
+
+  // Focused from an effect rather than from the click, because the box does not
+  // exist yet when the click runs. `nameBox` is state, so this runs again the
+  // moment `bind:this` fills it in.
+  $effect(() => {
+    if (naming) nameBox?.focus();
+  });
+
+  function stopNaming(): void {
+    naming = false;
+    newName = "";
+    newDesc = "";
+  }
+
+  async function createFolder(): Promise<void> {
+    if (creating) return;
+    // Reachable by pressing Enter, which a disabled button does not reliably
+    // stop. Silence here reads as a page that ignored you.
+    if (nameProblem) {
+      toast(nameProblem);
+      return;
+    }
+
+    creating = true;
+    try {
+      /*
+       * One more go at the destination, and then submit either way.
+       *
+       * `/api/destinations` is two recursive listings, the slowest call this
+       * page makes. Refusing to submit without it turned a slow read into a box
+       * that could never be submitted and never retried — and it was refusing
+       * over a preview, when the server picks the same destination itself from
+       * an empty one. So an unknown destination costs the preview, not the
+       * folder, and the toast says where it landed.
+       */
+      if (!parentForNew) await loadDefaultParent();
+      // Held before the await below, because making the folder changes the
+      // selection and `parentForNew` follows it.
+      const into = parentForNew;
+
+      const made = await api.newFolder(into, newName.trim(), newDesc.trim());
+      stopNaming();
+      // Taken off where it landed, not off `into`, which is empty whenever the
+      // server was the one that chose.
+      const landed = parentUri(made.uri);
+      // Opened before the refresh, so the round that refills the tree fetches
+      // the folder the new one landed in rather than leaving it folded shut.
+      open = new Set(open).add(landed);
+      await refreshTree();
+      openFolder(made.uri, made.name);
+      toast(`Made ${made.name} in ${landed.split("/").pop()}`);
+    } catch (error) {
+      toast((error as Error).message);
+    } finally {
+      creating = false;
+    }
+  }
+
+  /*
    * ── Rearranging the tree ─────────────────────────────────────
    *
    * Dragging a row onto a folder moves it there. There is no reordering within
@@ -424,7 +546,85 @@
           {expanding ? "Expanding…" : "Expand all"}
         </button>
         <button class="mini" onclick={() => (open = new Set())}>Collapse</button>
+        <!--
+          Icon only, and labelled for anything that is not looking at it. Three
+          worded buttons and a filter box do not fit a 280px pane, and this is
+          the one of the three with an unambiguous symbol.
+        -->
+        <button
+          class="mini add"
+          onclick={() => (naming ? stopNaming() : startNaming())}
+          aria-expanded={naming}
+          aria-label="New folder"
+          title="New folder"
+          disabled={creating}
+        >
+          <Icon name="plus" size={12} />
+        </button>
       </div>
+
+      <!--
+        Naming a new folder.
+
+        The path it will land at is shown while you type, name cleaned and all,
+        because a destination you cannot see is one you only discover by getting
+        it wrong — the same reason the Add page previews one.
+      -->
+      {#if naming}
+        <form
+          class="mk"
+          onsubmit={(event) => {
+            event.preventDefault();
+            void createFolder();
+          }}
+        >
+          <input
+            bind:this={nameBox}
+            bind:value={newName}
+            placeholder="Folder name"
+            aria-label="Folder name"
+            maxlength={MAX_SEGMENT}
+            onkeydown={(event) => {
+              if (event.key === "Escape") stopNaming();
+            }}
+          />
+          <input
+            bind:value={newDesc}
+            placeholder="What goes in it — optional"
+            aria-label="What goes in it"
+            onkeydown={(event) => {
+              if (event.key === "Escape") stopNaming();
+            }}
+          />
+          {#if parentForNew}
+            <p class="mkwhere mono">
+              {parentForNew}/<span class="stem">{cleanName || "«name»"}</span>
+            </p>
+          {:else}
+            <!-- The first open with nothing picked, while destinations load. -->
+            <p class="mkwhere">Working out where that goes…</p>
+          {/if}
+          <!--
+            Said while you type, in the words the server would use. A name it
+            will refuse is worth knowing before the round trip, not after.
+          -->
+          {#if newName.trim() && nameProblem}
+            <p class="mkwhy">{nameProblem}</p>
+          {/if}
+          <div class="mkgo">
+            <!--
+              Not held on the destination. A preview that has not arrived is
+              worth saying; it is not worth a button nothing can un-disable.
+              `createFolder` tries once more and then lets the server choose,
+              and the toast names where the folder landed.
+            -->
+            <button class="tbtn primary" type="submit" disabled={creating || nameProblem !== ""}>
+              {creating ? "Making…" : "Create"}
+            </button>
+            <button class="mini" type="button" onclick={stopNaming}>Cancel</button>
+          </div>
+        </form>
+      {/if}
 
       {#if tree.truncated}
         <div class="callout c-sheet" style="margin:10px 0">
@@ -580,6 +780,61 @@
   }
   .clr:hover {
     color: var(--ink);
+  }
+
+  .mini.add {
+    display: inline-flex;
+    align-items: center;
+    padding: 6px 8px;
+  }
+
+  /* The new-folder box, sitting under the toolbar it was opened from. */
+  .mk {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: var(--r2);
+    padding: 10px;
+    margin-bottom: var(--s2);
+  }
+  .mk input {
+    font: inherit;
+    font-size: 13px;
+    color: var(--ink);
+    background: var(--bg);
+    border: 1px solid var(--rule);
+    border-radius: var(--r2);
+    padding: 7px 9px;
+  }
+  .mk input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .mk input::placeholder {
+    color: var(--ink-3);
+  }
+  .mkwhere {
+    margin: 0;
+    font-size: 11px;
+    color: var(--ink-3);
+    word-break: break-all;
+    line-height: 1.5;
+  }
+  .mkwhere .stem {
+    color: var(--accent);
+  }
+  .mkwhy {
+    margin: 0;
+    font-size: 12px;
+    color: var(--rose);
+    line-height: 1.5;
+  }
+  .mkgo {
+    display: flex;
+    align-items: center;
+    gap: var(--s1);
   }
 
   .tnode.sel {
