@@ -30,6 +30,7 @@ covering ten areas should not lose nine of them to one bad response.
 from __future__ import annotations
 
 import logging
+import random
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -38,13 +39,14 @@ from ..observability import annotate, record_error, traced
 from .citations import build_memory_context, citation_map
 from .config import ReflectSettings
 from .models import (
+    Consolidation,
     MemoryRow,
     Observation,
     ProposedObservations,
     ReflectMemoryContext,
 )
 from .ports import MemoryStore, StructuredLLM
-from .prompts import propose_prompt
+from .prompts import consolidate_prompt, propose_prompt
 from .verify import verify_observations
 from .watermark import Watermark
 
@@ -91,6 +93,9 @@ class SweepReport:
         Observations the model offered, before verification.
     written : int
         Observations that survived and were written.
+    consolidated : int
+        Observations merged into another by the consolidation pass. High next
+        to ``written`` means the passes are covering the same ground.
     dropped : dict[str, int]
         Why observations were discarded, keyed by reason. The ratio of this to
         ``proposed`` is the signal that a prompt change made things worse.
@@ -105,6 +110,7 @@ class SweepReport:
     batches: int = 0
     proposed: int = 0
     written: int = 0
+    consolidated: int = 0
     dropped: dict[str, int] = field(default_factory=dict)
     failures: int = 0
     stepped_over: bool = False
@@ -118,10 +124,13 @@ class SweepReport:
 def group_by_directory(uris: Sequence[str]) -> dict[str, list[str]]:
     """Group stored URIs by their parent directory, preserving order.
 
-    One batch per directory rather than one big batch, because a directory is
-    the unit OpenViking already summarizes: it has an overview to use as
-    background, and its members are more likely to bear on each other than two
-    memories drawn from opposite ends of the store.
+    How a sweep is batched when it reads whole memories: a directory is the
+    unit OpenViking already summarizes, so it has an overview to use as
+    background, and a directory's worth of memories is already a full prompt.
+
+    Not used on the delta path -- see ``VikingStore.group``, which pools
+    instead. Kept here because the store that reads whole memories still calls
+    it, and because it is the thing the pooled version is a departure from.
     """
     grouped: dict[str, list[str]] = {}
     for uri in uris:
@@ -148,10 +157,14 @@ class ReflectionEngine:
         store: MemoryStore,
         llm: StructuredLLM,
         settings: ReflectSettings | None = None,
+        rng: random.Random | None = None,
     ) -> None:
         self._store = store
         self._llm = llm
         self._settings = settings or ReflectSettings()
+        # Unseeded on purpose: two sweeps sampling identically would ask the
+        # same questions twice. Tests inject their own.
+        self._rng = rng or random.Random()
 
     @traced("ov_ext.reflect.sweep")
     async def sweep(
@@ -203,7 +216,8 @@ class ReflectionEngine:
         barrier: datetime | None = None
         finished: list[datetime] = []
         every: list[datetime] = []
-        for directory, uris in group_by_directory(changed).items():
+        # The store decides, because it knows whether it is reading deltas.
+        for directory, uris in self._store.group(changed).items():
             outcome = await self._run_batch(directory, uris, report)
             if outcome.newest is not None:
                 every.append(outcome.newest)
@@ -325,7 +339,11 @@ class ReflectionEngine:
         annotate({"ov_ext.reflect.gathered": len(gathered)})
 
         scope = await self._store.read_overview(directory)
-        complete = await self._propose(contexts, scope, index_to_uri, rows_by_uri, report)
+        kept, complete = await self._passes(
+            contexts, scope, index_to_uri, rows_by_uri, report
+        )
+        for observation in await self._consolidate(kept, report):
+            await self._write(observation, report)
 
         if complete:
             # Only now: a delta retired by a batch that then failed is a change
@@ -371,15 +389,15 @@ class ReflectionEngine:
         index_to_uri: dict[int, str],
         rows_by_uri: dict[str, MemoryRow],
         report: SweepReport,
-    ) -> bool:
-        """Ask for observations, verify them, write survivors; report success.
+    ) -> list[Observation] | None:
+        """Ask for observations and verify them; return the survivors.
 
         Returns
         -------
-        bool
-            False when the model call failed or returned nothing parseable, so
-            the caller leaves the watermark where it was and the batch is tried
-            again.
+        list[Observation] | None
+            What survived verification, or ``None`` when the model call failed
+            or returned nothing parseable -- so the caller leaves the watermark
+            where it was and the batch is tried again.
         """
         settings = self._settings
         prompt = propose_prompt(contexts, scope=scope)
@@ -393,18 +411,18 @@ class ReflectionEngine:
             # the logs but a `failures=` count, and an operator reading stderr saw
             # a sweep that looked idle rather than broken.
             logger.warning(
-                "ov-ext reflect: propose call failed; batch skipped", exc_info=exc
+                "ov-ext reflect: propose call failed; pass skipped", exc_info=exc
             )
             report.failures += 1
-            return False
+            return None
 
         if proposed is None:
             annotate({"ov_ext.reflect.outcome": "propose_unparsed"})
             logger.warning(
-                "ov-ext reflect: propose call returned nothing parseable; batch skipped"
+                "ov-ext reflect: propose call returned nothing parseable; pass skipped"
             )
             report.failures += 1
-            return False
+            return None
 
         report.proposed += len(proposed.observations)
         kept, dropped = verify_observations(
@@ -415,10 +433,130 @@ class ReflectionEngine:
             require_cross_area=settings.require_cross_area,
         )
         report.record_drops(dropped)
+        return kept
 
-        for observation in kept:
-            await self._write(observation, report)
-        return True
+    async def _passes(
+        self,
+        contexts: Sequence[ReflectMemoryContext],
+        scope: str | None,
+        index_to_uri: dict[int, str],
+        rows_by_uri: dict[str, MemoryRow],
+        report: SweepReport,
+    ) -> tuple[list[Observation], bool]:
+        """Look at the batch several times, each through a different sample.
+
+        One call sees one arrangement of the memories and finds the patterns
+        that arrangement suggests. A connection two entities only make when read
+        together comes up only if they land in the same call, and with a dozen
+        shown out of a larger batch that is a coin toss -- so the sweep tosses
+        it more than once. Overlapping samples rather than a partition, for the
+        same reason: a memory is worth seeing beside more than one set of
+        neighbours.
+
+        Returns
+        -------
+        tuple[list[Observation], bool]
+            Everything that survived verification across the passes, and whether
+            every pass completed. A batch where one pass failed is incomplete,
+            so its memories are tried again rather than retired half-read.
+        """
+        settings = self._settings
+        if len(contexts) <= settings.pass_size:
+            # Everything fits in one call. Sampling would show the model the
+            # same memories in a different order and charge for it.
+            kept = await self._propose(contexts, scope, index_to_uri, rows_by_uri, report)
+            return (kept or [], kept is not None)
+
+        pooled: list[Observation] = []
+        complete = True
+        for number in range(settings.passes):
+            sample = self._rng.sample(list(contexts), settings.pass_size)
+            sample.sort(key=lambda context: context.index_id)
+            annotate({"ov_ext.reflect.pass": number + 1})
+            kept = await self._propose(sample, scope, index_to_uri, rows_by_uri, report)
+            if kept is None:
+                complete = False
+                continue
+            pooled.extend(kept)
+        return pooled, complete
+
+    async def _consolidate(
+        self, observations: Sequence[Observation], report: SweepReport
+    ) -> list[Observation]:
+        """Merge observations that several passes made in different words.
+
+        Overlapping samples mean the same claim surfaces more than once, and
+        writing each copy would fill the store with near-duplicates that then
+        become evidence for further observations.
+
+        The model returns groups of indices, titles and content -- never quotes.
+        Evidence is carried over from the proposals it grouped, so every quote in
+        a written observation is one that was already checked against the memory
+        it cites, and consolidation cannot introduce a citation nobody verified.
+
+        Returns
+        -------
+        list[Observation]
+            One per group. The input unchanged when there is nothing to merge,
+            or when the model call fails -- writing duplicates is a worse
+            outcome than not writing at all, but only slightly, and losing
+            verified work to a failed merge is worse than both.
+        """
+        if len(observations) < 2:
+            return list(observations)
+
+        try:
+            grouped = await self._llm.complete(
+                consolidate_prompt([(o.title, o.content) for o in observations]),
+                Consolidation,
+            )
+        except Exception as exc:
+            record_error(exc, "consolidate_failed", NAMESPACE)
+            logger.warning(
+                "ov-ext reflect: consolidation failed; writing the passes' "
+                "observations unmerged",
+                exc_info=exc,
+            )
+            return list(observations)
+
+        if grouped is None or not grouped.groups:
+            annotate({"ov_ext.reflect.outcome": "consolidate_unparsed"})
+            return list(observations)
+
+        merged: list[Observation] = []
+        claimed: set[int] = set()
+        for group in grouped.groups:
+            members = [
+                observations[index]
+                for index in group.indices
+                if 0 <= index < len(observations) and index not in claimed
+            ]
+            if not members:
+                continue
+            claimed.update(group.indices)
+            evidence: list[tuple[str, str]] = []
+            for member in members:
+                for pair in member.evidence:
+                    if pair not in evidence:
+                        evidence.append(pair)
+            merged.append(
+                Observation(
+                    title=group.title.strip() or members[0].title,
+                    content=group.content.strip() or members[0].content,
+                    evidence=tuple(evidence),
+                    areas=frozenset().union(*(m.areas for m in members)),
+                )
+            )
+
+        # An index the model forgot is a verified observation it would silently
+        # drop. Kept as it was proposed.
+        merged.extend(
+            observation
+            for index, observation in enumerate(observations)
+            if index not in claimed
+        )
+        report.consolidated += len(observations) - len(merged)
+        return merged
 
     async def _write(self, observation: Observation, report: SweepReport) -> None:
         """Persist one observation and link it to every memory it cites."""

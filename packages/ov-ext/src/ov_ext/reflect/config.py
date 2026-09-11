@@ -275,6 +275,40 @@ class ReflectSettings(BaseSettings):
             "store."
         ),
     )
+    memory_types: list[str] = Field(
+        default=["entities"],
+        description=(
+            "Memory types the sweep reflects on. Entities only, as in memex, "
+            "where an observation is by definition 'a synthesized insight about "
+            "an entity'. That is what gives an observation somewhere to live and "
+            "something to be about. Preferences are excluded on purpose: they are "
+            "what the user said about how they want to be worked with, and "
+            "synthesizing over them is the agent inventing preferences nobody "
+            "expressed."
+        ),
+    )
+    passes: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "Model calls per sweep, each over a different random subset of the "
+            "changed entities. One pass sees one grouping and finds the patterns "
+            "that grouping suggests; three see three, and a connection two "
+            "entities only make when read together is likelier to come up in at "
+            "least one. Costs a call each, so it is the knob for how hard to "
+            "look."
+        ),
+    )
+    pass_size: int = Field(
+        default=12,
+        ge=2,
+        description=(
+            "Changed entities shown to the model in one pass. Below 2 an "
+            "observation cannot clear the evidence floor. The ceiling is what "
+            "keeps a prompt answerable -- with deltas rather than whole files, a "
+            "dozen is small."
+        ),
+    )
     deltas_dsn: str = Field(
         default="",
         description=(

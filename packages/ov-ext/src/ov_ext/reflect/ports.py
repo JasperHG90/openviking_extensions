@@ -86,6 +86,15 @@ class MemoryStore(Protocol):
         """
         ...
 
+    def group(self, uris: Sequence[str]) -> dict[str, list[str]]:
+        """Split a sweep's URIs into batches, and name each one.
+
+        The name is used to look up a directory overview for prompt background,
+        so it is a directory when the batch is one, and something else when it
+        is not.
+        """
+        ...
+
     async def rows(self, uris: Sequence[str]) -> list[MemoryRow]:
         """Return the text and timestamps for specific URIs.
 

@@ -26,6 +26,8 @@ from pydantic import BaseModel, Field
 
 __all__ = [
     "CandidateObservation",
+    "Consolidation",
+    "ObservationGroup",
     "EvidenceItem",
     "MemoryRow",
     "Observation",
@@ -157,6 +159,37 @@ class ProposedObservations(BaseModel):
     observations: list[CandidateObservation] = Field(
         default_factory=list,
         description="New observations found. Empty when the memories support none.",
+    )
+
+
+class ObservationGroup(BaseModel):
+    """One consolidated observation, naming the proposals it replaces."""
+
+    indices: list[int] = Field(
+        description=(
+            "Zero-based indices of the proposed observations this replaces. One "
+            "index keeps a proposal as it is; two or more merge them."
+        )
+    )
+    title: str = Field(description="Concise title for the consolidated observation.")
+    content: str = Field(
+        description="The consolidated claim, covering everything the group said."
+    )
+
+
+class Consolidation(BaseModel):
+    """Everything the consolidation call returns.
+
+    Deliberately only titles, content and indices. The evidence is not asked
+    for: every quote in the proposals has already been checked against the
+    memory it cites, and letting the model restate them would put unverified
+    text into a written observation. The code unions the groups' existing
+    evidence instead.
+    """
+
+    groups: list[ObservationGroup] = Field(
+        default_factory=list,
+        description="One entry per observation worth keeping, after merging.",
     )
 
 

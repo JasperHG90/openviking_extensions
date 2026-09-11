@@ -77,6 +77,12 @@ class FakeStore:
         fresh.sort(key=lambda r: r.updated_at)
         return [r.uri for r in fresh[:limit]]
 
+    def group(self, uris: Sequence[str]) -> dict[str, list[str]]:
+        """Batch by directory, like the store reading whole memories."""
+        from ov_ext.reflect.engine import group_by_directory
+
+        return group_by_directory(uris)
+
     async def rows(self, uris: Sequence[str]) -> list[MemoryRow]:
         """Return the rows for ``uris`` that exist."""
         return [self._rows[uri] for uri in uris if uri in self._rows]

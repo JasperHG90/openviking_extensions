@@ -63,6 +63,10 @@ _TAIL_WINDOW = 10
 # from the end of one change into the start of another -- a span that exists in
 # no memory, verified against a row that only looks like one. The rule is a
 # token normalisation cannot collapse away.
+# How much wider than the requested batch to read before filtering by memory
+# type. Most deltas in a busy store are entities, so a small factor is enough.
+_DELTA_OVERREAD = 4
+
 _DELTA_SEPARATOR = "\n\n---\n\n"
 
 
@@ -251,17 +255,39 @@ class VikingStore:
         """
         reader = self._deltas
         assert reader is not None  # only reached with a store configured
-        pending = await asyncio.to_thread(reader.pending, limit=limit)
+        # Over-read, because the filter below discards rows: asking for exactly
+        # `limit` would return a batch of preferences and call it a full sweep.
+        pending = await asyncio.to_thread(reader.pending, limit=limit * _DELTA_OVERREAD)
+        wanted = set(self._settings.memory_types)
         self._consumed = {}
         self._delta_text = {}
         ordered: list[str] = []
+        skipped = 0
         for record in pending:
             uri = str(record["uri"])
+            if str(record.get("memory_type") or "") not in wanted:
+                # Read and retired without reflection: the change is real, it is
+                # just not something an observation should be drawn from. Leaving
+                # it pending would make the sweep read it again every tick.
+                self._consumed.setdefault(uri, []).append(int(record["id"]))
+                skipped += 1
+                continue
+            if len(ordered) >= limit and uri not in self._consumed:
+                break
             if uri not in self._consumed:
                 self._consumed[uri] = []
                 ordered.append(uri)
             self._consumed[uri].append(int(record["id"]))
             self._delta_text.setdefault(uri, []).append(record)
+        if skipped:
+            logger.debug(
+                "ov-ext reflect: %d deltas outside %s retired without reflection",
+                skipped,
+                sorted(wanted),
+            )
+            await self.mark_reflected(
+                [uri for uri in self._consumed if uri not in self._delta_text]
+            )
         return ordered
 
     async def mark_reflected(self, uris: Sequence[str]) -> None:
@@ -304,6 +330,28 @@ class VikingStore:
         newest = max(parse_timestamp(record["changed_at"]) for record in records)
         oldest = min(parse_timestamp(record["changed_at"]) for record in records)
         return MemoryRow(uri=uri, text=text, created_at=oldest, updated_at=newest)
+
+    def group(self, uris: Sequence[str]) -> dict[str, list[str]]:
+        """Split a sweep into batches.
+
+        One batch when reading deltas. Directory grouping was sized for whole
+        memories, where a directory's worth was already a full prompt; a delta
+        is a line, so the same grouping scatters a sweep into batches of one or
+        two -- and an observation must cite two distinct memories, so most of
+        them could not produce anything. Measured: the same six changes gave 0
+        observations across four directory batches and 2 in a single batch.
+
+        The key is the label the caller looks an overview up by. A pooled batch
+        spans directories, so there is no one overview to fetch and the prompt
+        runs without that background.
+        """
+        if self._deltas is not None:
+            return {"": list(uris)}
+        grouped: dict[str, list[str]] = {}
+        for uri in uris:
+            parent = uri.rsplit("/", 1)[0] if "/" in uri else uri
+            grouped.setdefault(parent, []).append(uri)
+        return grouped
 
     async def rows(self, uris: Sequence[str]) -> list[MemoryRow]:
         """Fetch the text and timestamps for specific URIs.
@@ -477,6 +525,10 @@ class VikingStore:
 
     async def read_overview(self, directory: str) -> str | None:
         """Return a directory's generated L1 overview, or ``None`` if absent."""
+        if not directory:
+            # A pooled delta batch spans directories; there is no single
+            # overview that describes it.
+            return None
         try:
             content = await self._fs.read_file(
                 f"{directory.rstrip('/')}/.overview.md", ctx=self._ctx

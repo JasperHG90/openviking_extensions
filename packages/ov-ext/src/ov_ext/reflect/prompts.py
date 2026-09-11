@@ -26,7 +26,7 @@ from collections.abc import Sequence
 
 from .models import ReflectMemoryContext
 
-__all__ = ["propose_prompt"]
+__all__ = ["consolidate_prompt", "propose_prompt"]
 
 _PROPOSE_INSTRUCTION = """\
 Analyze a set of memories and generate high-level observations about patterns, \
@@ -97,3 +97,47 @@ def propose_prompt(
         "Memories, each with the index you must cite it by:\n\n" + _render(contexts)
     )
     return "\n\n---\n\n".join(parts)
+
+
+_CONSOLIDATE_INSTRUCTION = """\
+You are given observations drawn from overlapping samples of the same set of \
+memories, so several of them are likely to be the same claim in different words.
+
+Group them. Put observations that make the same claim in one group and write a \
+single title and content for it. An observation that stands alone gets a group \
+of its own.
+
+Drop nothing: every index must appear in exactly one group. If two observations \
+are merely related rather than the same, keep them apart -- merging distinct \
+claims into one loses both.
+
+Do not invent claims the groups do not support, and do not quote anything: the \
+evidence travels with the observations and is attached again afterwards.
+
+STRICT RULE: All output MUST be written in English."""
+
+
+def consolidate_prompt(observations: Sequence[tuple[str, str]]) -> str:
+    """Build the prompt that merges overlapping observations.
+
+    Parameters
+    ----------
+    observations :
+        ``(title, content)`` pairs, in the order their indices refer to.
+
+    Returns
+    -------
+    str
+        The full prompt, without the JSON schema.
+    """
+    listed = json.dumps(
+        [
+            {"index": index, "title": title, "content": content}
+            for index, (title, content) in enumerate(observations)
+        ],
+        ensure_ascii=False,
+        indent=2,
+    )
+    return "\n\n---\n\n".join(
+        [_CONSOLIDATE_INSTRUCTION, "Observations to group:\n\n" + listed]
+    )
