@@ -338,11 +338,13 @@ describe("the OIDC route, end to end", () => {
           verifier: "ve",
         }),
         exchange: async () => ({
-          sub: "entity-1",
-          name: "jasper",
-          email: "jasper@example.com",
-          account: "jasper",
-          user: "jasper",
+          idToken: "header.payload.signature",
+          claims: {
+            sub: "entity-1",
+            name: "jasper",
+            email: "jasper@example.com",
+            email_verified: true,
+          },
         }),
       }) as unknown as Awaited<ReturnType<typeof services.oidc>>;
     return createApp(services);

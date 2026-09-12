@@ -1,8 +1,8 @@
 /**
- * Signing in and out against a real Vault.
+ * Signing in and out against a real Vault, both ways in.
  *
- * The unit suite stubs `fetch`, which proves the dashboard sends what we think
- * it sends and nothing about what Vault does with it. Three claims here are
+ * The unit suite stubs the world, which proves the dashboard sends what we
+ * think it sends and nothing about what Vault does with it. These claims are
  * about Vault's behaviour, not ours, and a stub cannot settle any of them:
  *
  * 1. `revoke-self` really kills the login token.
@@ -10,16 +10,26 @@
  *    sign-in would be broken the moment the revoke landed — and the unit tests
  *    would still pass, because the stub answers whatever we tell it to.
  * 3. Vault's claim templating produces the `ov_account` / `ov_user` the
- *    dashboard reads identity from.
+ *    dashboard reads identity from — in a minted token, *and* in an ID token
+ *    from its OIDC provider, which is a different feature with its own
+ *    templating and no obligation to agree.
+ * 4. The redirect sign-in works end to end against the real endpoints: real
+ *    discovery, a real authorization code, a real PKCE exchange, and a
+ *    signature checked against keys Vault actually published.
  *
  * Plus the one thing that is ours and matters most: a cookie copied before a
  * sign-out is worthless after it.
  *
- * Not part of `npm test`. Run it against a throwaway Vault:
+ * Not part of `npm test`. Run it with `just test-integration`, which starts the
+ * container if it is not up. By hand:
  *
  *   docker run -d --name ovdash-vault -p 18200:8200 \
- *     -e VAULT_DEV_ROOT_TOKEN_ID=root hashicorp/vault:latest
+ *     -e VAULT_DEV_ROOT_TOKEN_ID=root \
+ *     -e VAULT_API_ADDR=http://127.0.0.1:18200 hashicorp/vault:latest
  *   npm run test:integration
+ *
+ * VAULT_API_ADDR matters: a provider's issuer and JWKS URL are built from it,
+ * and dev mode's default names an address this suite cannot fetch.
  *
  * The setup below is idempotent, so re-running against the same container is
  * fine.
@@ -35,6 +45,12 @@ const ORIGIN = "http://localhost:8080";
 const USER = "jasper";
 const PASSWORD = "hunter2";
 const ROLE = "openviking";
+const PROVIDER = "ovdash";
+/** The OIDC scope that puts the OpenViking claims in an ID token. */
+const SCOPE = "openviking";
+/** Filled in by the setup: Vault generates both. */
+let clientId = "";
+let clientSecret = "";
 
 async function vault(
   path: string,
@@ -125,6 +141,48 @@ async function setUpVault(): Promise<void> {
     method: "POST",
     body: JSON.stringify({ key: "ovkey", ttl: "1h", template }),
   });
+
+  // ── the browser login: a client, and a scope that says who you are ──
+  //
+  // The same template as the role's. Nothing shares it between the two
+  // features: a provider with no custom scope issues a token carrying neither
+  // claim, which is exactly the sign-in this setup has to be able to reproduce.
+  await vault(`identity/oidc/scope/${SCOPE}`, {
+    method: "POST",
+    body: JSON.stringify({ template, description: "OpenViking identity" }),
+  });
+  await vault(`identity/oidc/assignment/${PROVIDER}`, {
+    method: "POST",
+    body: JSON.stringify({ entity_ids: [id] }),
+  });
+
+  // Deleted first: Vault refuses to move an existing client to another key, so
+  // a container left over from a different setup would fail every run after.
+  await vault(`identity/oidc/client/${PROVIDER}`, { method: "DELETE" });
+  await vault(`identity/oidc/client/${PROVIDER}`, {
+    method: "POST",
+    body: JSON.stringify({
+      key: "ovkey",
+      redirect_uris: [`${ORIGIN}/auth/callback`],
+      assignments: [PROVIDER],
+      client_type: "confidential",
+      id_token_ttl: "30m",
+      access_token_ttl: "30m",
+    }),
+  });
+  const client = await json<{ data: { client_id: string; client_secret: string } }>(
+    await vault(`identity/oidc/client/${PROVIDER}`),
+  );
+  clientId = client.data.client_id;
+  clientSecret = client.data.client_secret;
+
+  await vault(`identity/oidc/provider/${PROVIDER}`, {
+    method: "POST",
+    body: JSON.stringify({
+      allowed_client_ids: [clientId],
+      scopes_supported: [SCOPE],
+    }),
+  });
 }
 
 function dashboard() {
@@ -141,6 +199,68 @@ function dashboard() {
       }),
     ),
   );
+}
+
+/** The same dashboard, signing people in by sending them to Vault. */
+function redirectDashboard() {
+  return createApp(
+    buildServices(
+      loadConfig({
+        OV_URL: "http://openviking.invalid:1933",
+        PUBLIC_ORIGIN: ORIGIN,
+        SESSION_SECRET: "a".repeat(32),
+        AUTH_MODE: "vault-oidc",
+        OIDC_ISSUER: `${VAULT}/v1/identity/oidc/provider/${PROVIDER}`,
+        OIDC_CLIENT_ID: clientId,
+        OIDC_CLIENT_SECRET: clientSecret,
+        SESSION_COOKIE_SECURE: "false",
+      }),
+    ),
+  );
+}
+
+/** Pick one cookie out of a response; the callback sets two. */
+function cookieNamed(response: Response, name: string): string {
+  for (const header of response.headers.getSetCookie()) {
+    const pair = header.split(";")[0] ?? "";
+    if (pair.startsWith(`${name}=`) && pair !== `${name}=`) return pair;
+  }
+  return "";
+}
+
+/**
+ * Do what the browser does between `/auth/login` and `/auth/callback`.
+ *
+ * The dashboard sends people to Vault's UI, which authenticates them and then
+ * makes this very request with the parameters it was given. Here the person's
+ * Vault token stands in for that session, so the code is a real one: Vault
+ * checks the client, the redirect URI, the assignment and the PKCE challenge
+ * before issuing it.
+ */
+async function authorizeAt(location: string, token: string) {
+  const query = new URL(location).searchParams;
+  const response = await fetch(
+    `${VAULT}/v1/identity/oidc/provider/${PROVIDER}/authorize?${query}`,
+    { headers: { "x-vault-token": token } },
+  );
+  const body = await json<{ code?: string; state?: string; error_description?: string }>(
+    response,
+  );
+  if (!body.code) {
+    throw new Error(`Vault would not authorize: ${JSON.stringify(body)}`);
+  }
+  return body as { code: string; state: string };
+}
+
+/** Log the test user into Vault and return their token. */
+async function vaultToken(): Promise<string> {
+  const login = await json<{ auth: { client_token: string } }>(
+    await fetch(`${VAULT}/v1/auth/userpass/login/${USER}`, {
+      method: "POST",
+      body: JSON.stringify({ password: PASSWORD }),
+    }),
+  );
+  return login.auth.client_token;
 }
 
 /** Sign in through the dashboard's own route and return its cookie. */
@@ -275,7 +395,7 @@ describe("against a real Vault", () => {
     expect(survivor.signedIn).toBe(true);
   });
 
-  it("reports a session that ends no later than the minted token", async () => {
+  it("mints a token whose lifetime the session respects", async () => {
     const app = dashboard();
     const cookie = await signIn(app);
     const body = (await (
@@ -286,5 +406,98 @@ describe("against a real Vault", () => {
     expect(body.expiresAt).toBeGreaterThan(now);
     // The role's ttl is an hour, and nothing may quietly outlive it.
     expect(body.expiresAt).toBeLessThanOrEqual(now + 3600);
+  });
+});
+
+describe("signing in by being sent to Vault", () => {
+  it("comes back with the token OpenViking accepts, and knows who it is for", async () => {
+    const app = redirectDashboard();
+
+    const start = await app.request("/auth/login?returnTo=%2F%23%2Fhome");
+    expect(start.status).toBe(302);
+    const location = start.headers.get("location") ?? "";
+    // Vault's own login page, not a form of ours.
+    expect(location).toContain(`/identity/oidc/provider/${PROVIDER}/authorize`);
+    expect(new URL(location).searchParams.get("scope")).toBe(`openid ${SCOPE}`);
+
+    const pending = cookieNamed(start, "ovdash_session_login");
+    const { code, state } = await authorizeAt(location, await vaultToken());
+
+    const back = await app.request(`/auth/callback?code=${code}&state=${state}`, {
+      headers: { cookie: pending },
+    });
+    expect(back.status).toBe(302);
+    expect(back.headers.get("location")).toBe("/#/home");
+
+    const cookie = cookieNamed(back, "ovdash_session");
+    const session = (await (
+      await app.request("/api/session", { headers: { cookie } })
+    ).json()) as {
+      signedIn: boolean;
+      canSignOut: boolean;
+      expiresAt: number;
+      viewer: { account: string; user: string };
+    };
+    expect(session.signedIn).toBe(true);
+    expect(session.canSignOut).toBe(true);
+    // Vault's own templating produced these, through the scope rather than the
+    // role — a different feature, and the one thing a stub cannot vouch for.
+    expect(session.viewer).toMatchObject({ account: "lab", user: USER });
+
+    // The client's id_token_ttl is 30 minutes, and no refresh grant exists to
+    // extend it, so the session must not pretend to last longer.
+    const now = Math.floor(Date.now() / 1000);
+    expect(session.expiresAt).toBeGreaterThan(now);
+    expect(session.expiresAt).toBeLessThanOrEqual(now + 1800);
+  });
+
+  it("refuses to redeem the same authorization code twice", async () => {
+    // The login cookie is a signed JWT, so presenting it again verifies again.
+    // What actually stops a replayed callback is Vault refusing the code, which
+    // only a real provider can be held to.
+    const app = redirectDashboard();
+    const start = await app.request("/auth/login");
+    const pending = cookieNamed(start, "ovdash_session_login");
+    const { code, state } = await authorizeAt(
+      start.headers.get("location") ?? "",
+      await vaultToken(),
+    );
+
+    const first = await app.request(`/auth/callback?code=${code}&state=${state}`, {
+      headers: { cookie: pending },
+    });
+    expect(first.status).toBe(302);
+
+    const replay = await app.request(`/auth/callback?code=${code}&state=${state}`, {
+      headers: { cookie: pending },
+    });
+    expect(replay.status).toBeGreaterThanOrEqual(400);
+    expect(cookieNamed(replay, "ovdash_session")).toBe("");
+  });
+
+  it("signs nobody in from a code whose login was never started here", async () => {
+    // No login cookie: nothing holds the state, the nonce or the verifier, so
+    // there is nothing to check the provider's answer against. A real code from
+    // a real Vault, and it still gets the sign-in page rather than a session.
+    const app = redirectDashboard();
+    const start = await app.request("/auth/login");
+    const { code, state } = await authorizeAt(
+      start.headers.get("location") ?? "",
+      await vaultToken(),
+    );
+
+    const back = await app.request(`/auth/callback?code=${code}&state=${state}`);
+    expect(back.status).toBe(302);
+    expect(back.headers.get("location")).toBe("/");
+    expect(cookieNamed(back, "ovdash_session")).toBe("");
+  });
+
+  it("has no password form to post at", async () => {
+    const response = await redirectDashboard().request("/auth/vault-login", {
+      method: "POST",
+      headers: { origin: ORIGIN, "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ username: USER, password: PASSWORD }),
+    });
+    expect(response.status).toBe(404);
   });
 });

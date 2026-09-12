@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { loadConfig, redirectUri } from "../src/server/env";
+import { loadConfig, redirectUri, scopes } from "../src/server/env";
 
 const BASE = {
   OV_URL: "http://openviking:1933",
@@ -76,5 +76,49 @@ describe("loadConfig", () => {
       OIDC_REDIRECT_URI: "https://other.example/cb",
     });
     expect(redirectUri(config)).toBe("https://other.example/cb");
+  });
+});
+
+describe("signing in through Vault's own login", () => {
+  const VAULT_OIDC = {
+    ...BASE,
+    AUTH_MODE: "vault-oidc",
+    OIDC_ISSUER: "https://vault.example/v1/identity/oidc/provider/ovdash",
+    OIDC_CLIENT_ID: "ov-dash",
+    OIDC_CLIENT_SECRET: "secret",
+  };
+
+  it("needs a registered client, like any other redirect", () => {
+    expect(() => loadConfig({ ...VAULT_OIDC, OIDC_CLIENT_SECRET: "" })).toThrow(
+      /OIDC_CLIENT_SECRET is required when AUTH_MODE=vault-oidc/,
+    );
+  });
+
+  it("asks for no key source and no Vault address", () => {
+    // The credential is the ID token the sign-in returns, so a key would be a
+    // secret nothing reads — and Vault is reached through the issuer alone.
+    const config = loadConfig({
+      OV_URL: "http://openviking:1933",
+      SESSION_SECRET: "a".repeat(32),
+      AUTH_MODE: "vault-oidc",
+      OIDC_ISSUER: "https://vault.example/v1/identity/oidc/provider/ovdash",
+      OIDC_CLIENT_ID: "ov-dash",
+      OIDC_CLIENT_SECRET: "secret",
+    });
+    expect(config.AUTH_MODE).toBe("vault-oidc");
+    expect(config.VAULT_ADDR).toBeUndefined();
+  });
+
+  it("asks Vault for the scope carrying ov_account and ov_user", () => {
+    // Vault advertises neither `email` nor `groups`, and asking for one is an
+    // invalid_scope refusal — so the default cannot be shared with `oidc`.
+    expect(scopes(loadConfig(VAULT_OIDC))).toBe("openid openviking");
+    expect(scopes(loadConfig({ ...BASE, AUTH_MODE: "dev" }))).toBe("openid email groups");
+  });
+
+  it("lets a differently named scope be set", () => {
+    expect(scopes(loadConfig({ ...VAULT_OIDC, OIDC_SCOPES: "openid ov" }))).toBe(
+      "openid ov",
+    );
   });
 });

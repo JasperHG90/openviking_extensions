@@ -94,7 +94,12 @@ test-integration: vault-up
 # ── the throwaway Vault ────────────────────────────────────────
 
 # Start a dev-mode Vault for the integration suite. Idempotent, and the suite
-# configures the mount, entity and role itself.
+# configures the mounts, entity, role and OIDC provider itself.
+#
+# VAULT_API_ADDR is not decoration. An OIDC provider's issuer and JWKS URL are
+# built from it, and dev mode's default is http://0.0.0.0:8200 — an address the
+# suite cannot fetch and an issuer that will never match the one it configures,
+# so the redirect sign-in fails at discovery without this.
 [doc('Start a dev-mode Vault for the integration suite. Idempotent.')]
 [group('vault')]
 vault-up:
@@ -103,7 +108,9 @@ vault-up:
     else \
       docker rm -f {{ vault_container }} >/dev/null 2>&1 || true; \
       docker run -d --name {{ vault_container }} -p {{ vault_port }}:8200 \
-        -e VAULT_DEV_ROOT_TOKEN_ID=root hashicorp/vault:latest >/dev/null; \
+        -e VAULT_DEV_ROOT_TOKEN_ID=root \
+        -e VAULT_API_ADDR=http://127.0.0.1:{{ vault_port }} \
+        hashicorp/vault:latest >/dev/null; \
       until curl -sf -m 2 http://127.0.0.1:{{ vault_port }}/v1/sys/health >/dev/null; do sleep 1; done; \
       echo "vault up on :{{ vault_port }}"; \
     fi

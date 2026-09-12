@@ -27,8 +27,13 @@ export const sessionStateSchema = z.discriminatedUnion("signedIn", [
   z.object({
     signedIn: z.literal(false),
     loginUrl: z.string(),
-    /** How to sign in: a form this page posts, or a redirect to a provider. */
-    mode: z.enum(["vault-userpass", "redirect"]),
+    /**
+     * How to sign in: a form this page posts, or a redirect to a provider.
+     *
+     * `vault-oidc` is a redirect too. It is named because the button says where
+     * it sends you, and the page cannot know that on its own.
+     */
+    mode: z.enum(["vault-userpass", "vault-oidc", "redirect"]),
   }),
   z.object({
     signedIn: z.literal(true),

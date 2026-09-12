@@ -19,19 +19,32 @@ const secret = z
 /**
  * How the dashboard decides who is calling.
  *
- * `vault-userpass` is the one that works against a Vault-backed OpenViking:
- * the person types their Vault username and password into the dashboard, the
- * server logs them in and mints the identity token OpenViking accepts. It needs
- * no CLI, and no OIDC client registered anywhere.
+ * `vault-oidc` is the one to reach for against a Vault-backed OpenViking. The
+ * person presses "Sign in with Vault" and signs in at Vault's own login page;
+ * the ID token that comes back is both who they are and the credential
+ * OpenViking accepts, so no password ever reaches the dashboard and whatever
+ * Vault asks for — MFA included — applies without the dashboard knowing about
+ * it. It needs an OIDC client registered with Vault, and a scope that templates
+ * `ov_account` and `ov_user` into the token.
  *
- * `oidc` runs the authorization-code flow itself. Useful when the provider
- * issues tokens OpenViking will accept — Vault's own provider does not, since
- * its ID tokens carry neither the audience nor the `ov_account`/`ov_user`
- * claims that OpenViking maps identity from. `trusted-header` reads the headers
- * an authenticating proxy already injected. `dev` fixes one identity so the UI
- * can be worked on without any of this.
+ * `vault-userpass` does the same job through a password form: the dashboard
+ * logs into Vault with the password and mints the identity token itself. It
+ * needs nothing registered anywhere, and it is the only mode that handles a
+ * password.
+ *
+ * `oidc` runs the same redirect against any other provider, but keeps only an
+ * identity from it and resolves a *key* per request from {@link KeySource} —
+ * for a provider whose tokens OpenViking will not accept.
+ * `trusted-header` reads the headers an authenticating proxy already injected.
+ * `dev` fixes one identity so the UI can be worked on without any of this.
  */
-const authModeSchema = z.enum(["oidc", "vault-userpass", "trusted-header", "dev"]);
+const authModeSchema = z.enum([
+  "oidc",
+  "vault-oidc",
+  "vault-userpass",
+  "trusted-header",
+  "dev",
+]);
 export type AuthMode = z.infer<typeof authModeSchema>;
 
 /**
@@ -41,6 +54,11 @@ export type AuthMode = z.infer<typeof authModeSchema>;
  * map an OIDC claim onto the same `(account, user)` pair the key would give.
  * Vault's `sub` is an entity id and never matches, so the default takes the
  * local part of the email — `jasper@example.com` becomes `jasper`.
+ *
+ * Not read under `vault-oidc` or `vault-userpass`. There the token carries
+ * `ov_account` and `ov_user`, and those are not a claim to map *from* — they
+ * are the identity OpenViking will answer as, so the dashboard reads them
+ * rather than deriving anything.
  */
 /*
  * "email" is deliberately absent. An OpenViking user id becomes a path
@@ -97,12 +115,19 @@ const schema = z
     /** Account every user resolves into. Post-OV2 this is the person's name. */
     OV_ACCOUNT: z.string().default(""),
 
-    // ── OIDC, when AUTH_MODE=oidc ────────────────────────────────
+    // ── OIDC, when AUTH_MODE is oidc or vault-oidc ───────────────
     /** Issuer URL; discovery appends /.well-known/openid-configuration. */
     OIDC_ISSUER: z.string().url().optional(),
     OIDC_CLIENT_ID: z.string().optional(),
     OIDC_CLIENT_SECRET: z.string().optional(),
-    OIDC_SCOPES: z.string().default("openid email groups"),
+    /**
+     * Scopes asked for. Leave it unset to get the ones the mode needs.
+     *
+     * See {@link scopes}. Set it only to name a Vault scope called something
+     * other than `openviking`, or to ask another provider for more than the
+     * default three.
+     */
+    OIDC_SCOPES: z.string().optional(),
     /** Overrides the redirect URI derived from PUBLIC_ORIGIN. */
     OIDC_REDIRECT_URI: z.string().url().optional(),
     /** Skip TLS verification when talking to the provider. Labs only. */
@@ -137,15 +162,17 @@ const schema = z
     /**
      * How long a signed-in browser stays signed in.
      *
-     * It means two different things, because the two modes hold two different
-     * things. Under `vault-userpass` the cookie carries the credential, so this
-     * is a ceiling on it: the session ends at whichever runs out first, this or
-     * the minted token's own `exp`.
+     * It means two different things, because the modes hold two different
+     * things. Under `vault-oidc` and `vault-userpass` the session carries the
+     * credential, so this is a ceiling on it: the session ends at whichever
+     * runs out first, this or the token's own `exp`. Vault's provider
+     * advertises no refresh grant, so under `vault-oidc` the token's lifetime
+     * usually wins — set the client's `id_token_ttl` to how long a sitting
+     * should last.
      *
-     * Under `oidc` the cookie carries only an identity, and this is deliberately
-     * independent of the ID token's lifetime. Vault's provider advertises no
-     * refresh grant, so its token dies in about an hour; the dashboard only
-     * needs it to learn who someone is, and resolves a key per request
+     * Under `oidc` the session carries only an identity, and this is
+     * deliberately independent of the ID token's lifetime: the dashboard only
+     * needs that token to learn who someone is, and resolves a key per request
      * afterwards. Tying the session to it would sign people out hourly for no
      * gain in safety.
      */
@@ -204,15 +231,19 @@ const schema = z
       require("VAULT_ADDR", "when AUTH_MODE=vault-userpass");
     }
 
-    if (cfg.AUTH_MODE === "oidc") {
-      require("OIDC_ISSUER", "when AUTH_MODE=oidc");
-      require("OIDC_CLIENT_ID", "when AUTH_MODE=oidc");
-      require("OIDC_CLIENT_SECRET", "when AUTH_MODE=oidc");
+    if (cfg.AUTH_MODE === "oidc" || cfg.AUTH_MODE === "vault-oidc") {
+      const why = `when AUTH_MODE=${cfg.AUTH_MODE}`;
+      require("OIDC_ISSUER", why);
+      require("OIDC_CLIENT_ID", why);
+      require("OIDC_CLIENT_SECRET", why);
     }
 
     // The credential comes from the sign-in itself, so none of the key sources
-    // apply and requiring one would ask for a secret nothing reads.
-    if (cfg.AUTH_MODE === "vault-userpass") return;
+    // apply and requiring one would ask for a secret nothing reads. Under
+    // `vault-oidc` that credential is the ID token, and VAULT_ADDR is not
+    // required either: the dashboard reaches Vault through the issuer alone and
+    // never calls its API.
+    if (cfg.AUTH_MODE === "vault-userpass" || cfg.AUTH_MODE === "vault-oidc") return;
 
     if (cfg.KEY_SOURCE === "vault") {
       require("VAULT_ADDR", "when KEY_SOURCE=vault");
@@ -273,4 +304,19 @@ export function redirectUri(config: Config): string {
   return (
     config.OIDC_REDIRECT_URI ?? new URL("/auth/callback", config.PUBLIC_ORIGIN).toString()
   );
+}
+
+/**
+ * The scopes to ask the provider for.
+ *
+ * Defaulted per mode rather than once, because the two modes need opposite
+ * things and a wrong default is a login that fails at the provider. Under
+ * `vault-oidc` the whole point of the redirect is the `ov_account`/`ov_user`
+ * claims, and Vault only puts them in the token when the scope carrying them is
+ * asked for — `email` and `groups`, meanwhile, are scopes Vault does not
+ * advertise, and asking for either is an `invalid_scope` refusal.
+ */
+export function scopes(config: Config): string {
+  if (config.OIDC_SCOPES) return config.OIDC_SCOPES;
+  return config.AUTH_MODE === "vault-oidc" ? "openid openviking" : "openid email groups";
 }

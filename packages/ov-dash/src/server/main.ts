@@ -57,9 +57,16 @@ async function main(): Promise<void> {
   });
 
   serve({ fetch: app.fetch, hostname: config.HOST, port: config.PORT }, (info) => {
+    // Where the credential comes from, not which setting happens to be set:
+    // the Vault modes carry the token the sign-in produced and read no key
+    // source at all, so printing one names a secret nothing will ever open.
+    const credential =
+      config.AUTH_MODE === "vault-oidc" || config.AUTH_MODE === "vault-userpass"
+        ? "keys=from the sign-in"
+        : `keys=${config.KEY_SOURCE}`;
     console.log(
       `ov-dash listening on http://${config.HOST}:${info.port} ` +
-        `(auth=${config.AUTH_MODE}, keys=${config.KEY_SOURCE}, ov=${config.OV_URL})`,
+        `(auth=${config.AUTH_MODE}, ${credential}, ov=${config.OV_URL})`,
     );
     // Said at boot because it is a property of the deployment, not of the code:
     // sessions live in this process, so a second replica would sign people out

@@ -7,10 +7,11 @@
    * for a room you have not entered yet — so the shell stays away until there
    * is a viewer, and this fills the window on its own.
    *
-   * Two shapes, decided by the server. Against a Vault-backed OpenViking the
-   * person types a username and password here. Against a provider whose tokens
-   * OpenViking accepts directly, signing in is a full-page redirect instead and
-   * the dashboard never sees a password.
+   * Two shapes, decided by the server. Normally there is one button and the
+   * sign-in happens at the provider's own page — Vault's, where the password
+   * and whatever else it asks for stay. The password form is the older shape,
+   * for a deployment with no OIDC client registered; it is the only one that
+   * puts a password through this dashboard.
    */
   import Icon from "../lib/Icon.svelte";
   import Seal from "../lib/Seal.svelte";
@@ -26,6 +27,10 @@
   const signedOut = $derived(app.session && !app.session.signedIn ? app.session : null);
   const mode = $derived(signedOut?.mode ?? "redirect");
   const loginUrl = $derived(signedOut?.loginUrl ?? "/auth/login");
+  // Naming where you are about to be sent is the whole courtesy of this button:
+  // a page that says "Sign in" and then swaps the address bar for Vault's login
+  // looks like something went wrong.
+  const goLabel = $derived(mode === "vault-oidc" ? "Sign in with Vault" : "Sign in");
 
   let username = $state("");
   let password = $state("");
@@ -141,9 +146,12 @@
           class="go"
           href={`${loginUrl}?returnTo=${encodeURIComponent(`/${window.location.hash || "#/home"}`)}`}
         >
-          <Icon name="exit" /> Sign in
+          <Icon name="exit" /> {goLabel}
         </a>
       </p>
+      {#if mode === "vault-oidc"}
+        <p class="aside">You sign in at Vault. This dashboard never sees your password.</p>
+      {/if}
     {/if}
   </main>
 </div>
@@ -332,6 +340,15 @@
     margin: var(--s6) 0 0;
   }
 
+  /* Where the password goes instead. Said once, quietly, under the button. */
+  .aside {
+    margin: var(--s3) 0 0;
+    max-width: 34ch;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--ink-3);
+  }
+
   .alert {
     width: 100%;
     margin-top: var(--s6);
@@ -415,6 +432,9 @@
   }
   .door > :global(:nth-child(5)) {
     animation-delay: 0.26s;
+  }
+  .door > :global(:nth-child(6)) {
+    animation-delay: 0.31s;
   }
 
   @media (prefers-reduced-motion: reduce) {

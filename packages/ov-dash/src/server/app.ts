@@ -34,7 +34,7 @@ import { searchModeSchema } from "../shared/schemas";
 import type { Config } from "./env";
 import { IdentityError, isSafeUserId } from "./identity";
 import { KeyError, KeyResolver } from "./keys";
-import { OidcClient, OidcError } from "./oidc";
+import { OidcClient, OidcError, viewerFromClaims } from "./oidc";
 import {
   MAX_CONCURRENT_UPSTREAM,
   OvClient,
@@ -57,7 +57,7 @@ import {
   takeLogin,
 } from "./session";
 import { SessionStore } from "./store";
-import { VaultError, signIn } from "./vault";
+import { VaultError, credentialFromClaims, signIn } from "./vault";
 
 /** Everything a request handler needs, built once at boot. */
 export interface Services {
@@ -121,23 +121,33 @@ export function buildServices(config: Config): Services {
   };
 }
 
+/** The modes where signing in is a redirect to a provider and back. */
+function redirects(config: Config): boolean {
+  return config.AUTH_MODE === "oidc" || config.AUTH_MODE === "vault-oidc";
+}
+
+/** The modes where the session holds the credential, not just an identity. */
+function holdsCredential(config: Config): boolean {
+  return config.AUTH_MODE === "vault-userpass" || config.AUTH_MODE === "vault-oidc";
+}
+
 /**
  * Who is calling, and the credential they arrived with.
  *
- * In `oidc` and `vault-userpass` modes this comes from the cookie the sign-in
- * wrote. In `trusted-header` mode it is whatever the authenticating proxy
- * injected, read fresh each request. In `dev` mode it is a fixed identity.
+ * In every cookie-backed mode this comes from the session the sign-in wrote. In
+ * `trusted-header` mode it is whatever the authenticating proxy injected, read
+ * fresh each request. In `dev` mode it is a fixed identity.
  *
- * Identity and credential are returned together because in `vault-userpass`
- * both live in one stored session, and reading it twice left a window where the
- * session could expire between the two reads.
+ * Identity and credential are returned together because where a session carries
+ * both, reading it twice left a window where it could expire between the two
+ * reads.
  */
 async function resolveCaller(
   c: Context,
   config: Config,
   store: SessionStore,
 ): Promise<{ viewer: Viewer; credential?: string; expiresAt?: number | null } | null> {
-  if (config.AUTH_MODE === "vault-userpass") {
+  if (holdsCredential(config)) {
     const session = await readCredentialSession(c, config, store);
     return session
       ? {
@@ -197,8 +207,8 @@ export function createApp(services: Services) {
   app.get("/auth/login", async (c) => {
     const returnTo = safeReturnTo(c.req.query("returnTo"));
 
-    if (config.AUTH_MODE !== "oidc") {
-      // Nothing to negotiate: identity comes from a header or from config.
+    if (!redirects(config)) {
+      // Nothing to negotiate: identity comes from a form, a header, or config.
       return c.redirect(returnTo);
     }
 
@@ -209,7 +219,7 @@ export function createApp(services: Services) {
   });
 
   app.get("/auth/callback", async (c) => {
-    if (config.AUTH_MODE !== "oidc") return c.redirect("/");
+    if (!redirects(config)) return c.redirect("/");
 
     const error = c.req.query("error");
     if (error) {
@@ -221,19 +231,47 @@ export function createApp(services: Services) {
     const state = c.req.query("state");
     const pending = await takeLogin(c, config);
 
-    if (!pending) {
-      throw new OidcError(
-        "this login has expired or was already used — start again from the sign-in page",
-        400,
+    // Nothing to check the provider's answer against, or an answer that does
+    // not match what we sent. Both are ordinary: a login cookie expires after
+    // ten minutes, and starting a second sign-in in a second tab overwrites the
+    // first tab's state, so whichever tab finishes second lands here. Neither
+    // signs anybody in, so the honest answer is the sign-in page again rather
+    // than a JSON refusal in the address bar. The reason is logged, because to
+    // an operator "the callback did not match" and "a person has two tabs open"
+    // are the same event and only one of them is worth reading about.
+    if (!pending || !code || !state || state !== pending.state) {
+      console.warn(
+        `callback refused: ${pending ? "state did not match this login" : "no login in flight"}`,
       );
-    }
-    if (!code || !state || state !== pending.state) {
-      throw new OidcError("the callback did not match this login", 400);
+      return c.redirect(safeReturnTo(pending?.returnTo));
     }
 
     const client = await services.oidc();
-    const viewer = await client.exchange(code, pending.verifier, pending.nonce);
-    await startSession(c, config, services.sessions, viewer);
+    const { idToken, claims } = await client.exchange(
+      code,
+      pending.verifier,
+      pending.nonce,
+    );
+
+    if (config.AUTH_MODE === "vault-oidc") {
+      // The token Vault just issued is the one OpenViking accepts, so it is
+      // kept rather than read and thrown away. Identity comes out of the same
+      // token for the same reason it does after a mint: it is who OpenViking
+      // will answer as, and therefore the only trustworthy source for who this
+      // session is.
+      const credential = credentialFromClaims(idToken, claims);
+      await startCredentialSession(
+        c,
+        config,
+        services.sessions,
+        credential.viewer,
+        credential.token,
+        credential.expiresAt,
+      );
+      return c.redirect(pending.returnTo);
+    }
+
+    await startSession(c, config, services.sessions, viewerFromClaims(config, claims));
     return c.redirect(pending.returnTo);
   });
 
@@ -306,8 +344,7 @@ export function createApp(services: Services) {
 
   app.get("/api/session", async (c) => {
     const caller = await resolveCaller(c, config, services.sessions);
-    const cookieBacked =
-      config.AUTH_MODE === "oidc" || config.AUTH_MODE === "vault-userpass";
+    const cookieBacked = redirects(config) || holdsCredential(config);
     const state: SessionState = caller
       ? {
           signedIn: true,
@@ -318,7 +355,14 @@ export function createApp(services: Services) {
       : {
           signedIn: false,
           loginUrl: "/auth/login",
-          mode: config.AUTH_MODE === "vault-userpass" ? "vault-userpass" : "redirect",
+          // Which door to draw. `vault-oidc` is a redirect like `oidc`, but the
+          // page says where it sends you, and only the server knows that.
+          mode:
+            config.AUTH_MODE === "vault-userpass"
+              ? "vault-userpass"
+              : config.AUTH_MODE === "vault-oidc"
+                ? "vault-oidc"
+                : "redirect",
         };
     return c.json(state);
   });

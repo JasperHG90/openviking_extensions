@@ -30,9 +30,10 @@ interface Entry {
   /**
    * The OpenViking credential, when the sign-in produced one.
    *
-   * Present under `vault-userpass`, where the minted token *is* the credential.
-   * Absent under `oidc`, where the session carries an identity and the key is
-   * resolved per request.
+   * Present under the two Vault modes, where the token the sign-in produced
+   * *is* the credential — minted under `vault-userpass`, issued by Vault's
+   * provider under `vault-oidc`. Absent under `oidc`, where the session carries
+   * an identity and the key is resolved per request.
    */
   token?: string;
   /** Unix seconds this session ends at. */
