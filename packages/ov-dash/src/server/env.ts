@@ -20,12 +20,20 @@ const secret = z
  * How the dashboard decides who is calling.
  *
  * `vault-oidc` is the one to reach for against a Vault-backed OpenViking. The
- * person presses "Sign in with Vault" and signs in at Vault's own login page;
- * the ID token that comes back is both who they are and the credential
- * OpenViking accepts, so no password ever reaches the dashboard and whatever
- * Vault asks for — MFA included — applies without the dashboard knowing about
- * it. It needs an OIDC client registered with Vault, and a scope that templates
- * `ov_account` and `ov_user` into the token.
+ * person presses "Sign in with Vault" and signs in at Vault's own login page,
+ * so no password ever reaches the dashboard and whatever Vault asks for — MFA
+ * included — applies without the dashboard knowing about it.
+ *
+ * What comes back is *not* what OpenViking accepts, and this is the whole shape
+ * of the mode. A provider ID token carries the issuer and audience of the
+ * provider; OpenViking pins one issuer and one audience, and they are the
+ * identity-token ones every other client uses. So the dashboard trades the ID
+ * token at Vault's JWT auth mount for a session token, and mints from it — the
+ * same credential `vault-userpass` produces, reached without a password.
+ *
+ * It needs an OIDC client registered with Vault, a scope that templates
+ * `ov_account` and `ov_user` into the token, and a JWT mount whose role binds
+ * that client and resolves each person to their existing entity.
  *
  * `vault-userpass` does the same job through a password form: the dashboard
  * logs into Vault with the password and mints the identity token itself. It
@@ -207,6 +215,24 @@ const schema = z
     /** Mount of the userpass auth method people sign in against. */
     VAULT_USERPASS_MOUNT: z.string().default("userpass"),
     /**
+     * Mount of the JWT auth method a redirect sign-in is traded at.
+     *
+     * `vault-oidc` only. The browser flow ends with an ID token from Vault's
+     * provider; this mount takes it back and answers with a session token, from
+     * which the identity token OpenViking accepts is minted.
+     */
+    VAULT_JWT_MOUNT: z.string().default("jwt"),
+    /**
+     * Role on that mount.
+     *
+     * It has to bind `bound_audiences` to `OIDC_CLIENT_ID` and take
+     * `user_claim` from `ov_user`, and every person signing in needs an entity
+     * alias on the mount pointing at their existing entity. Without the alias
+     * Vault invents an empty one, and the token minted from it carries no
+     * identity at all.
+     */
+    VAULT_JWT_ROLE: z.string().default("ov-dash"),
+    /**
      * Identity-token role minted from after a sign-in.
      *
      * The role decides the audience, the claims and the lifetime. It must
@@ -227,8 +253,10 @@ const schema = z
       }
     };
 
-    if (cfg.AUTH_MODE === "vault-userpass") {
-      require("VAULT_ADDR", "when AUTH_MODE=vault-userpass");
+    if (cfg.AUTH_MODE === "vault-userpass" || cfg.AUTH_MODE === "vault-oidc") {
+      // Both end at Vault's API: one to log in with a password, the other to
+      // trade the ID token the redirect produced. Neither can mint without it.
+      require("VAULT_ADDR", `when AUTH_MODE=${cfg.AUTH_MODE}`);
     }
 
     if (cfg.AUTH_MODE === "oidc" || cfg.AUTH_MODE === "vault-oidc") {
@@ -239,10 +267,7 @@ const schema = z
     }
 
     // The credential comes from the sign-in itself, so none of the key sources
-    // apply and requiring one would ask for a secret nothing reads. Under
-    // `vault-oidc` that credential is the ID token, and VAULT_ADDR is not
-    // required either: the dashboard reaches Vault through the issuer alone and
-    // never calls its API.
+    // apply and requiring one would ask for a secret nothing reads.
     if (cfg.AUTH_MODE === "vault-userpass" || cfg.AUTH_MODE === "vault-oidc") return;
 
     if (cfg.KEY_SOURCE === "vault") {

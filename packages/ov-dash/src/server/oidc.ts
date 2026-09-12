@@ -13,11 +13,11 @@
  * so under `oidc` the identity a person maps to comes from a configurable claim
  * (see {@link Config.IDENTITY_FROM}), not from `sub`.
  *
- * Under `vault-oidc` nothing is mapped at all: the token carries `ov_account`
- * and `ov_user` — put there by a Vault scope that templates them from entity
- * metadata — and those *are* the identity OpenViking answers as. Which is why
- * this module hands back the verified token and its claims, and lets the caller
- * decide which of the two it is holding.
+ * Under `vault-oidc` nothing is mapped either: the token carries `ov_account`
+ * and `ov_user`, put there by a Vault scope that templates them from entity
+ * metadata, and the caller spends the token at Vault's JWT mount rather than
+ * reading an identity off it. Which is why this module hands back the verified
+ * token *and* its claims, and decides nothing about what either is worth.
  */
 
 import { createHash, randomBytes } from "node:crypto";
@@ -193,10 +193,10 @@ export class OidcClient {
    * Swap an authorization code for a verified ID token.
    *
    * The token comes back beside its claims rather than as an identity, because
-   * what it is worth depends on who issued it: from Vault it is the credential
-   * OpenViking accepts, from anyone else it is only a statement about who
-   * signed in. Deciding that here would mean this module knowing which
-   * deployment it is in.
+   * what it is worth depends on who issued it: from Vault it buys a session at
+   * the JWT mount, from anyone else it is only a statement about who signed in.
+   * Deciding that here would mean this module knowing which deployment it is
+   * in.
    *
    * @param code - The `code` parameter the provider sent back.
    * @param verifier - The PKCE verifier stashed when the flow began.

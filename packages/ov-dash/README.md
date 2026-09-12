@@ -25,10 +25,17 @@ different — the Account page says which one is in force rather than assuming.
 one button. It sends the browser to Vault's OIDC provider with PKCE, a state
 and a nonce; Vault authenticates the person however it is configured to —
 password, MFA, anything — and redirects back with a code. The dashboard swaps
-that code for an ID token, verifies it against Vault's published keys, and
-keeps it: with a scope that templates `ov_account` and `ov_user`, that token is
-both who the person is and the credential OpenViking accepts. **No password
-reaches this dashboard**, and `KEY_SOURCE` is not read.
+that code for an ID token, verifies it against Vault's published keys, and then
+**trades it back at Vault's JWT auth mount** for a session token, from which it
+mints the identity token OpenViking accepts. **No password reaches this
+dashboard**, and `KEY_SOURCE` is not read.
+
+The trade is not ceremony. A provider ID token carries the provider's issuer
+and this dashboard's client id; OpenViking pins one issuer and one audience,
+and they are the identity-token pair every other client uses. Nothing can hold
+both, so the dashboard ends up holding the same credential a password sign-in
+produces — reached without a password. ov-dash 0.4.0 handed the ID token
+straight to OpenViking and was refused; 0.5.0 is that fix.
 
 **`vault-userpass`.** The same job, for a deployment with no OIDC client
 registered. The sign-in form posts a Vault username and password; the dashboard
@@ -39,12 +46,12 @@ and never stored — but it is handled here, which is the reason to prefer
 `vault-oidc`. MFA cannot be added to this flow: the dashboard would have to
 carry the challenge itself.
 
-In both, the session ends at whichever runs out first — the token's own `exp`
-or `SESSION_TTL_SECONDS` — and nothing renews it. Vault advertises no refresh
-grant, so under `vault-oidc` set the client's `id_token_ttl` to how long a
-sitting should last. The cookie is written with that shorter lifetime, so the
-cookie and the token it carries never disagree, and the Account page shows the
-time.
+In both, the session ends at whichever runs out first — the minted token's own
+`exp` or `SESSION_TTL_SECONDS` — and nothing renews it. So the identity-token
+role's `ttl` is what sets how long a sitting lasts, in both modes; the ID
+token's own lifetime governs nothing, since it is spent at the JWT mount and
+never held. The cookie is written with that shorter lifetime, so the cookie and
+the token it carries never disagree, and the Account page shows the time.
 
 **`oidc` / `trusted-header` / `dev`.** Identity arrives from a provider, a
 proxy, or configuration, and the dashboard resolves a *key* for that person on
@@ -62,17 +69,27 @@ variable. This is where the API-key story applies.
 4. The dashboard swaps the code for an ID token — client secret and PKCE
    verifier both — and verifies the signature against the provider's JWKS, the
    issuer, the audience, and the nonce it stashed.
-5. `ov_account` and `ov_user` are read out of the verified token. They are not
-   a claim mapped onto an identity: they *are* the identity OpenViking will
-   answer as, which is why nothing here derives a user from an email.
-6. Token and identity go into the session store, and the browser is given a
+5. It posts that token to `auth/<jwt mount>/login`. The role there takes the
+   person's id from the `ov_user` claim and binds the audience to this client,
+   and Vault answers with a session token for that person.
+6. It mints `identity/oidc/token/<role>` as them, then hands the session token
+   straight back with `revoke-self` — the same three steps the password flow
+   ends with, and the minted token outlives the revoke.
+7. `ov_account` and `ov_user` are read out of the minted token and checked
+   against **both** claims the ID token carried. They come from one entity by
+   two routes — the provider's scope and the identity-token role's template —
+   so the two templates have to agree on what they emit. They disagree in
+   practice only when the JWT mount's alias points at the wrong entity, which
+   would hand this person somebody else's credential. If a sign-in is refused
+   with "a different identity", the log line names which half.
+8. Token and identity go into the session store, and the browser is given a
    cookie naming it. Every later request calls OpenViking with the token the
    server is holding.
 
 The access token is thrown away. Vault's is opaque to everything but its own
 `userinfo` endpoint — presenting one to Vault's API answers `permission denied`
-— so the ID token is the only half of the exchange that is worth anything, and
-reading the wrong one is the classic way to get this backwards.
+— which is also why step 5 exists at all: the exchange leaves nothing that can
+mint, so the ID token has to buy a session token first.
 
 ### What Vault needs, once
 
@@ -104,8 +121,10 @@ resource "vault_identity_oidc_client" "ov_dash" {
   redirect_uris    = ["https://dash.example.com/auth/callback"]
   assignments      = [vault_identity_oidc_assignment.ov_dash.name]
   client_type      = "confidential"
-  id_token_ttl     = 28800   # how long a sitting lasts; nothing renews it
-  access_token_ttl = 1800
+  # Both are short on purpose: the ID token is spent within seconds of being
+  # issued, and how long a sitting lasts is the identity-token role's ttl.
+  id_token_ttl     = 600
+  access_token_ttl = 600
 }
 
 # And the provider must offer the scope and allow this client:
@@ -114,17 +133,69 @@ resource "vault_identity_oidc_client" "ov_dash" {
 # as must the signing key's own allowed_client_ids.
 ```
 
+And the mount the ID token is traded at:
+
+```hcl
+resource "vault_jwt_auth_backend" "ov_dash" {
+  path = "jwt"
+  # Vault fetching its own provider. If the cert is private, add
+  # oidc_discovery_ca_pem; if it cannot reach its own name at all, use
+  # jwks_url + bound_issuer instead.
+  oidc_discovery_url = "https://vault.example.com/v1/identity/oidc/provider/default"
+}
+
+resource "vault_jwt_auth_backend_role" "ov_dash" {
+  backend         = vault_jwt_auth_backend.ov_dash.path
+  role_name       = "ov-dash"
+  role_type       = "jwt"
+  user_claim      = "ov_user"                                   # the scope's claim
+  bound_audiences = [vault_identity_oidc_client.ov_dash.client_id]
+  token_policies  = [vault_policy.ov_dash.name]
+  token_type      = "service"
+  token_ttl       = 300              # it exists for one mint
+}
+
+# What that session may do, which is two things.
+resource "vault_policy" "ov_dash" {
+  name   = "ov-dash"
+  policy = <<-EOT
+    path "identity/oidc/token/openviking" { capabilities = ["read"] }
+    path "auth/token/revoke-self"         { capabilities = ["update"] }
+  EOT
+}
+
+# One per person, and the step with no error message of its own: without it
+# Vault invents a fresh entity on first login, whose metadata is empty.
+resource "vault_identity_entity_alias" "ov_dash_jwt" {
+  name           = "jasper"                       # their ov_user
+  canonical_id   = vault_identity_entity.jasper.id
+  mount_accessor = vault_jwt_auth_backend.ov_dash.accessor
+}
+```
+
+Use the *same* template string for the scope and for the identity-token role.
+The dashboard compares what they produce, so an account hard-coded in one and
+templated in the other is refused as a mismatched identity.
+
+**Keep `id_token_ttl` short, and not for tidiness.** Between the redirect and
+the trade, that ID token is a full Vault login as the person: `auth/jwt/login`
+has no replay protection — measured, the same token presented twice returns a
+fresh session both times — and the session it buys carries the role's policies
+*plus* the entity's own. So for its whole lifetime a captured ID token is worth
+whatever that person is worth in Vault, not just a read of their OpenViking
+tree. Ten minutes is plenty; the dashboard spends it within a second of getting
+it, and how long a sitting lasts is the identity-token role's `ttl`, not this.
+
 `client_id` and `client_secret` are generated by Vault — read them back out and
 put them in `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET`. Whoever signs in must be
 in the assignment, and their entity must carry `ov_account` and `ov_user`
 metadata; without the metadata the template renders nothing and the sign-in is
 refused with "that token carries no ov_account/ov_user claims".
 
-One thing this dashboard cannot check for you: **OpenViking has to accept that
-token.** Its OIDC plugin verifies against Vault's discovery document and JWKS,
-and an ID token from the provider carries a different issuer and audience than
-one minted from `identity/oidc/token/<role>`. If OpenViking pins either, add
-the `ov-dash` client id to what it allows.
+**OpenViking needs no change.** That is the point of the trade: what the
+dashboard presents is the same `identity/oidc/token/<role>` token the CLI and
+every other client use, under the issuer and audience `ov.conf.json` already
+pins. Nothing has to learn about the provider.
 
 ## How a Vault password sign-in works
 
@@ -179,11 +250,11 @@ Same first three steps as above, against any provider. Then it diverges:
 5. Every later request resolves that user's key from `KEY_SOURCE` and calls
    OpenViking with it.
 
-The session deliberately outlives the ID token here, which is the one place
-these two modes disagree. The token is only used to learn who someone is, so
-tying the session to a token that dies in an hour and cannot be refreshed would
-sign people out hourly and buy nothing. Under `vault-oidc` the token is the
-credential, so the session ends with it.
+The session deliberately outlives the ID token here, and under `vault-oidc` it
+does too — for different reasons. In this mode the ID token is only used to
+learn who someone is; in that one it is spent at the JWT mount. Neither session
+is tied to it. What `vault-oidc` *is* tied to is the identity token minted
+afterwards, which this mode never gets.
 
 ## What it shows
 
@@ -594,8 +665,18 @@ describes. What it settled:
   the dashboard refuses it rather than signing anyone in as nobody.
 - The **access token is useless**: presenting it to Vault's API answers
   `permission denied`, and it opens only `identity/oidc/provider/<name>/userinfo`.
-  So a redirect sign-in cannot mint from `identity/oidc/token/<role>` — the ID
-  token is the credential or there is none.
+  So the exchange leaves nothing that can mint on its own — which is what sends
+  the ID token back to the JWT mount.
+- That trade works, and ends where it has to: `auth/jwt/login` with the ID token
+  returns a session token for the person, minting from it produces
+  `iss=…/v1/identity/oidc` and the identity-token role's own `client_id` as
+  `aud` (generated unless the role pins one), carrying `ov_account` and
+  `ov_user` — and `revoke-self` on the session token leaves the minted one live.
+- **The entity alias is load-bearing.** Without one on the JWT mount, Vault
+  invents a fresh entity, the mint succeeds, and both claims come back as empty
+  strings. The dashboard refuses that rather than signing someone in as nobody —
+  but it is silent everywhere else, so it is the first thing to check when a
+  sign-in is refused with no identity.
 - Vault's dev mode builds the issuer and JWKS URL from `VAULT_API_ADDR`, whose
   default is `http://0.0.0.0:8200`. Left alone, discovery declares an issuer
   that will never match and publishes keys at an address nothing can fetch.
@@ -609,39 +690,18 @@ the same sign-in over HTTP.
 
 ## What is still not verified
 
-**That the lab cluster's OpenViking accepts this token.** Its OIDC plugin
-verifies against Vault's discovery document, and a provider ID token carries a
-different issuer and audience from the minted identity token the dashboard sends
-today. `auth.md` records that oauth2-proxy forwards exactly this kind of token
-and the server accepts it, which is the reason to expect it to work — but it has
-not been tried from here. If it is refused, the fix is on the OpenViking side:
-allow the `ov-dash` client id.
+**That the cluster's ov-dash job points at the right image.** Everything below
+the deployment is measured; `AUTH_MODE=vault-oidc` on an image older than 0.5.0
+hands OpenViking a provider ID token and is refused on every call after a
+sign-in that looked fine.
 
-Worth settling before deploying, once the Vault resources exist. Your own Vault
-token stands in for the browser, and PKCE is optional for a confidential client,
-so it is two calls and a third:
-
-```bash
-CLIENT=...            # vault read identity/oidc/client/ov-dash
-SECRET=...
-AUTH=$(curl -sG -H "x-vault-token: $(cat ~/.vault-token)" \
-  --data-urlencode "client_id=$CLIENT" \
-  --data-urlencode "redirect_uri=https://dash.example.com/auth/callback" \
-  --data-urlencode "response_type=code" \
-  --data-urlencode "scope=openid openviking" \
-  --data-urlencode "state=x" --data-urlencode "nonce=y" \
-  "$VAULT_ADDR/v1/identity/oidc/provider/<provider>/authorize")
-
-ID=$(curl -s -u "$CLIENT:$SECRET" \
-  -d "grant_type=authorization_code&code=$(jq -r .code <<<"$AUTH")" \
-  -d "redirect_uri=https://dash.example.com/auth/callback" \
-  "$VAULT_ADDR/v1/identity/oidc/provider/<provider>/token" | jq -r .id_token)
-
-# The question. A 200 means the dashboard will work; a 401 means widen what
-# OpenViking accepts.
-curl -s -o /dev/null -w '%{http_code}\n' -H "X-API-Key: $ID" \
-  "$OV_URL/api/v1/fs/ls?uri=viking://user/<you>"
-```
+Handing a provider ID token to OpenViking directly is settled, and settled as a
+dead end: `ov.conf.json` pins `server.oidc.issuer` to `…/v1/identity/oidc` and
+`audience` to `openviking`, the plugin verifies both, and the schema holds one
+of each. Re-pinning them to the provider would break hermes and every human
+token from `identity/oidc/token/openviking`. That is why this mode trades the
+token rather than presenting it, and why nothing on the OpenViking side has to
+move.
 
 `KEY_SOURCE=vault` is likewise untested end to end: the Vault token on this
 machine was expired, so keys came from `KEY_SOURCE=env`. It is not read by

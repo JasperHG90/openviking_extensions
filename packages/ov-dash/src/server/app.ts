@@ -57,7 +57,7 @@ import {
   takeLogin,
 } from "./session";
 import { SessionStore } from "./store";
-import { VaultError, credentialFromClaims, signIn } from "./vault";
+import { VaultError, signIn, signInWithIdToken } from "./vault";
 
 /** Everything a request handler needs, built once at boot. */
 export interface Services {
@@ -254,12 +254,35 @@ export function createApp(services: Services) {
     );
 
     if (config.AUTH_MODE === "vault-oidc") {
-      // The token Vault just issued is the one OpenViking accepts, so it is
-      // kept rather than read and thrown away. Identity comes out of the same
-      // token for the same reason it does after a mint: it is who OpenViking
-      // will answer as, and therefore the only trustworthy source for who this
-      // session is.
-      const credential = credentialFromClaims(idToken, claims);
+      // The ID token proves who signed in; it is not what OpenViking takes.
+      // Vault trades it for a session token, and the identity token minted from
+      // that is the credential — the same one a password sign-in produces.
+      //
+      // The identity is read off the ID token first for two reasons: Vault's
+      // JWT role takes the person's id from `ov_user`, so a token without it
+      // fails upstream with a far worse message, and both claims are what the
+      // minted token gets checked against afterwards.
+      const claimed = (name: string): string =>
+        typeof claims[name] === "string" ? (claims[name] as string).trim() : "";
+      const expected = { account: claimed("ov_account"), user: claimed("ov_user") };
+      if (!expected.user || !expected.account) {
+        // Two causes, and naming only the first sends people to look at a scope
+        // that is fine. Measured: with the scope in place but the entity's
+        // metadata missing, Vault still emits the claim — as an empty string.
+        // That is the one that actually happens, when somebody is onboarded and
+        // the metadata is the step that gets forgotten.
+        console.warn(
+          `sign-in carried ov_account=${JSON.stringify(expected.account)} ov_user=${JSON.stringify(expected.user)} — empty means the entity has no such metadata, absent means the scope is not on this client`,
+        );
+        throw new VaultError(
+          "this sign-in carries no ov_account/ov_user identity, so Vault cannot tell who " +
+            "it is for — the OIDC scope has to template both, and the person has to have " +
+            "an entity that carries them",
+          403,
+        );
+      }
+
+      const credential = await signInWithIdToken(config, idToken, expected);
       await startCredentialSession(
         c,
         config,
@@ -1038,8 +1061,11 @@ export function createApp(services: Services) {
       );
     }
     if (error instanceof VaultError) {
+      // The error names its own code: an outage and a refusal answer with
+      // different ones, so a dashboard that cannot reach Vault does not look
+      // like a dashboard Vault said no to.
       return c.json(
-        { error: { code: "VAULT_REFUSED", message: error.message } },
+        { error: { code: error.code, message: error.message } },
         error.status as 400,
       );
     }

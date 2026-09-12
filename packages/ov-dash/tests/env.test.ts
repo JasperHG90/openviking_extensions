@@ -86,6 +86,7 @@ describe("signing in through Vault's own login", () => {
     OIDC_ISSUER: "https://vault.example/v1/identity/oidc/provider/ovdash",
     OIDC_CLIENT_ID: "ov-dash",
     OIDC_CLIENT_SECRET: "secret",
+    VAULT_ADDR: "https://vault.example",
   };
 
   it("needs a registered client, like any other redirect", () => {
@@ -94,9 +95,7 @@ describe("signing in through Vault's own login", () => {
     );
   });
 
-  it("asks for no key source and no Vault address", () => {
-    // The credential is the ID token the sign-in returns, so a key would be a
-    // secret nothing reads — and Vault is reached through the issuer alone.
+  it("asks for no key source, because the sign-in produces the credential", () => {
     const config = loadConfig({
       OV_URL: "http://openviking:1933",
       SESSION_SECRET: "a".repeat(32),
@@ -104,9 +103,23 @@ describe("signing in through Vault's own login", () => {
       OIDC_ISSUER: "https://vault.example/v1/identity/oidc/provider/ovdash",
       OIDC_CLIENT_ID: "ov-dash",
       OIDC_CLIENT_SECRET: "secret",
+      VAULT_ADDR: "https://vault.example",
     });
     expect(config.AUTH_MODE).toBe("vault-oidc");
-    expect(config.VAULT_ADDR).toBeUndefined();
+    // Defaults, so a deployment only names them when Vault calls them
+    // something else.
+    expect(config.VAULT_JWT_MOUNT).toBe("jwt");
+    expect(config.VAULT_JWT_ROLE).toBe("ov-dash");
+  });
+
+  it("needs Vault's address, because the ID token has to be traded there", () => {
+    // The redirect ends with a token OpenViking refuses -- wrong issuer, wrong
+    // audience. Without Vault there is nothing to trade it at, and the failure
+    // would land on the first person to sign in rather than at boot.
+    const { VAULT_ADDR, ...without } = VAULT_OIDC;
+    expect(() => loadConfig(without)).toThrow(
+      /VAULT_ADDR is required when AUTH_MODE=vault-oidc/,
+    );
   });
 
   it("asks Vault for the scope carrying ov_account and ov_user", () => {
