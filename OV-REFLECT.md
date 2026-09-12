@@ -192,7 +192,10 @@ Per-file headers on the ported files.
 - [ ] Deletion trigger — watch resource deletes and re-ingests, re-reflect the
       memories citing them at top priority (decision 12)
 - [ ] Trends — lazy, from Postgres timestamps, stored as a search tag
-- [ ] Compare/merge with provenance, once observation churn is visible
+- [x] Compare/merge with provenance — done 2026-09-12. The churn became
+      visible: thirteen files about one scraper. An observation is now filed
+      under the memory it is about and revised in place, and the change query
+      no longer hands the sweep its own observations to reflect on
 - [ ] Phase 0 incremental update, with the retention guardrail (decision 13)
 - [ ] Retrieval counter in `HybridRetriever` → salience formula
 

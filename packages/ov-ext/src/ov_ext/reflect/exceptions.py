@@ -2,11 +2,26 @@
 
 from __future__ import annotations
 
-__all__ = ["ContentUnavailableError", "ReflectionError"]
+__all__ = ["ContentUnavailableError", "ObservationUnreadableError", "ReflectionError"]
 
 
 class ReflectionError(RuntimeError):
     """Base for conditions that stop a sweep."""
+
+
+class ObservationUnreadableError(ReflectionError):
+    """The observation standing at a URI could not be read, and may still exist.
+
+    Distinct from "there is no file yet", which is the ordinary case and comes
+    back as ``None``. This is raised when the store refused the read for any
+    other reason -- unreachable, timed out, not permitted, unparseable.
+
+    The distinction is the difference between writing a first observation and
+    destroying one. A missing file means there is nothing to revise, so writing
+    the new claim is right. A failed read means *nothing is known* about what is
+    there, and a store that treats the two alike overwrites months of
+    accumulated reasoning on a network blip.
+    """
 
 
 class ContentUnavailableError(ReflectionError):

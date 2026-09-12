@@ -13,10 +13,11 @@ genuinely new". Two departures of our own:
 
 - Propose is told to look across projects, since an observation whose evidence
   spans two of them is the thing single-window extraction can never produce.
-- memex's "skip what is already known" instruction is dropped with it: nothing
-  here reads existing observations yet, and an instruction referring to a list
-  that is never supplied is noise in the prompt. It comes back with the
-  compare/merge pass.
+- memex's "skip what is already known" instruction arrives as its own call
+  rather than as a line in propose. :func:`revise_prompt` shows the model the
+  observation already standing about this entity and the one just drawn, and
+  asks what holds now -- so "already known" is a document it reads, not a
+  list it is told to imagine.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from collections.abc import Sequence
 
 from .models import ReflectMemoryContext
 
-__all__ = ["consolidate_prompt", "propose_prompt"]
+__all__ = ["consolidate_prompt", "propose_prompt", "revise_prompt"]
 
 _PROPOSE_INSTRUCTION = """\
 Analyze a set of memories and generate high-level observations about patterns, \
@@ -140,4 +141,63 @@ def consolidate_prompt(observations: Sequence[tuple[str, str]]) -> str:
     )
     return "\n\n---\n\n".join(
         [_CONSOLIDATE_INSTRUCTION, "Observations to group:\n\n" + listed]
+    )
+
+
+_REVISE_INSTRUCTION = """\
+An observation about this subject already stands, written by an earlier pass \
+over earlier memories. A new one has just been drawn from what has changed \
+since. Write the observation that holds now. It replaces the standing one.
+
+Both are about the same subject. That does NOT make them the same claim, and \
+merging two claims that merely share a subject destroys them both.
+
+Carry forward what still holds. Drop only what the new claim directly \
+supersedes -- a correction replaces what it corrects rather than sitting \
+beside it. State a reversal as what is true now, not as a history of what was \
+believed.
+
+Merge two statements ONLY when they assert the same thing in different words. \
+Anything else is kept: the result carries the standing claim and the new one \
+as separate paragraphs, both intact. Dropping a standing claim because the new \
+one is unrelated to it is the one mistake you must not make -- there is no \
+other copy of it.
+
+Do not invent anything neither side supports, and do not quote: the evidence \
+travels with the observations and is attached again afterwards.
+
+STRICT RULE: All output MUST be written in English."""
+
+
+def revise_prompt(
+    standing: tuple[str, str], incoming: tuple[str, str], *, subject: str
+) -> str:
+    """Build the prompt that folds a new observation into the standing one.
+
+    Parameters
+    ----------
+    standing :
+        ``(title, content)`` of the observation already on disk.
+    incoming :
+        ``(title, content)`` of the one this sweep drew.
+    subject :
+        The memory both are filed under, named so the model knows what the file
+        is about and does not drift onto whichever claim it read last.
+
+    Returns
+    -------
+    str
+        The full prompt, without the JSON schema.
+    """
+    payload = json.dumps(
+        {
+            "subject": subject,
+            "standing": {"title": standing[0], "content": standing[1]},
+            "new": {"title": incoming[0], "content": incoming[1]},
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    return "\n\n---\n\n".join(
+        [_REVISE_INSTRUCTION, "The two observations:\n\n" + payload]
     )

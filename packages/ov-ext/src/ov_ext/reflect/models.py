@@ -33,6 +33,7 @@ __all__ = [
     "Observation",
     "ProposedObservations",
     "ReflectMemoryContext",
+    "Revision",
 ]
 
 # Verbatim from memex. The strictness is deliberate: an earlier, softer wording
@@ -190,6 +191,24 @@ class Consolidation(BaseModel):
     groups: list[ObservationGroup] = Field(
         default_factory=list,
         description="One entry per observation worth keeping, after merging.",
+    )
+
+
+class Revision(BaseModel):
+    """A standing observation rewritten to take in what has changed since.
+
+    Titles and content only, for the same reason :class:`Consolidation` asks
+    for no quotes: the evidence on both sides has already been checked against
+    the memories it cites, and letting the model restate a quote would put
+    unverified text into a file that claims every line is traceable.
+    """
+
+    title: str = Field(description="Concise title for the observation as it now stands.")
+    content: str = Field(
+        description=(
+            "The observation as it now stands, replacing the standing one. Fold "
+            "in what the new claim adds and drop what it supersedes."
+        )
     )
 
 

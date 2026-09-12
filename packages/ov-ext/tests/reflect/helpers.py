@@ -11,7 +11,7 @@ method was called.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any, TypeVar
 
@@ -47,6 +47,12 @@ class FakeStore:
     ----------
     written : list[Observation]
         Observations handed to :meth:`write_observation`, in order.
+    standing : dict[str, Observation]
+        What each file holds now, so a second write to one subject finds the
+        first -- which is the whole behaviour the revise pass turns on.
+    unreadable : dict[str, Exception]
+        URIs whose next read raises, for modelling a store that is reachable
+        but will not answer.
     links : list[tuple[str, str, str, str | None, float]]
         Every edge recorded, as ``(from, to, type, match_text, weight)``.
     """
@@ -64,6 +70,8 @@ class FakeStore:
         self._tail = list(tail)
         self._overview = overview
         self.written: list[Observation] = []
+        self.standing: dict[str, Observation] = {}
+        self.unreadable: dict[str, Exception] = {}
         self.links: list[tuple[str, str, str, str | None, float]] = []
         self.reflected: list[str] = []
 
@@ -108,10 +116,71 @@ class FakeStore:
         """Return the configured overview, whatever the directory."""
         return self._overview
 
-    async def write_observation(self, observation: Observation) -> str:
-        """Record the observation and hand back a URI for it."""
+    def observation_uri(
+        self, observation: Observation, subjects: Collection[str] = ()
+    ) -> str:
+        """Name the file the way the real store does.
+
+        The real helpers, not a second copy of the rule: what the engine relies
+        on is that one subject resolves to one file, and a fake that numbered
+        its writes instead would satisfy every revision test while the live
+        store kept creating new files.
+        """
+        from ov_ext.reflect.viking import _subject, _topic
+
+        topic = _topic(observation, subjects)
+        return f"viking://observations/{topic}/{_subject(observation, subjects)}.md"
+
+    async def read_observation(self, uri: str) -> Observation | None:
+        """Return what was last written to ``uri``, or ``None``.
+
+        Raises whatever ``unreadable`` holds for that URI, so a test can model a
+        store that is up but will not answer -- which the engine has to tell
+        apart from a file that is not there. The entry is NOT consumed: a file
+        that fails once and then reads fine cannot show what a persistently
+        stuck subject does to the sweeps behind it.
+        """
+        problem = self.unreadable.get(uri)
+        if problem is not None:
+            raise problem
+        return self.standing.get(uri)
+
+    async def resolve(
+        self, observation: Observation, subjects: Collection[str] = ()
+    ) -> tuple[str, Observation | None]:
+        """Prefer a file that exists over a better-ranked one that does not.
+
+        The real rule, not a shortcut, including the part that keeps it from
+        becoming a magnet: a runner-up's file is reused only when what stands
+        there already cites the memory this observation is about.
+        """
+        from ov_ext.reflect.viking import _ranked
+
+        ranked = _ranked(observation, subjects)
+        if not ranked:
+            return self.observation_uri(observation, subjects), None
+        subject = ranked[0]
+        candidates = [self.observation_uri(observation, [uri]) for uri in ranked[:3]]
+        for candidate in dict.fromkeys(candidates):
+            standing = await self.read_observation(candidate)
+            if standing is None:
+                continue
+            if candidate == candidates[0] or subject in standing.sources:
+                return candidate, standing
+        return candidates[0], None
+
+    async def whole_memories(self, uris: Sequence[str]) -> list[MemoryRow]:
+        """Return whole memories, which is all this fake ever held."""
+        return await FakeStore.rows(self, uris)
+
+    async def write_observation(
+        self, observation: Observation, *, uri: str | None = None
+    ) -> str:
+        """Record the observation and hand back the URI it landed on."""
+        uri = uri or self.observation_uri(observation)
         self.written.append(observation)
-        return f"viking://observations/{len(self.written)}.md"
+        self.standing[uri] = observation
+        return uri
 
     async def link(
         self,

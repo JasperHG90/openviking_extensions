@@ -42,8 +42,15 @@ class FakeFS:
         self.writes: list[tuple[str, str]] = []
 
     async def read_file(self, uri: str, ctx: Any = None) -> str:
+        # The exception OpenViking's own VikingFS raises for a missing file, not
+        # a builtin that looks like it. The store has to tell "no file yet" from
+        # "the read failed", and a fake that signalled absence with a different
+        # type would let it confuse the two -- which is a write over a file that
+        # is still there.
+        from openviking_cli.exceptions import NotFoundError
+
         if uri not in self.files:
-            raise FileNotFoundError(uri)
+            raise NotFoundError(uri)
         return self.files[uri]
 
     async def write_file(self, uri: str, content: str, ctx: Any = None) -> None:
@@ -594,3 +601,33 @@ async def test_a_complete_batch_does_write_what_its_passes_found() -> None:
     observations = [uri for uri, _ in fs.writes if "/observations/" in uri]
     assert observations, "a complete batch must write what it found"
     assert deltas.retired == [1, 2]
+
+
+async def test_a_dry_run_leaves_even_unreflectable_deltas_pending() -> None:
+    """The store retires deltas too, and guarding only the engine missed it.
+
+    A delta outside `memory_types` is normally retired on sight -- it is a real
+    change, just not one an observation should be drawn from, and leaving it
+    would make every sweep read it again. During a dry run that is destructive,
+    and it ruins the main reason to dry-run: previewing a change to
+    `memory_types` itself. Run the preview on the old setting and every delta
+    the new setting would have covered is gone before the real run starts.
+    """
+    entity = "viking://user/jasper/memories/entities/a.md"
+    event = "viking://user/jasper/memories/events/2026/09/12/standup.md"
+    an_event = delta_row(2, event, "- stood up")
+    an_event["memory_type"] = "events"
+    deltas = FakeDeltas([delta_row(1, entity, "- ships v0.4"), an_event])
+
+    await run_sweep(
+        FakeFS(),
+        FakeDB([]),
+        FakeCtx(),
+        settings(dry_run=True),
+        lock=ProcessLock(),
+        llm=FakeLLM([ProposedObservations(observations=[])]),
+        now=NOW,
+        deltas=deltas,
+    )
+
+    assert deltas.retired == [], "a dry run must write nothing, the queue included"

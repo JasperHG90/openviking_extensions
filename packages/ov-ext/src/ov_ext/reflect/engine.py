@@ -12,7 +12,15 @@ one function:
    at random;
 4. one model call for observations;
 5. verify every quote in code;
-6. write what survived, and move the watermark.
+6. write what survived -- revising the observation already filed under that
+   memory, when there is one -- and move the watermark.
+
+Step 6 is where an observation becomes a thing that evolves rather than a
+snapshot. A file is named after the memory it is about, so the next sweep with
+something to say about that memory opens the file that is already there, hands
+it to the model beside the new claim, and writes back what holds now. Naming a
+file after the evidence instead is how one running observation about a scraper
+became thirteen files, each true, none of them the current answer.
 
 There was a second model call, asking which memories were in tension, and it is
 gone. Contradiction needs two whole memories held side by side to mean anything,
@@ -31,23 +39,25 @@ from __future__ import annotations
 
 import logging
 import random
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from ..observability import annotate, record_error, traced
 from .citations import build_memory_context, citation_map
 from .config import ReflectSettings
+from .exceptions import ObservationUnreadableError
 from .models import (
     Consolidation,
     MemoryRow,
     Observation,
     ProposedObservations,
     ReflectMemoryContext,
+    Revision,
 )
 from .ports import MemoryStore, Sampler, StructuredLLM
-from .prompts import consolidate_prompt, propose_prompt
-from .verify import normalise, verify_observations
+from .prompts import consolidate_prompt, propose_prompt, revise_prompt
+from .verify import areas_of, normalise, quote_is_present, verify_observations
 from .watermark import Watermark
 
 __all__ = ["BatchOutcome", "ReflectionEngine", "SweepReport"]
@@ -96,6 +106,17 @@ class SweepReport:
     consolidated : int
         Observations merged into another by the consolidation pass. High next
         to ``written`` means the passes are covering the same ground.
+    revised : int
+        Observations folded into a file that already stood, rather than
+        starting one. Rises as a store matures: the more a subject has been
+        reflected on, the likelier the next sweep revises instead of creating.
+    unwritten : int
+        Verified observations that survived every gate and still did not reach
+        the store, because the file they belong in could not be read or could
+        not be revised. Counted apart from ``failures`` because nothing was
+        abandoned and nothing was lost: the changes behind them stay pending
+        and are read again. A number that stays high means one subject's file
+        is stuck.
     dropped : dict[str, int]
         Why observations were discarded, keyed by reason. The ratio of this to
         ``proposed`` is the signal that a prompt change made things worse.
@@ -111,6 +132,8 @@ class SweepReport:
     proposed: int = 0
     written: int = 0
     consolidated: int = 0
+    revised: int = 0
+    unwritten: int = 0
     dropped: dict[str, int] = field(default_factory=dict)
     failures: int = 0
     stepped_over: bool = False
@@ -244,6 +267,8 @@ class ReflectionEngine:
                 "ov_ext.reflect.batches": report.batches,
                 "ov_ext.reflect.proposed": report.proposed,
                 "ov_ext.reflect.written": report.written,
+                "ov_ext.reflect.revised": report.revised,
+                "ov_ext.reflect.unwritten": report.unwritten,
                 "ov_ext.reflect.failures": report.failures,
             }
         )
@@ -284,20 +309,24 @@ class ReflectionEngine:
                     "ov-ext reflect: no progress for %d sweeps. Reading captured "
                     "changes, so the watermark is unused and NOTHING has been "
                     "skipped -- every pending change is still pending and will be "
-                    "read again. Failures this sweep: %d.",
+                    "read again. Failures this sweep: %d, observations that could "
+                    "not be written: %d.",
                     watermark.stalls + 1,
                     report.failures,
+                    report.unwritten,
                 )
                 annotate({"ov_ext.reflect.outcome": "stepped_over"})
                 return report, watermark.stepped_over(forced, now=moment)
             logger.error(
                 "ov-ext reflect: no progress for %d sweeps; stepping the watermark "
                 "over %s to %s. The memories in the failing batch will NOT be "
-                "reflected on. Failures this sweep: %d.",
+                "reflected on. Failures this sweep: %d, observations that could "
+                "not be written: %d.",
                 watermark.stalls + 1,
                 watermark.last_seen.isoformat(),
                 forced.isoformat(),
                 report.failures,
+                report.unwritten,
             )
             annotate({"ov_ext.reflect.outcome": "stepped_over"})
             return report, watermark.stepped_over(forced, now=moment)
@@ -306,13 +335,16 @@ class ReflectionEngine:
         logger.warning(
             "ov-ext reflect: read %d changed memories across %d batches but "
             "advanced nothing; watermark held at %s, stall %d of %d. Failures "
-            "this sweep: %d.",
+            "this sweep: %d, observations that could not be written: %d. A "
+            "sweep that keeps reporting unwritten observations has a subject "
+            "whose file cannot be read or revised -- the log above names it.",
             len(changed),
             report.batches,
             watermark.last_seen.isoformat(),
             watermark.stalls + 1,
             settings.max_stalls,
             report.failures,
+            report.unwritten,
         )
         return report, watermark.stalled(now=moment)
 
@@ -333,6 +365,7 @@ class ReflectionEngine:
         a model call that failed: marking that batch done would drop those
         memories from reflection permanently over a transient outage.
         """
+        settings = self._settings
         report.batches += 1
         annotate(
             {"ov_ext.reflect.directory": directory, "ov_ext.reflect.changed": len(uris)}
@@ -368,20 +401,42 @@ class ReflectionEngine:
         kept, covered, every_pass_ran = await self._passes(
             contexts, scope, index_to_uri, rows_by_uri, report
         )
-        # Written before anything is retired: `write_observation` names a file
-        # after the title, which the model does not repeat word for word, so a
-        # change read twice lands somewhere new rather than merging -- and those
-        # duplicates become evidence for further observations, which is what
-        # consolidation exists to stop. Retiring exactly what a pass looked at
-        # keeps that from happening while still crediting the passes that
-        # worked.
+        # Written before anything is retired, so a sweep that dies here reads
+        # the same changes again rather than dropping them. A re-read is cheap
+        # now that a subject has one file: the second pass revises what the
+        # first wrote instead of landing beside it.
+        #
+        # `uris` -- the memories this batch is reflecting *on* -- decides what
+        # each observation is filed under. Without it the file is chosen from
+        # whichever neighbours the sample drew, which is not stable between
+        # sweeps; see `VikingStore._primary`.
+        subjects = set(uris)
         for observation in await self._consolidate(kept, report):
-            await self._write(observation, report)
+            if not await self._write(observation, report, subjects):
+                # Only the changes THIS observation was drawn from stay pending.
+                # Clearing the whole batch instead livelocks the delta path,
+                # where `group` pools every change into one batch: one stuck
+                # subject would retire nothing for the entire sweep, forever,
+                # and drag every healthy subject back through a revise call
+                # every tick. The failure is per-observation, so the
+                # bookkeeping has to be too.
+                covered -= observation.sources
 
         # A URI nothing read stays pending. On the delta path that is the whole
         # record of outstanding work, so it is read again next sweep.
+        #
+        # Nothing is retired when a write did not land: the delta is the only
+        # record that this change still needs reflecting on, and retiring it
+        # because the batch *reached* the write would lose the change to a
+        # failure that has nothing to do with it.
         retiring = [uri for uri in uris if uri in covered]
-        if retiring:
+        if retiring and not settings.dry_run:
+            # A dry run writes nothing, so it has reflected on nothing, so it
+            # must retire nothing. The watermark is already held back for it
+            # (`runner.run_sweep`); pendingness is the other record of progress
+            # and was not, so previewing a prompt change against a delta store
+            # silently consumed the queue it was previewing -- and switching
+            # the dry run off then found every one of those changes gone.
             await self._store.mark_reflected(retiring)
         missed = len(uris) - len(retiring)
         if missed:
@@ -660,18 +715,84 @@ class ReflectionEngine:
         report.consolidated += len(observations) - len(merged)
         return merged
 
-    async def _write(self, observation: Observation, report: SweepReport) -> None:
-        """Persist one observation and link it to every memory it cites."""
+    async def _write(
+        self,
+        observation: Observation,
+        report: SweepReport,
+        subjects: Collection[str] = (),
+    ) -> bool:
+        """Persist one observation and link it to every memory it cites.
+
+        An observation is filed under the memory it is about, so a subject
+        reflected on twice resolves to the file it already has. When one is
+        there, this revises it rather than writing beside it -- which is the
+        whole difference between an observation that evolves and a directory
+        full of snapshots nobody will ever reconcile.
+
+        Parameters
+        ----------
+        observation :
+            The verified observation to file.
+        report :
+            Counters for what was written, revised, and lost.
+        subjects :
+            The memories this batch reflected on, which is what the observation
+            is filed under.
+
+        Returns
+        -------
+        bool
+            Whether the observation reached the store. ``False`` means the
+            change it came from has not been reflected on and must stay pending.
+        """
+        try:
+            uri, standing = await self._store.resolve(observation, subjects)
+        except ObservationUnreadableError as exc:
+            # What is at `uri` is unknown, so writing would risk destroying a
+            # file that is still there. Skipped, and reported as unwritten so
+            # the change stays pending.
+            record_error(exc, "standing_unreadable", NAMESPACE)
+            logger.warning(
+                "ov-ext reflect: %s, so it is left untouched and the change "
+                "from %r stays pending",
+                exc,
+                observation.title,
+                exc_info=exc,
+            )
+            report.unwritten += 1
+            return False
+
         if self._settings.dry_run:
+            # Resolved first, and reported as the file it would really land in.
+            # Naming the best-ranked file instead hid the one thing a dry run is
+            # for: a claim that would be folded into an observation already
+            # standing somewhere else.
             logger.info(
-                "ov-ext reflect (dry run): would write %r citing %d memories",
+                "ov-ext reflect (dry run): would %s %s with %r, citing %d memories",
+                "revise" if standing is not None else "write",
+                uri,
                 observation.title,
                 len(observation.evidence),
             )
             report.written += 1
-            return
+            if standing is not None:
+                report.revised += 1
+            return True
 
-        uri = await self._store.write_observation(observation)
+        if standing is not None:
+            revised = await self._revise(standing, observation, uri, report)
+            if revised is None:
+                # The revise call failed. The standing file already covers this
+                # subject, so it is left exactly as it is: writing the new claim
+                # to a file of its own is the sprawl this exists to end, and
+                # overwriting a standing observation with one the model never
+                # got to reconcile would lose what it says. Reported as
+                # unwritten, so the change is read again rather than retired on
+                # the strength of a write that did not happen.
+                return False
+            observation = revised
+
+        uri = await self._store.write_observation(observation, uri=uri)
         for source_uri, quote in observation.evidence:
             # `derived_from` is OpenViking's own label for a summary drawn from
             # other memories, and `match_text` is already contracted to appear
@@ -684,3 +805,191 @@ class ReflectionEngine:
                 weight=1.0 / len(observation.evidence),
             )
         report.written += 1
+        return True
+
+    @traced("ov_ext.reflect.revise")
+    async def _revise(
+        self,
+        standing: Observation,
+        incoming: Observation,
+        uri: str,
+        report: SweepReport,
+    ) -> Observation | None:
+        """Fold a new observation into the one already written about a subject.
+
+        One model call, made only when a file is already there. It is given the
+        two claims and no quotes: the evidence on both sides has been verified
+        against the memories it cites, and asking the model to restate it would
+        put text nobody checked into a file whose every line is supposed to be
+        traceable. The merged evidence is attached here instead.
+
+        Parameters
+        ----------
+        standing :
+            The observation read back from ``uri``.
+        incoming :
+            What this sweep drew about the same subject.
+        uri :
+            The file being revised, whose name is shown to the model as the
+            subject so a revision does not drift onto whichever claim it read
+            last.
+        report :
+            Counters, for the revision and for a call that failed.
+
+        Returns
+        -------
+        Observation | None
+            The observation that now holds, or ``None`` when the model call
+            failed -- the caller then leaves the standing file alone.
+        """
+        try:
+            revision = await self._llm.complete(
+                revise_prompt(
+                    (standing.title, standing.content),
+                    (incoming.title, incoming.content),
+                    subject=uri.rsplit("/", 1)[-1].removesuffix(".md"),
+                ),
+                Revision,
+            )
+        except Exception as exc:  # the model is a network call; a revision may fail
+            record_error(exc, "revise_failed", NAMESPACE)
+            logger.warning(
+                "ov-ext reflect: revise call failed; %s left as it stands",
+                uri,
+                exc_info=exc,
+            )
+            report.unwritten += 1
+            return None
+
+        if revision is None:
+            annotate({"ov_ext.reflect.outcome": "revise_unparsed"})
+            logger.warning(
+                "ov-ext reflect: revise call returned nothing parseable; %s left "
+                "as it stands",
+                uri,
+            )
+            report.unwritten += 1
+            return None
+
+        evidence = await self._merged_evidence(incoming, standing)
+        if not evidence:
+            # Everything on both sides failed the freshness re-check, which the
+            # delta path can reach on its own: the incoming quote was verified
+            # against the captured change while the re-check reads the index,
+            # so index lag alone can empty the merge. An observation with no
+            # evidence is not one this store will write -- `write_observation`
+            # weights each link by 1/len -- and writing it would in any case
+            # replace a traceable file with an untraceable one.
+            logger.warning(
+                "ov-ext reflect: every quote for %s failed the freshness "
+                "re-check, so there is nothing left to write; left as it stands",
+                uri,
+            )
+            report.unwritten += 1
+            return None
+        report.revised += 1
+        return Observation(
+            # Falling back rather than accepting an empty string: a revision
+            # that came back blank in one field still carries a merge worth
+            # keeping in the other, and an untitled observation would be
+            # renamed from scratch by the next sweep that touched it.
+            title=revision.title.strip() or standing.title,
+            content=revision.content.strip() or standing.content,
+            evidence=evidence,
+            areas=areas_of(uri for uri, _ in evidence),
+        )
+
+    async def _merged_evidence(
+        self, incoming: Observation, standing: Observation
+    ) -> tuple[tuple[str, str], ...]:
+        """Evidence for a revised observation: this sweep's, then what stands.
+
+        Newest first, because the cap cuts the tail. An observation revised for
+        months would otherwise keep the quotes it was founded on forever and
+        drop the change that prompted the latest revision -- the wrong way
+        round, since the file is supposed to say what holds now.
+
+        Deduped on the normalised quote, exactly as verification dedupes it, so
+        the same span quoted again with a line break in a different place is one
+        piece of evidence and not two.
+
+        Carried-forward quotes are checked against the memory they cite *as it
+        is now*, and dropped when it no longer contains them. They were verified
+        when the standing observation was written, which may have been months
+        ago; a memory edited since leaves the file asserting a citation that is
+        no longer true, and every revision re-asserts it. This is the same
+        substring check verification runs, against freshly read rows -- the
+        `max_evidence` cap bounds how many quotes a file keeps, which is not the
+        same as keeping the ones that are still there.
+        """
+        merged: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for uri, quote in (*incoming.evidence, *standing.evidence):
+            key = (uri, normalise(quote))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append((uri, quote))
+
+        fresh = await self._still_supported(standing.evidence)
+        kept = [
+            (uri, quote)
+            for uri, quote in merged
+            if (uri, normalise(quote)) not in fresh or fresh[(uri, normalise(quote))]
+        ]
+        return tuple(self._capped(kept))
+
+    async def _still_supported(
+        self, evidence: Sequence[tuple[str, str]]
+    ) -> dict[tuple[str, str], bool]:
+        """Re-check carried-forward quotes against the memories they cite.
+
+        Returns
+        -------
+        dict[tuple[str, str], bool]
+            ``(uri, normalised quote)`` to whether the quote is still in the
+            memory. A memory this cannot read is absent from the result, and the
+            caller keeps its quotes: an index that will not answer is not
+            evidence that a citation went stale.
+        """
+        if not evidence:
+            return {}
+        try:
+            rows = await self._store.whole_memories(sorted({uri for uri, _ in evidence}))
+        except Exception as exc:
+            # Including ContentUnavailableError. Re-verification is a
+            # safeguard, not the write path, and refusing to revise because the
+            # check could not run would trade a stale quote for a frozen
+            # observation.
+            logger.warning(
+                "ov-ext reflect: could not re-check carried evidence; keeping it",
+                exc_info=exc,
+            )
+            return {}
+        texts = {row.uri: row.text for row in rows}
+        return {
+            (uri, normalise(quote)): quote_is_present(quote, texts[uri])
+            for uri, quote in evidence
+            if uri in texts
+        }
+
+    def _capped(self, evidence: Sequence[tuple[str, str]]) -> list[tuple[str, str]]:
+        """Trim evidence to the cap without dropping below the evidence floor.
+
+        The cap counts quotes and the floor counts distinct memories, so taking
+        the first ``max_evidence`` can leave an observation resting on one
+        source -- under the floor verification had just enforced, in a file that
+        still claims to be a synthesis. Quotes from memories not yet represented
+        are kept past the cap until the floor is met.
+        """
+        cap = self._settings.max_evidence
+        head = list(evidence[:cap])
+        sources = {uri for uri, _ in head}
+        for uri, quote in evidence[cap:]:
+            if len(sources) >= self._settings.min_evidence:
+                break
+            if uri in sources:
+                continue
+            sources.add(uri)
+            head.append((uri, quote))
+        return head
