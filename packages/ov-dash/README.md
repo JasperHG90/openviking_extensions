@@ -1,8 +1,9 @@
 # ov-dash
 
-A dashboard over OpenViking. People sign in with their Vault username and
-password; the dashboard keeps the credential that sign-in produces on the
-server and calls OpenViking as them. The browser never holds one.
+A dashboard over OpenViking. People press **Sign in with Vault** and sign in at
+Vault's own page; the dashboard keeps the credential that sign-in produces on
+the server and calls OpenViking as them. The browser never holds one, and no
+password ever passes through this code.
 
 ## Why it exists
 
@@ -12,36 +13,120 @@ browser half of the service does not work: Web Studio's credential page has
 nothing to offer, and every write surface needs a bearer token that Vault's
 provider will only mint through a browser redirect and will not refresh.
 
-This dashboard closes that gap without forking anything. A person proves who
-they are to Vault through the dashboard, and the dashboard mints the token
-OpenViking accepts on their behalf — the same thing the `ov` CLI does, done
-server-side so nobody needs the CLI.
+This dashboard closes that gap without forking anything. It *is* the browser
+redirect: it sends the person to Vault, and keeps the token Vault hands back.
 
-## Two ways to hold a credential
+## Three ways to hold a credential
 
 Which one a deployment uses is set by `AUTH_MODE`, and they are genuinely
 different — the Account page says which one is in force rather than assuming.
 
-**`vault-userpass` (what `.env.example` ships, and what the lab cluster needs;
-the schema's own default is `oidc`, so set this explicitly).** The sign-in
-form posts a Vault username and password. The dashboard logs into Vault with
-them, mints an OpenViking identity token from `identity/oidc/token/<role>`,
-hands the Vault login token straight back with `revoke-self`, and keeps the
-minted token in memory. The password is used once and never
-stored. **No API key exists anywhere in this mode**, so `KEY_SOURCE` is not
-read and nothing needs one.
+**`vault-oidc` (what `.env.example` ships; start here).** The sign-in page is
+one button. It sends the browser to Vault's OIDC provider with PKCE, a state
+and a nonce; Vault authenticates the person however it is configured to —
+password, MFA, anything — and redirects back with a code. The dashboard swaps
+that code for an ID token, verifies it against Vault's published keys, and
+keeps it: with a scope that templates `ov_account` and `ov_user`, that token is
+both who the person is and the credential OpenViking accepts. **No password
+reaches this dashboard**, and `KEY_SOURCE` is not read.
 
-The session ends at whichever runs out first, the minted token's own `exp` or
-`SESSION_TTL_SECONDS`, and nothing renews it — refreshing would need the
-password back. The cookie is written with that shorter lifetime, so the cookie
-and the token it carries never disagree, and the Account page shows the time.
+**`vault-userpass`.** The same job, for a deployment with no OIDC client
+registered. The sign-in form posts a Vault username and password; the dashboard
+logs into Vault with them, mints an OpenViking identity token from
+`identity/oidc/token/<role>`, hands the Vault login token straight back with
+`revoke-self`, and keeps the minted token in memory. The password is used once
+and never stored — but it is handled here, which is the reason to prefer
+`vault-oidc`. MFA cannot be added to this flow: the dashboard would have to
+carry the challenge itself.
+
+In both, the session ends at whichever runs out first — the token's own `exp`
+or `SESSION_TTL_SECONDS` — and nothing renews it. Vault advertises no refresh
+grant, so under `vault-oidc` set the client's `id_token_ttl` to how long a
+sitting should last. The cookie is written with that shorter lifetime, so the
+cookie and the token it carries never disagree, and the Account page shows the
+time.
 
 **`oidc` / `trusted-header` / `dev`.** Identity arrives from a provider, a
 proxy, or configuration, and the dashboard resolves a *key* for that person on
 every request from `KEY_SOURCE` — Vault KV, a static map, or one environment
 variable. This is where the API-key story applies.
 
-## How a Vault sign-in works
+## How signing in with Vault works
+
+1. The browser asks for a page. There is no session, so it lands on Sign in —
+   one button that says where it will send you.
+2. `/auth/login` builds Vault's authorization URL with PKCE, a state and a
+   nonce, stashes all three in a short-lived signed cookie, and redirects.
+3. Vault authenticates the person at its own page and redirects back to
+   `/auth/callback` with a code.
+4. The dashboard swaps the code for an ID token — client secret and PKCE
+   verifier both — and verifies the signature against the provider's JWKS, the
+   issuer, the audience, and the nonce it stashed.
+5. `ov_account` and `ov_user` are read out of the verified token. They are not
+   a claim mapped onto an identity: they *are* the identity OpenViking will
+   answer as, which is why nothing here derives a user from an email.
+6. Token and identity go into the session store, and the browser is given a
+   cookie naming it. Every later request calls OpenViking with the token the
+   server is holding.
+
+The access token is thrown away. Vault's is opaque to everything but its own
+`userinfo` endpoint — presenting one to Vault's API answers `permission denied`
+— so the ID token is the only half of the exchange that is worth anything, and
+reading the wrong one is the classic way to get this backwards.
+
+### What Vault needs, once
+
+Three new resources in `identity/oidc`, beside the key and the identity-token
+role a Vault-backed OpenViking already has:
+
+```hcl
+# The claims. The same template the identity-token role already uses — nothing
+# shares it between the two features, and a provider without this issues tokens
+# that say nothing about who signed in. The placeholders are deliberately
+# unquoted: Vault substitutes a JSON string itself, and refuses a template that
+# quotes them with "error parsing template JSON" — at apply time, not at login.
+resource "vault_identity_oidc_scope" "openviking" {
+  name        = "openviking"
+  description = "OpenViking identity"
+  template    = "{\"ov_account\":{{identity.entity.metadata.ov_account}},\"ov_user\":{{identity.entity.metadata.ov_user}}}"
+}
+
+# Who may sign in. Miss this and Vault refuses the authorize request, which is
+# the easiest step to forget: every other piece exists and nobody can get in.
+resource "vault_identity_oidc_assignment" "ov_dash" {
+  name       = "ov-dash"
+  entity_ids = [vault_identity_entity.jasper.id]   # or group_ids
+}
+
+resource "vault_identity_oidc_client" "ov_dash" {
+  name             = "ov-dash"
+  key              = vault_identity_oidc_key.openviking.name  # the existing key
+  redirect_uris    = ["https://dash.example.com/auth/callback"]
+  assignments      = [vault_identity_oidc_assignment.ov_dash.name]
+  client_type      = "confidential"
+  id_token_ttl     = 28800   # how long a sitting lasts; nothing renews it
+  access_token_ttl = 1800
+}
+
+# And the provider must offer the scope and allow this client:
+#   scopes_supported   = ["openviking"]
+#   allowed_client_ids = [..., vault_identity_oidc_client.ov_dash.client_id]
+# as must the signing key's own allowed_client_ids.
+```
+
+`client_id` and `client_secret` are generated by Vault — read them back out and
+put them in `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET`. Whoever signs in must be
+in the assignment, and their entity must carry `ov_account` and `ov_user`
+metadata; without the metadata the template renders nothing and the sign-in is
+refused with "that token carries no ov_account/ov_user claims".
+
+One thing this dashboard cannot check for you: **OpenViking has to accept that
+token.** Its OIDC plugin verifies against Vault's discovery document and JWKS,
+and an ID token from the provider carries a different issuer and audience than
+one minted from `identity/oidc/token/<role>`. If OpenViking pins either, add
+the `ov-dash` client id to what it allows.
+
+## How a Vault password sign-in works
 
 1. The browser asks for a page. There is no session, so it lands on Sign in.
 2. The form posts to `/auth/vault-login`, guarded like every other
@@ -60,11 +145,11 @@ variable. This is where the API-key story applies.
    cookie naming it. Every later request looks the session up and calls
    OpenViking with the token the server is holding.
 
-Signing out deletes the session. The cookie names a session the server holds,
-so dropping the entry kills every copy of that cookie at once — not just the
-browser that asked. The minted token stays valid until it expires (a signed JWT,
-and Vault offers no way to withdraw one early), but nothing can present it as
-that person once the session is gone.
+Signing out deletes the session, in both Vault modes. The cookie names a session
+the server holds, so dropping the entry kills every copy of that cookie at once
+— not just the browser that asked. The token stays valid until it expires (a
+signed JWT, and Vault offers no way to withdraw one early), but nothing can
+present it as that person once the session is gone.
 
 ### The sessions live in this process
 
@@ -84,24 +169,21 @@ Two consequences, both deliberate:
   would be signed out whenever the load balancer sent them to the other one.
   Scaling out needs a shared store, not this.
 
-## How an OIDC sign-in works
+## How an `oidc` sign-in works
 
-1. `/auth/login` builds an authorization URL with PKCE, a state and a nonce, and
-   stashes all three in a short-lived signed cookie.
-2. The provider authenticates the person and redirects back to
-   `/auth/callback` with a code.
-3. The dashboard swaps the code for an ID token, verifies its signature against
-   the provider's JWKS, and checks the nonce came back unchanged.
+Same first three steps as above, against any provider. Then it diverges:
+
 4. A claim from that token becomes the OpenViking user (`email-local` by
-   default: `jasper@example.com` → `jasper`). That identity goes into a signed
-   session cookie — an identity, never a credential.
+   default: `jasper@example.com` → `jasper`). That identity goes into the
+   session — an identity, never a credential.
 5. Every later request resolves that user's key from `KEY_SOURCE` and calls
    OpenViking with it.
 
-The session deliberately outlives the ID token here. Vault's provider advertises
-no refresh grant, so its token dies in about an hour; the dashboard only needs
-it to learn who someone is. Tying the session to it would sign people out
-hourly and buy nothing.
+The session deliberately outlives the ID token here, which is the one place
+these two modes disagree. The token is only used to learn who someone is, so
+tying the session to a token that dies in an hour and cannot be refreshed would
+sign people out hourly and buy nothing. Under `vault-oidc` the token is the
+credential, so the session ends with it.
 
 ## What it shows
 
@@ -273,16 +355,18 @@ value names itself.
 
 The three that decide the shape:
 
-- `AUTH_MODE` — `vault-userpass` (the dashboard signs people into Vault and
-  mints the token OpenViking accepts — the one that works against a
-  Vault-backed OpenViking), `oidc` (the dashboard runs an OIDC login itself,
-  for a provider whose tokens OpenViking accepts), `trusted-header` (a proxy
-  already did it), or `dev` (one fixed identity).
+- `AUTH_MODE` — `vault-oidc` (the person signs in at Vault and the ID token is
+  the credential), `vault-userpass` (a password form; the dashboard mints the
+  token itself), `oidc` (a redirect against some other provider, keeping only
+  an identity), `trusted-header` (a proxy already did it), or `dev` (one fixed
+  identity).
 - `KEY_SOURCE` — `vault` (per-person keys from KV), `static-map` (a JSON object),
-  or `env` (one key for everyone; single-user or local only).
-- `IDENTITY_FROM` — which claim becomes the OpenViking user. Vault's `sub` is an
-  entity id and will not match a username, which is why the default is
-  `email-local`.
+  or `env` (one key for everyone; single-user or local only). Not read by the
+  two Vault modes, where the sign-in produces the credential.
+- `IDENTITY_FROM` — which claim becomes the OpenViking user, under `oidc` and
+  `trusted-header`. Vault's `sub` is an entity id and will not match a
+  username, which is why the default is `email-local`. The Vault modes read
+  `ov_user` out of the token instead and ignore this.
 
 ### The identity is the data path, so it is checked three times
 
@@ -366,7 +450,8 @@ files.
 ## Run it
 
 ```bash
-cp .env.example .env      # fill in OV_URL, SESSION_SECRET, VAULT_ADDR
+cp .env.example .env      # fill in OV_URL, SESSION_SECRET, PUBLIC_ORIGIN
+                          # and the OIDC client Vault generated
 docker compose up --build
 ```
 
@@ -453,8 +538,8 @@ every script block.
 Nothing in this dashboard. `viking://` URIs are checked for their scheme and
 passed upstream, so a read is scoped by exactly one thing: the credential
 OpenViking answers as. That is the premise the whole design rests on, and it
-holds wherever each person has their own credential — `vault-userpass`, or
-`KEY_SOURCE=vault`.
+holds wherever each person has their own credential — `vault-oidc`,
+`vault-userpass`, or `KEY_SOURCE=vault`.
 
 It does **not** hold under `KEY_SOURCE=env`, where one key serves every caller.
 There, anyone who can sign in can read anyone else's tree by asking for their
@@ -497,12 +582,67 @@ an array answers correctly at `limit <= 10` and returns zero above it, while
 either scope alone is fine at any limit. So `find` runs once per scope and the
 results are merged here — see the comment on `OvClient.find`.
 
+## The redirect sign-in, measured
+
+Run against a throwaway Vault (`just test-integration`) on 11 Sep 2026, with a
+provider, a client and an `openviking` scope configured the way the HCL above
+describes. What it settled:
+
+- A scope templating entity metadata **does** put `ov_account` and `ov_user` in
+  the provider's ID token, alongside `sub` (the entity id) and `aud` (the client
+  id). Without the scope the same login returns a token carrying neither, and
+  the dashboard refuses it rather than signing anyone in as nobody.
+- The **access token is useless**: presenting it to Vault's API answers
+  `permission denied`, and it opens only `identity/oidc/provider/<name>/userinfo`.
+  So a redirect sign-in cannot mint from `identity/oidc/token/<role>` — the ID
+  token is the credential or there is none.
+- Vault's dev mode builds the issuer and JWKS URL from `VAULT_API_ADDR`, whose
+  default is `http://0.0.0.0:8200`. Left alone, discovery declares an issuer
+  that will never match and publishes keys at an address nothing can fetch.
+- A quoted placeholder in a template (`"{{identity.entity.metadata.x}}"`) is
+  refused when the scope is written, not when a token is issued.
+
+`tests/vault-live.integration.ts` runs the whole dance against those endpoints —
+real discovery, a real authorization code, the PKCE exchange, and a signature
+checked against keys Vault published — and the built server was driven through
+the same sign-in over HTTP.
+
 ## What is still not verified
 
-The OIDC login flow itself. Every run above used `AUTH_MODE=dev` with a token
-lifted from `ovx`, because the dashboard is not yet registered as a client with
-Vault's OIDC provider. Discovery, PKCE, the callback and JWKS verification are
-covered by unit tests against a stubbed provider, not by a real sign-in.
+**That the lab cluster's OpenViking accepts this token.** Its OIDC plugin
+verifies against Vault's discovery document, and a provider ID token carries a
+different issuer and audience from the minted identity token the dashboard sends
+today. `auth.md` records that oauth2-proxy forwards exactly this kind of token
+and the server accepts it, which is the reason to expect it to work — but it has
+not been tried from here. If it is refused, the fix is on the OpenViking side:
+allow the `ov-dash` client id.
+
+Worth settling before deploying, once the Vault resources exist. Your own Vault
+token stands in for the browser, and PKCE is optional for a confidential client,
+so it is two calls and a third:
+
+```bash
+CLIENT=...            # vault read identity/oidc/client/ov-dash
+SECRET=...
+AUTH=$(curl -sG -H "x-vault-token: $(cat ~/.vault-token)" \
+  --data-urlencode "client_id=$CLIENT" \
+  --data-urlencode "redirect_uri=https://dash.example.com/auth/callback" \
+  --data-urlencode "response_type=code" \
+  --data-urlencode "scope=openid openviking" \
+  --data-urlencode "state=x" --data-urlencode "nonce=y" \
+  "$VAULT_ADDR/v1/identity/oidc/provider/<provider>/authorize")
+
+ID=$(curl -s -u "$CLIENT:$SECRET" \
+  -d "grant_type=authorization_code&code=$(jq -r .code <<<"$AUTH")" \
+  -d "redirect_uri=https://dash.example.com/auth/callback" \
+  "$VAULT_ADDR/v1/identity/oidc/provider/<provider>/token" | jq -r .id_token)
+
+# The question. A 200 means the dashboard will work; a 401 means widen what
+# OpenViking accepts.
+curl -s -o /dev/null -w '%{http_code}\n' -H "X-API-Key: $ID" \
+  "$OV_URL/api/v1/fs/ls?uri=viking://user/<you>"
+```
 
 `KEY_SOURCE=vault` is likewise untested end to end: the Vault token on this
-machine was expired, so keys came from `KEY_SOURCE=env`.
+machine was expired, so keys came from `KEY_SOURCE=env`. It is not read by
+either Vault mode.

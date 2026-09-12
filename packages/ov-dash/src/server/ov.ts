@@ -231,10 +231,10 @@ export class OvClient {
     /**
      * A credential the caller already holds.
      *
-     * `AUTH_MODE=vault-userpass` mints one during sign-in and keeps it in the
-     * session, so there is nothing to look up: passing it here skips the key
-     * resolver entirely rather than asking Vault for a key that does not
-     * exist.
+     * Both Vault modes hold one in the session — minted under
+     * `vault-userpass`, the verified ID token under `vault-oidc` — so there is
+     * nothing to look up: passing it here skips the key resolver entirely
+     * rather than asking Vault for a key that does not exist.
      */
     credential?: string,
   ): Promise<OvClient> {

@@ -8,10 +8,16 @@
  *
  * Two things about Vault's provider shape this module. It advertises only the
  * authorization-code grant — no device flow, no client credentials, and no
- * refresh — so the ID token is used once, at login, to learn who someone is and
- * is then discarded. And its `sub` is an entity id rather than a username, so
- * the identity a person maps to comes from a configurable claim (see
- * {@link Config.IDENTITY_FROM}), not from `sub`.
+ * refresh — so nothing here can renew a token, and a session lasts as long as
+ * the token it was given. And its `sub` is an entity id rather than a username,
+ * so under `oidc` the identity a person maps to comes from a configurable claim
+ * (see {@link Config.IDENTITY_FROM}), not from `sub`.
+ *
+ * Under `vault-oidc` nothing is mapped at all: the token carries `ov_account`
+ * and `ov_user` — put there by a Vault scope that templates them from entity
+ * metadata — and those *are* the identity OpenViking answers as. Which is why
+ * this module hands back the verified token and its claims, and lets the caller
+ * decide which of the two it is holding.
  */
 
 import { createHash, randomBytes } from "node:crypto";
@@ -19,7 +25,7 @@ import { createRemoteJWKSet, jwtVerify } from "jose";
 import { z } from "zod";
 import type { Viewer } from "../shared/schemas";
 import type { Config } from "./env";
-import { redirectUri } from "./env";
+import { redirectUri, scopes } from "./env";
 import { requireUserId } from "./identity";
 
 /** The parts of a discovery document this flow needs. */
@@ -40,6 +46,21 @@ const tokenResponseSchema = z.object({
   token_type: z.string().optional(),
   expires_in: z.number().optional(),
 });
+
+/** A signed-in login: the ID token, and what its signature vouches for. */
+export interface VerifiedLogin {
+  /**
+   * The raw `id_token`.
+   *
+   * Deliberately not the `access_token`. Vault's access token is opaque to
+   * everything but its own `userinfo` endpoint — measured: presenting one to
+   * Vault's API answers `permission denied` — so the ID token is the only half
+   * of the exchange anything downstream can use.
+   */
+  idToken: string;
+  /** Claims from that token, after the signature, issuer and nonce checks. */
+  claims: Record<string, unknown>;
+}
 
 /** Raised when the provider or the browser gives us something unusable. */
 export class OidcError extends Error {
@@ -139,8 +160,10 @@ export class OidcClient {
    * Build the URL to send the browser to, and the state to remember.
    *
    * @returns The authorize URL and the PKCE/state values to stash in a cookie.
-   *   The caller is responsible for stashing them; this method holds no state,
-   *   so two logins in two tabs cannot overwrite each other's verifier.
+   *   The caller is responsible for stashing them. This method holds no state
+   *   of its own — though the cookie it is stashed in is one per browser, so a
+   *   second sign-in started in a second tab does replace the first tab's
+   *   values, and the callback sends that tab back to the sign-in page.
    */
   authorize(): {
     url: string;
@@ -157,7 +180,7 @@ export class OidcClient {
     url.searchParams.set("response_type", "code");
     url.searchParams.set("client_id", this.config.OIDC_CLIENT_ID ?? "");
     url.searchParams.set("redirect_uri", redirectUri(this.config));
-    url.searchParams.set("scope", this.config.OIDC_SCOPES);
+    url.searchParams.set("scope", scopes(this.config));
     url.searchParams.set("state", state);
     url.searchParams.set("nonce", nonce);
     url.searchParams.set("code_challenge", challenge);
@@ -167,17 +190,23 @@ export class OidcClient {
   }
 
   /**
-   * Swap an authorization code for a verified identity.
+   * Swap an authorization code for a verified ID token.
+   *
+   * The token comes back beside its claims rather than as an identity, because
+   * what it is worth depends on who issued it: from Vault it is the credential
+   * OpenViking accepts, from anyone else it is only a statement about who
+   * signed in. Deciding that here would mean this module knowing which
+   * deployment it is in.
    *
    * @param code - The `code` parameter the provider sent back.
    * @param verifier - The PKCE verifier stashed when the flow began.
    * @param nonce - The nonce stashed when the flow began; the ID token must
    *   carry it back, which is what stops a token minted for another login from
    *   being replayed into this one.
-   * @returns The claims, mapped onto a viewer.
+   * @returns The ID token, and the claims its signature vouches for.
    * @throws OidcError - When the exchange fails or the token does not verify.
    */
-  async exchange(code: string, verifier: string, nonce: string): Promise<Viewer> {
+  async exchange(code: string, verifier: string, nonce: string): Promise<VerifiedLogin> {
     const body = new URLSearchParams({
       grant_type: "authorization_code",
       code,
@@ -242,7 +271,7 @@ export class OidcClient {
       throw new OidcError("id_token nonce did not match this login", 401);
     }
 
-    return viewerFromClaims(this.config, claims);
+    return { idToken: parsed.data.id_token, claims };
   }
 }
 

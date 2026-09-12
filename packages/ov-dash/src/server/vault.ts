@@ -1,21 +1,23 @@
 /**
- * Signing in through Vault, and minting the token OpenViking accepts.
+ * Signing in through Vault with a password, and minting the token OpenViking
+ * accepts.
  *
- * There are two different Vault OIDC features here and they are not
- * interchangeable, which is the whole reason this module exists:
+ * There are two different Vault OIDC features, and this module is the second:
  *
- * - `identity/oidc/provider/<name>` is the browser login. Measured against the
- *   lab provider, its ID tokens carry `scopes_supported: ["openid"]` and
- *   `claims_supported: []`, and their issuer is Vault's `api_addr`. They say
- *   almost nothing about who you are.
+ * - `identity/oidc/provider/<name>` is the browser login — `AUTH_MODE=vault-oidc`,
+ *   which needs none of this file. A provider with no custom scope issues ID
+ *   tokens that say almost nothing (measured against the lab provider:
+ *   `scopes_supported: ["openid"]`, `claims_supported: []`), which is why that
+ *   mode asks for a scope templating `ov_account` and `ov_user`.
  * - `identity/oidc/token/<role>` mints an *identity token* for whoever is
- *   calling. Those carry the `ov_account` and `ov_user` claims OpenViking maps
- *   identity from, under the issuer OpenViking trusts.
+ *   calling. Those carry the same two claims, and getting one means holding a
+ *   Vault token — so it is the password flow's answer, not the redirect's. A
+ *   redirect leaves the dashboard holding an access token Vault's own API
+ *   refuses.
  *
- * So the login flow cannot hand its ID token to OpenViking — wrong issuer,
- * wrong audience, none of the claims. What works is: authenticate the person to
- * Vault, then mint an identity token *as them*. That is exactly what the `ov`
- * CLI does, done server-side so nobody needs the CLI.
+ * So: authenticate the person to Vault with their password, then mint an
+ * identity token *as them*. That is exactly what the `ov` CLI does, done
+ * server-side so nobody needs the CLI.
  */
 
 import { decodeJwt } from "jose";
@@ -53,20 +55,27 @@ const mintSchema = z.object({
   }),
 });
 
-/** The identity claims OpenViking reads out of a minted token. */
+/**
+ * The identity claims OpenViking reads out of a token.
+ *
+ * No length floor here on purpose: an empty claim is refused a few lines below
+ * by `requireUserId`, whose pattern needs at least one character. Adding
+ * `.min(1)` looked like a second guard and was a dead one — nothing could
+ * reach it.
+ */
 const claimsSchema = z.object({
   ov_account: z.string(),
   ov_user: z.string(),
   exp: z.number().optional(),
 });
 
-/** A minted credential and the identity it speaks for. */
+/** A credential and the identity it speaks for. */
 export interface VaultCredential {
   /** The signed JWT to present to OpenViking. */
   token: string;
   viewer: Viewer;
-  /** Unix seconds the token expires at, or null when it says nothing. */
-  expiresAt: number | null;
+  /** Unix seconds the token expires at. A credential without one is refused. */
+  expiresAt: number;
 }
 
 function base(config: Config): string {
@@ -212,25 +221,57 @@ export function credentialFrom(token: string): VaultCredential {
   } catch (error) {
     throw new VaultError(`that token is not a readable JWT: ${(error as Error).message}`);
   }
+  return credentialFromClaims(token, raw);
+}
 
-  const parsed = claimsSchema.safeParse(raw);
+/**
+ * Same, for a token whose claims have already been read.
+ *
+ * The redirect sign-in verifies its ID token against the provider's keys, and
+ * decoding it a second time here would throw that verification away — the
+ * claims that matter would come from an unchecked parse of the same string.
+ * This takes the checked ones instead, and the two paths still end at one
+ * mapping.
+ *
+ * @param token - The token as it will be presented to OpenViking.
+ * @param claims - Its claims, read by whoever verified it.
+ * @returns The credential and the viewer it speaks for.
+ * @throws VaultError - When the claims carry no OpenViking identity.
+ */
+export function credentialFromClaims(token: string, claims: unknown): VaultCredential {
+  const parsed = claimsSchema.safeParse(claims);
   if (!parsed.success) {
     throw new VaultError(
       "that token carries no ov_account/ov_user claims, so OpenViking cannot resolve an identity from it — " +
-        "the Vault role has to template those claims",
+        "the Vault role (or, for a redirect sign-in, the scope this dashboard asks for) has to template those claims",
       403,
     );
   }
 
   const { ov_account: account, ov_user: user, exp } = parsed.data;
-  // The same check every other identity path gets: this becomes a path segment
-  // in viking://user/<id>, so it must be one segment.
+  // The same check every other identity path gets: both become path segments in
+  // the templated root — `viking://user/<id>`, and `{account}` wherever OV_ROOT
+  // puts it — so each must be one segment. The account is checked here and not
+  // only where a write is scoped: the read paths build their root straight from
+  // the viewer, so an account of "../.." reached OpenViking as a uri climbing
+  // out of the tree it was meant to name.
   requireUserId(user, "ov_user");
+  requireUserId(account, "ov_account");
+
+  if (exp === undefined) {
+    // A credential session is capped by the token's own expiry, so a token that
+    // never says when it ends would quietly get the full session length — the
+    // one case where "it said nothing" must not mean "take the maximum".
+    throw new VaultError(
+      "that token does not say when it expires, so there is no honest length for a session holding it",
+      403,
+    );
+  }
 
   return {
     token,
     viewer: { sub: user, name: user, email: "", account, user },
-    expiresAt: exp ?? null,
+    expiresAt: exp,
   };
 }
 

@@ -65,8 +65,13 @@ jobs:
           # changed dev-mode defaults would otherwise turn CI red, and block
           # releases, on a day nobody touched the repo.
           docker rm -f ovdash-vault > /dev/null 2>&1 || true
+          # VAULT_API_ADDR is load-bearing: an OIDC provider builds its issuer
+          # and JWKS URL from it, and dev mode's default is http://0.0.0.0:8200
+          # -- an issuer that never matches the one the suite configures, and
+          # keys at an address nothing can fetch. Matches ov-dash's justfile.
           docker run -d --name ovdash-vault -p 18200:8200 \
-            -e VAULT_DEV_ROOT_TOKEN_ID=root hashicorp/vault:2.1.0
+            -e VAULT_DEV_ROOT_TOKEN_ID=root \
+            -e VAULT_API_ADDR=http://127.0.0.1:18200 hashicorp/vault:2.1.0
 
           # Bounded at roughly three minutes, so a container that never comes
           # up fails on its own rather than sitting against the job timeout.
