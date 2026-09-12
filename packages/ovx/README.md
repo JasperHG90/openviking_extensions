@@ -171,6 +171,37 @@ The password is read straight from `/dev/tty` with echo off and sent in the
 request body, so it never reaches `argv`, the environment, your shell history,
 or a log. It cannot be piped in, deliberately.
 
+### A second factor
+
+Where the mount enforces MFA, Vault answers the password with a challenge
+instead of a token, and `ovx` asks for the code:
+
+```
+$ ovx -L lab
+ovx: no Vault session.
+Vault username [jasper]: operator
+Password for operator:
+TOTP passcode:
+ovx: logged in. Token stored for profile 'lab'.
+```
+
+The passcode is read the same way as the password and validated in its own
+request, which carries no session token — it is finishing a login, so there is
+no session yet to present. What comes back is an ordinary session token, cached
+in the same file, so nothing else about logging in changes.
+
+A method that pushes to a device instead of issuing a code — Duo, Okta, PingID —
+is not prompted for. `ovx` says to approve it there and waits:
+
+```
+ovx: approve the duo request on your device.
+```
+
+Where two enforcements match one login, Vault wants both satisfied. `ovx` can
+answer one, so it says which two and stops, rather than answering the first and
+failing on an enforcement you were never prompted for. The `vault` CLI refuses
+that case as well.
+
 The token lands at `~/.ovx/tokens/lab.json`, mode `600`. It is an RS256 JWT
 carrying an `ov_account` claim, which is how the server works out who you are.
 
