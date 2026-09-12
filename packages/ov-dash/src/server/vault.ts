@@ -1,23 +1,27 @@
 /**
- * Signing in through Vault with a password, and minting the token OpenViking
- * accepts.
+ * Getting a Vault session for a person, and minting the token OpenViking
+ * accepts from it.
  *
- * There are two different Vault OIDC features, and this module is the second:
+ * Both sign-ins end here, and they differ only in how the session is got:
+ * `vault-userpass` posts a password, `vault-oidc` hands back the ID token a
+ * browser redirect produced. From there it is one path — mint, revoke, keep the
+ * minted token — which is exactly what the `ov` CLI does, done server-side so
+ * nobody needs the CLI.
  *
- * - `identity/oidc/provider/<name>` is the browser login — `AUTH_MODE=vault-oidc`,
- *   which needs none of this file. A provider with no custom scope issues ID
- *   tokens that say almost nothing (measured against the lab provider:
- *   `scopes_supported: ["openid"]`, `claims_supported: []`), which is why that
- *   mode asks for a scope templating `ov_account` and `ov_user`.
- * - `identity/oidc/token/<role>` mints an *identity token* for whoever is
- *   calling. Those carry the same two claims, and getting one means holding a
- *   Vault token — so it is the password flow's answer, not the redirect's. A
- *   redirect leaves the dashboard holding an access token Vault's own API
- *   refuses.
+ * Two different Vault OIDC features meet in that sentence, and confusing them
+ * is what makes this module look redundant:
  *
- * So: authenticate the person to Vault with their password, then mint an
- * identity token *as them*. That is exactly what the `ov` CLI does, done
- * server-side so nobody needs the CLI.
+ * - `identity/oidc/provider/<name>` is the browser login. Its ID tokens carry
+ *   the provider's issuer and the client's id, and say nothing at all unless a
+ *   scope templates `ov_account`/`ov_user` (measured against the lab provider
+ *   with no scope: `scopes_supported: ["openid"]`, `claims_supported: []`).
+ * - `identity/oidc/token/<role>` mints an *identity token*, under the issuer
+ *   and audience OpenViking pins. Getting one means holding a Vault token.
+ *
+ * OpenViking takes the second and refuses the first, and it cannot be made to
+ * take both — one auth mode is one plugin, with one issuer and one audience. So
+ * the redirect's ID token is spent, not presented: it buys a session at the JWT
+ * mount, and the session mints the credential.
  */
 
 import { decodeJwt } from "jose";
@@ -31,10 +35,15 @@ export class VaultError extends Error {
   /**
    * @param message - What failed. Never contains a password or a token.
    * @param status - HTTP status the request should end with.
+   * @param code - Machine-readable reason. `VAULT_REFUSED` means Vault gave an
+   *   answer and the answer was no; `VAULT_UNAVAILABLE` means it could not give
+   *   one — sealed, standby, rate-limited. Both used to report as a refusal,
+   *   which pointed an outage at whoever configured the thing.
    */
   constructor(
     message: string,
     readonly status = 502,
+    readonly code: "VAULT_REFUSED" | "VAULT_UNAVAILABLE" = "VAULT_REFUSED",
   ) {
     super(message);
     this.name = "VaultError";
@@ -160,6 +169,80 @@ export async function login(
 }
 
 /**
+ * Trade a verified OIDC ID token for a Vault session token.
+ *
+ * This is what lets a redirect sign-in end up holding the token OpenViking
+ * already trusts. The browser flow leaves the dashboard with an ID token from
+ * Vault's *provider*, whose issuer and audience OpenViking does not accept and
+ * cannot be made to accept without breaking every other client. Vault's JWT
+ * auth method takes that same token back and answers with a session token for
+ * the person it names — and from there the ordinary mint applies.
+ *
+ * The access token from the same exchange is useless for this. Measured: it is
+ * opaque to Vault's API, which answers `permission denied` to everything but
+ * its own `userinfo`.
+ *
+ * The role does the checking. It binds the audience to this dashboard's client
+ * id, so a token minted for some other client of the same Vault is refused, and
+ * it takes the person's id from the `ov_user` claim.
+ *
+ * @param config - Supplies the Vault address, the JWT mount and the role.
+ * @param idToken - An ID token whose signature, issuer, audience and nonce have
+ *   already been checked. Vault checks the first three again; nothing here
+ *   relies on it being the only check.
+ * @returns The Vault client token.
+ * @throws VaultError - When Vault refuses it, or cannot be reached.
+ */
+export async function exchangeIdToken(config: Config, idToken: string): Promise<string> {
+  const role = config.VAULT_JWT_ROLE;
+  const url = `${base(config)}/v1/auth/${config.VAULT_JWT_MOUNT}/login`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { ...headers(config), "content-type": "application/json" },
+    body: JSON.stringify({ role, jwt: idToken }),
+    redirect: "manual",
+    signal: AbortSignal.timeout(config.OV_TIMEOUT_MS),
+  }).catch((error: Error) => {
+    throw new VaultError(`could not reach Vault: ${error.message}`);
+  });
+
+  if (!response.ok) {
+    // Vault's own words name the cause far better than the status does — an
+    // unbound audience, a role that does not exist, a mount with no
+    // configuration. All of that is ours to fix and none of it is the person's
+    // business, so it is logged rather than returned.
+    const why = await detail(response);
+    console.warn(
+      `vault would not accept the sign-in at ${config.VAULT_JWT_MOUNT} role ${role}: HTTP ${response.status} ${why}`.trim(),
+    );
+
+    // "Vault refused this" and "Vault is not well" are different events and
+    // must not read the same. Collapsing them made a sealed Vault, a standby
+    // redirect and a rate limit all report a misconfigured role — so an outage
+    // looked like something an operator had done, and never showed up as a 5xx.
+    if (response.status === 400 || response.status === 401 || response.status === 403) {
+      throw new VaultError(
+        "Vault would not turn this sign-in into a session — the dashboard is signed in, " +
+          "but its JWT role does not accept the token",
+        403,
+      );
+    }
+    throw new VaultError(
+      `Vault could not answer this sign-in: HTTP ${response.status}`,
+      502,
+      "VAULT_UNAVAILABLE",
+    );
+  }
+
+  const parsed = loginSchema.safeParse(await response.json());
+  if (!parsed.success) {
+    throw new VaultError("Vault accepted the sign-in but returned no token");
+  }
+  return parsed.data.auth.client_token;
+}
+
+/**
  * Mint an OpenViking identity token for whoever holds `vaultToken`.
  *
  * The role decides the audience, the claims and the lifetime, so this asks for
@@ -221,29 +304,12 @@ export function credentialFrom(token: string): VaultCredential {
   } catch (error) {
     throw new VaultError(`that token is not a readable JWT: ${(error as Error).message}`);
   }
-  return credentialFromClaims(token, raw);
-}
 
-/**
- * Same, for a token whose claims have already been read.
- *
- * The redirect sign-in verifies its ID token against the provider's keys, and
- * decoding it a second time here would throw that verification away — the
- * claims that matter would come from an unchecked parse of the same string.
- * This takes the checked ones instead, and the two paths still end at one
- * mapping.
- *
- * @param token - The token as it will be presented to OpenViking.
- * @param claims - Its claims, read by whoever verified it.
- * @returns The credential and the viewer it speaks for.
- * @throws VaultError - When the claims carry no OpenViking identity.
- */
-export function credentialFromClaims(token: string, claims: unknown): VaultCredential {
-  const parsed = claimsSchema.safeParse(claims);
+  const parsed = claimsSchema.safeParse(raw);
   if (!parsed.success) {
     throw new VaultError(
       "that token carries no ov_account/ov_user claims, so OpenViking cannot resolve an identity from it — " +
-        "the Vault role (or, for a redirect sign-in, the scope this dashboard asks for) has to template those claims",
+        "the Vault role has to template those claims, and the person has to have an entity that carries them",
       403,
     );
   }
@@ -350,4 +416,63 @@ export async function signIn(
     // token behind as one that succeeds.
     await revokeSelf(config, vaultToken);
   }
+}
+
+/**
+ * The same, for somebody who has just signed in at Vault's own page.
+ *
+ * Identical after the first step, which is the point: what the session ends up
+ * holding is the token OpenViking already accepts, not the one the browser flow
+ * happened to produce.
+ *
+ * @param config - Validated configuration.
+ * @param idToken - The verified ID token from the callback.
+ * @param expected - The identity the ID token claimed, checked against the one
+ *   the minted token carries. Both halves: the account is as much of the
+ *   identity as the user is — it is the account header on every call and
+ *   `{account}` in the templated root — so two entities that share a user name
+ *   and differ in account are exactly the misroute worth catching.
+ *
+ *   They come from the same entity metadata by two routes, the provider's scope
+ *   and the role's template, so they agree unless the JWT mount's entity alias
+ *   points somewhere else. That misconfiguration hands this person another
+ *   person's credential, and neither token shows it alone.
+ * @returns The OpenViking credential and the identity it carries.
+ * @throws VaultError - When Vault refuses, or the two identities disagree.
+ */
+export async function signInWithIdToken(
+  config: Config,
+  idToken: string,
+  expected: { account: string; user: string },
+): Promise<VaultCredential> {
+  // No "check it if we were given one": an empty expectation would turn the
+  // comparison below into a no-op, silently, for whoever called it that way.
+  if (!expected.account || !expected.user) {
+    throw new VaultError(
+      "this sign-in carries no identity to check Vault's answer against",
+      403,
+    );
+  }
+
+  const vaultToken = await exchangeIdToken(config, idToken);
+  let credential: VaultCredential;
+  try {
+    credential = await mint(config, vaultToken);
+  } finally {
+    await revokeSelf(config, vaultToken);
+  }
+
+  const got = credential.viewer;
+  if (got.user !== expected.user || got.account !== expected.account) {
+    console.warn(
+      `vault minted ${got.account}/${got.user} after a sign-in by ` +
+        `${expected.account}/${expected.user} — check the entity alias on the ` +
+        `${config.VAULT_JWT_MOUNT} mount`,
+    );
+    throw new VaultError(
+      "the token Vault minted is for a different identity than the one that signed in",
+      403,
+    );
+  }
+  return credential;
 }

@@ -48,9 +48,12 @@ const ROLE = "openviking";
 const PROVIDER = "ovdash";
 /** The OIDC scope that puts the OpenViking claims in an ID token. */
 const SCOPE = "openviking";
-/** Filled in by the setup: Vault generates both. */
+/** Role on the JWT mount the redirect sign-in is traded at. */
+const JWT_ROLE = "ov-dash";
+/** Filled in by the setup: Vault generates all three. */
 let clientId = "";
 let clientSecret = "";
+let jwtMountAccessor = "";
 
 async function vault(
   path: string,
@@ -80,6 +83,8 @@ async function setUpVault(): Promise<void> {
     body: JSON.stringify({ type: "userpass" }),
   });
 
+  // The same two capabilities the README's `vault_policy.ov_dash` grants, plus
+  // lookup-self, which one test below uses to watch a token die.
   const policy = [
     `path "identity/oidc/token/${ROLE}" { capabilities = ["read"] }`,
     'path "auth/token/revoke-self" { capabilities = ["update"] }',
@@ -183,6 +188,75 @@ async function setUpVault(): Promise<void> {
       scopes_supported: [SCOPE],
     }),
   });
+
+  // ── where the ID token is traded back for a Vault session ──
+  //
+  // The provider's ID token is not a credential OpenViking takes: it carries
+  // the provider's issuer and the dashboard's client id, and OpenViking pins
+  // the identity-token pair that every other client uses. So the dashboard
+  // hands the token straight back here and mints from what it gets.
+  await vault("sys/auth/jwt", { method: "POST", body: JSON.stringify({ type: "jwt" }) });
+  // `jwks_url`, not `oidc_discovery_url`: Vault fetches this itself, from
+  // inside its own container, where the host's mapped port does not exist. A
+  // real deployment can reach its own address and should use discovery. The
+  // issuer is still checked — against the address the token actually carries.
+  const issuer = `${VAULT}/v1/identity/oidc/provider/${PROVIDER}`;
+  await vault("auth/jwt/config", {
+    method: "POST",
+    body: JSON.stringify({
+      jwks_url: `http://127.0.0.1:8200/v1/identity/oidc/provider/${PROVIDER}/.well-known/keys`,
+      bound_issuer: issuer,
+    }),
+  });
+  await vault(`auth/jwt/role/${JWT_ROLE}`, {
+    method: "POST",
+    body: JSON.stringify({
+      role_type: "jwt",
+      // The claim the provider's scope templates. It is also the alias name, so
+      // it is what ties this login to the person's existing entity.
+      user_claim: "ov_user",
+      bound_audiences: [clientId],
+      token_policies: ["ov-dash"],
+      token_type: "service",
+      token_ttl: "5m",
+    }),
+  });
+
+  const jwtAccessor = (
+    await json<{ data: Record<string, { accessor: string }> }>(await vault("sys/auth"))
+  ).data["jwt/"]?.accessor;
+  if (!jwtAccessor) throw new Error("jwt mount has no accessor");
+  jwtMountAccessor = jwtAccessor;
+  await attachJwtAlias(id);
+}
+
+/**
+ * Point the JWT mount's alias at the person's existing entity.
+ *
+ * Without this Vault invents a fresh entity on first login, and an entity with
+ * no metadata mints a token whose `ov_account` and `ov_user` are empty strings.
+ * One of the tests below takes the alias away again to hold that behaviour.
+ */
+async function attachJwtAlias(entityId: string): Promise<void> {
+  await vault("identity/entity-alias", {
+    method: "POST",
+    body: JSON.stringify({
+      name: USER,
+      canonical_id: entityId,
+      mount_accessor: jwtMountAccessor,
+    }),
+  });
+}
+
+/** Remove it again, and take the entity Vault invents with it. */
+async function detachJwtAlias(entityId: string): Promise<string | null> {
+  const entity = await json<{
+    data: { aliases: { id: string; mount_accessor: string }[] };
+  }>(await vault(`identity/entity/id/${entityId}`));
+  const alias = entity.data.aliases.find((a) => a.mount_accessor === jwtMountAccessor);
+  if (!alias) return null;
+  await vault(`identity/entity-alias/id/${alias.id}`, { method: "DELETE" });
+  return alias.id;
 }
 
 function dashboard() {
@@ -213,6 +287,9 @@ function redirectDashboard() {
         OIDC_ISSUER: `${VAULT}/v1/identity/oidc/provider/${PROVIDER}`,
         OIDC_CLIENT_ID: clientId,
         OIDC_CLIENT_SECRET: clientSecret,
+        VAULT_ADDR: VAULT,
+        VAULT_JWT_ROLE: JWT_ROLE,
+        VAULT_OIDC_ROLE: ROLE,
         SESSION_COOKIE_SECURE: "false",
       }),
     ),
@@ -410,7 +487,7 @@ describe("against a real Vault", () => {
 });
 
 describe("signing in by being sent to Vault", () => {
-  it("comes back with the token OpenViking accepts, and knows who it is for", async () => {
+  it("trades the ID token for the one OpenViking accepts", async () => {
     const app = redirectDashboard();
 
     const start = await app.request("/auth/login?returnTo=%2F%23%2Fhome");
@@ -440,15 +517,142 @@ describe("signing in by being sent to Vault", () => {
     };
     expect(session.signedIn).toBe(true);
     expect(session.canSignOut).toBe(true);
-    // Vault's own templating produced these, through the scope rather than the
-    // role — a different feature, and the one thing a stub cannot vouch for.
+    // Vault's own templating produced these — through the scope on the way out,
+    // and through the role's template on the way back. Two different features
+    // that a stub cannot make agree.
     expect(session.viewer).toMatchObject({ account: "lab", user: USER });
 
-    // The client's id_token_ttl is 30 minutes, and no refresh grant exists to
-    // extend it, so the session must not pretend to last longer.
+    // The session runs on the minted token, whose role ttl is an hour — not on
+    // the ID token, which the client caps at 30 minutes and which was spent at
+    // the JWT mount. Anything at or under 30 minutes would mean the dashboard
+    // kept the wrong one.
     const now = Math.floor(Date.now() / 1000);
-    expect(session.expiresAt).toBeGreaterThan(now);
-    expect(session.expiresAt).toBeLessThanOrEqual(now + 1800);
+    expect(session.expiresAt).toBeGreaterThan(now + 1800);
+    expect(session.expiresAt).toBeLessThanOrEqual(now + 3600);
+  });
+
+  it("the chain the dashboard walks ends at the token OpenViking pins", async () => {
+    // The dashboard's own run is covered above; what it cannot show is the
+    // token itself, which never leaves the process. So the same three steps are
+    // walked here against Vault directly and the result is read.
+    //
+    // No PKCE on this one: the client is confidential, Vault allows it, and it
+    // keeps the test to the part that is on trial.
+    const token = await vaultToken();
+    const auth = await json<{ code: string }>(
+      await fetch(
+        `${VAULT}/v1/identity/oidc/provider/${PROVIDER}/authorize?${new URLSearchParams({
+          client_id: clientId,
+          redirect_uri: `${ORIGIN}/auth/callback`,
+          response_type: "code",
+          scope: `openid ${SCOPE}`,
+          state: "state",
+          nonce: "nonce",
+        })}`,
+        { headers: { "x-vault-token": token } },
+      ),
+    );
+    const exchanged = await json<{ id_token: string }>(
+      await fetch(`${VAULT}/v1/identity/oidc/provider/${PROVIDER}/token`, {
+        method: "POST",
+        headers: {
+          authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`,
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code: auth.code,
+          redirect_uri: `${ORIGIN}/auth/callback`,
+        }),
+      }),
+    );
+
+    const idClaims = JSON.parse(
+      Buffer.from(exchanged.id_token.split(".")[1] ?? "", "base64url").toString("utf8"),
+    ) as { iss: string; aud: string };
+    // Where it starts: an issuer and audience OpenViking does not accept.
+    expect(idClaims.iss).toBe(`${VAULT}/v1/identity/oidc/provider/${PROVIDER}`);
+    expect(idClaims.aud).toBe(clientId);
+
+    const traded = await json<{ auth: { client_token: string; entity_id: string } }>(
+      await fetch(`${VAULT}/v1/auth/jwt/login`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ role: JWT_ROLE, jwt: exchanged.id_token }),
+      }),
+    );
+    // The alias did its job: this is the person's own entity, not a new one.
+    const entityId = (
+      await json<{ data: { id: string } }>(await vault(`identity/entity/name/${USER}`))
+    ).data.id;
+    expect(traded.auth.entity_id).toBe(entityId);
+
+    const minted = await json<{ data: { token: string } }>(
+      await vault(`identity/oidc/token/${ROLE}`, { token: traded.auth.client_token }),
+    );
+    const claims = JSON.parse(
+      Buffer.from(minted.data.token.split(".")[1] ?? "", "base64url").toString("utf8"),
+    ) as { iss: string; ov_account: string; ov_user: string };
+
+    // Where it ends: the issuer OpenViking pins, carrying the identity it maps
+    // from. That difference is the entire reason the trade exists.
+    expect(claims.iss).toBe(`${VAULT}/v1/identity/oidc`);
+    expect(claims.ov_account).toBe("lab");
+    expect(claims.ov_user).toBe(USER);
+
+    // And handing the login token back does not kill what was minted from it.
+    await vault("auth/token/revoke-self", {
+      method: "POST",
+      token: traded.auth.client_token,
+    });
+    const live = await json<{ active: boolean }>(
+      await vault("identity/oidc/introspect", {
+        method: "POST",
+        body: JSON.stringify({ token: minted.data.token }),
+      }),
+    );
+    expect(live.active).toBe(true);
+  });
+
+  it("refuses when the JWT mount does not know the person", async () => {
+    // Without an entity alias Vault invents an empty entity, and the token it
+    // mints from that carries `ov_account: ""` and `ov_user: ""` — measured,
+    // not assumed. A sign-in as nobody must fail rather than half-work.
+    const entityId = (
+      await json<{ data: { id: string } }>(await vault(`identity/entity/name/${USER}`))
+    ).data.id;
+    await detachJwtAlias(entityId);
+    try {
+      const app = redirectDashboard();
+      const start = await app.request("/auth/login");
+      const pending = cookieNamed(start, "ovdash_session_login");
+      const { code, state } = await authorizeAt(
+        start.headers.get("location") ?? "",
+        await vaultToken(),
+      );
+      const back = await app.request(`/auth/callback?code=${code}&state=${state}`, {
+        headers: { cookie: pending },
+      });
+
+      expect(back.status).toBe(403);
+      expect(cookieNamed(back, "ovdash_session")).toBe("");
+    } finally {
+      // Vault made an entity for the alias name; it has to go before the alias
+      // can point at the real one again.
+      const stray = await json<{ data?: { id: string } }>(
+        await vault("identity/lookup/entity", {
+          method: "POST",
+          body: JSON.stringify({
+            alias_name: USER,
+            alias_mount_accessor: jwtMountAccessor,
+          }),
+        }),
+      );
+      if (stray.data?.id && stray.data.id !== entityId) {
+        await vault(`identity/entity/id/${stray.data.id}`, { method: "DELETE" });
+      }
+      await attachJwtAlias(entityId);
+    }
   });
 
   it("refuses to redeem the same authorization code twice", async () => {
