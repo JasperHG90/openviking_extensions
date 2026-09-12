@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field, PrivateAttr
 from ov_ext.reflect.config import ReflectSettings
 from ov_ext.reflect.exceptions import ContentUnavailableError
 from ov_ext.reflect.models import MemoryRow, Observation
-from ov_ext.reflect.viking import VikingLLM, VikingStore, _digest, _render, _slug
+from ov_ext.reflect.viking import VikingLLM, VikingStore, _primary, _render, _subject
 
 NOW = datetime(2026, 9, 8, tzinfo=timezone.utc)
 
@@ -58,8 +58,15 @@ class FakeFS:
         self.writes: list[tuple[str, str]] = []
 
     async def read_file(self, uri: str, ctx: Any = None) -> str:
+        # The exception OpenViking's own VikingFS raises for a missing file, not
+        # a builtin that looks like it. The store has to tell "no file yet" from
+        # "the read failed", and a fake that signalled absence with a different
+        # type would let it confuse the two -- which is a write over a file that
+        # is still there.
+        from openviking_cli.exceptions import NotFoundError
+
         if uri not in self.files:
-            raise FileNotFoundError(uri)
+            raise NotFoundError(uri)
         return self.files[uri]
 
     async def write_file(self, uri: str, content: str, ctx: Any = None) -> None:
@@ -283,22 +290,62 @@ async def test_a_link_is_merged_into_what_the_file_already_has() -> None:
 # --- pure helpers ----------------------------------------------------------
 
 
-def test_two_observations_with_the_same_title_get_different_files() -> None:
-    """Slug alone collides, and write_file would overwrite one with the other."""
-    first = observation()
+def test_two_observations_about_different_memories_get_different_files() -> None:
+    """The subject names the file, so two subjects cannot land on one."""
     second = Observation(
         title="Both retry!",
         content="Something else entirely.",
         evidence=(("viking://x/c.md", "other quote"), ("viking://x/d.md", "another")),
         areas=frozenset({"viking://x"}),
     )
-    assert _slug(first.title) == _slug(second.title)
-    assert _digest(first) != _digest(second)
+    assert _subject(observation()) != _subject(second)
 
 
-def test_the_same_conclusion_from_the_same_evidence_keeps_its_filename() -> None:
-    """So a re-run merges into the existing file instead of piling up near-duplicates."""
-    assert _digest(observation()) == _digest(observation())
+def test_the_subject_is_what_the_observation_quotes_most() -> None:
+    """Not the first URI sorted: that is a tiebreak, not a subject."""
+    about_b = Observation(
+        title="About b",
+        content="Mostly about b.",
+        evidence=(
+            ("viking://user/jasper/memories/entities/a.md", "one quote"),
+            ("viking://user/jasper/memories/entities/b.md", "first"),
+            ("viking://user/jasper/memories/entities/b.md", "second"),
+        ),
+        areas=frozenset({"viking://user/jasper/memories/entities"}),
+    )
+    assert _subject(about_b) == "b"
+    # The same claim with the counts the other way round follows the quotes.
+    assert _subject(observation()) == "a"
+
+
+def test_a_resource_is_never_what_an_observation_is_filed_under() -> None:
+    """Resources are someone else's text; a finding is not about their article."""
+    article = "viking://user/jasper/resources/blog-scraper/post.md/chunk_1.md"
+    heavily_quoted = Observation(
+        title="A claim",
+        content="Something is true.",
+        evidence=(
+            (article, "one"),
+            (article, "two"),
+            (article, "three"),
+            ("viking://user/jasper/memories/entities/tool/embark.md", "just once"),
+        ),
+        areas=frozenset({"viking://x"}),
+    )
+    assert _subject(heavily_quoted) == "embark"
+
+
+def test_an_entity_outranks_a_busier_event() -> None:
+    """An observation is about an entity; an event is how it was noticed."""
+    event = "viking://user/jasper/memories/events/2026/09/07/standup.md"
+    entity = "viking://user/jasper/memories/entities/tool/embark.md"
+    mixed = Observation(
+        title="A claim",
+        content="Something is true.",
+        evidence=((event, "one"), (event, "two"), (entity, "just once")),
+        areas=frozenset({"viking://x"}),
+    )
+    assert _primary(mixed) == entity
 
 
 def test_the_rendered_body_carries_every_quote() -> None:
@@ -385,25 +432,43 @@ async def test_the_boundary_row_does_not_come_back_every_sweep() -> None:
     Harmless once, but with enough rows sharing a timestamp it fills the batch
     and the mark can never advance past them.
     """
+    on_the_mark = "viking://user/jasper/memories/entities/tool/on_the_mark.md"
+    after = "viking://user/jasper/memories/entities/tool/after.md"
     db = FakeDB(
         [
-            {"uri": "viking://x/on-the-mark.md", "updated_at": NOW},
-            {"uri": "viking://x/after.md", "updated_at": NOW + timedelta(seconds=1)},
+            {"uri": on_the_mark, "updated_at": NOW},
+            {"uri": after, "updated_at": NOW + timedelta(seconds=1)},
         ]
     )
-    assert await store(db).changed_since(NOW, limit=10) == ["viking://x/after.md"]
+    assert await store(db).changed_since(NOW, limit=10) == [after]
 
 
-async def test_the_written_uri_carries_the_digest() -> None:
-    """Asserting `_digest` in isolation does not prove the filename uses it."""
+async def test_the_written_uri_is_the_one_the_engine_was_promised() -> None:
+    """The engine reads the standing observation from `observation_uri` first.
+
+    If the write then landed anywhere else, every revision would read an empty
+    file and write a new one beside it -- the bug, with an extra step.
+    """
     fs = FakeFS()
-    uri = await store(fs=fs).write_observation(observation())
-    assert _digest(observation()) in uri
-    assert uri.endswith(".md")
+    adapter = store(fs=fs)
+    promised = adapter.observation_uri(observation())
+    assert await adapter.write_observation(observation()) == promised
+    assert promised.endswith(".md")
+
+
+async def test_a_write_can_be_pinned_to_the_file_it_is_revising() -> None:
+    """Merged evidence can move the subject; the revision must not move with it."""
+    fs = FakeFS()
+    pinned = "viking://user/jasper/memories/observations/entities/elsewhere.md"
+
+    written = await store(fs=fs).write_observation(observation(), uri=pinned)
+
+    assert written == pinned
+    assert fs.writes[0][0] == pinned
 
 
 async def test_the_same_memories_are_written_to_the_same_file_twice() -> None:
-    """So a re-sweep merges rather than accumulating near-duplicates."""
+    """So a re-sweep revises rather than accumulating near-duplicates."""
     fs = FakeFS()
     first = await store(fs=fs).write_observation(observation())
     second = await store(fs=fs).write_observation(observation())
@@ -875,8 +940,9 @@ def observation_over(*evidence: tuple[str, str], title: str = "A claim") -> Obse
     )
 
 
-ENTITY = "viking://user/jasper/memories/entities/browser_extension/ov_clip.md"
-EVENT = "viking://user/jasper/memories/events/2026/09/07/daily_reflection.md"
+MEMORIES = "viking://user/jasper/memories"
+ENTITY = f"{MEMORIES}/entities/browser_extension/ov_clip.md"
+EVENT = f"{MEMORIES}/events/2026/09/07/daily_reflection.md"
 
 
 async def test_an_observation_is_filed_under_the_entity_it_is_about() -> None:
@@ -939,8 +1005,14 @@ async def test_a_quote_reflowed_by_the_model_is_the_same_evidence() -> None:
     assert first.writes[0][0] == second.writes[0][0]
 
 
-async def test_a_different_reading_of_the_same_memories_stays_apart() -> None:
-    """Sources alone would collapse two genuine claims into one file."""
+async def test_a_different_reading_of_the_same_memories_lands_on_one_file() -> None:
+    """Quoting different spans is not a different subject.
+
+    Hashing the quotes into the filename is what turned one running observation
+    about `blog_scraper` into thirteen files: every sweep samples different
+    neighbours, so the model quotes different spans and the hash moves even when
+    the claim does not.
+    """
     first, second = FakeFS(), FakeFS()
 
     await store(fs=first).write_observation(
@@ -950,7 +1022,7 @@ async def test_a_different_reading_of_the_same_memories_stays_apart() -> None:
         observation_over((ENTITY, "a different span"), (EVENT, "and another"))
     )
 
-    assert first.writes[0][0] != second.writes[0][0]
+    assert first.writes[0][0] == second.writes[0][0]
 
 
 async def test_the_filename_says_what_the_observation_is_about() -> None:
@@ -959,9 +1031,7 @@ async def test_the_filename_says_what_the_observation_is_about() -> None:
         observation_over((ENTITY, "one"), (EVENT, "two"))
     )
 
-    name = fs.writes[0][0].rsplit("/", 1)[-1]
-    # Sorted by URI, so the entity sorts before the event.
-    assert name.startswith("ov_clip_daily_reflection-"), name
+    assert fs.writes[0][0].endswith("/observations/browser_extension/ov_clip.md")
 
 
 async def test_the_body_writes_no_link_of_its_own() -> None:
@@ -1016,9 +1086,572 @@ async def test_a_quote_that_cannot_be_linked_is_reported(
     assert "will not render a link" in caplog.text
 
 
+# --- reading back the observation that already stands ------------------------
+
+
+async def test_an_observation_round_trips_through_its_own_file() -> None:
+    """The revise pass is only as good as what it reads back."""
+    fs = FakeFS()
+    adapter = store(fs=fs)
+    original = observation_over(
+        (ENTITY, "one quote"), (EVENT, "another quote"), title="A standing claim"
+    )
+
+    uri = await adapter.write_observation(original)
+    read_back = await adapter.read_observation(uri)
+
+    assert read_back is not None
+    assert read_back.title == "A standing claim"
+    assert read_back.content == "Something is true."
+    assert read_back.evidence == original.evidence
+    assert read_back.areas == original.areas
+
+
+async def test_the_evidence_read_back_is_the_links_not_the_bullets() -> None:
+    """A bullet is rendered text; promoting it to a citation checks nothing.
+
+    The quotes in the links were verified against the memories they name. Prose
+    in the file was not, and a file edited by hand would otherwise smuggle a
+    citation into the next revision.
+    """
+    uri = "viking://user/jasper/memories/observations/entities/x.md"
+    fs = FakeFS()
+    await store(fs=fs).write_observation(observation_over((ENTITY, "real")), uri=uri)
+    fs.files[uri] = fs.files[uri].replace(
+        "## Evidence", '## Evidence\n\n- invented: "never verified"'
+    )
+
+    read_back = await store(fs=fs).read_observation(uri)
+
+    assert read_back is not None
+    assert [quote for _, quote in read_back.evidence] == ["real"]
+
+
+async def test_something_that_is_not_an_observation_is_refused_not_overwritten() -> None:
+    """`MemoryFileUtils.read` does not raise on text that is not a memory file.
+
+    It hands the raw bytes back as `content`, so "it parsed" says nothing about
+    what is there. Read as an observation, that garbage becomes the standing
+    claim the model is asked to revise, and the revision is written back over
+    whatever the file really was.
+    """
+    from ov_ext.reflect.exceptions import ObservationUnreadableError
+
+    uri = "viking://user/jasper/memories/observations/entities/x.md"
+    fs = FakeFS({uri: "\x00 not a memory file"})
+
+    with pytest.raises(ObservationUnreadableError, match="derived_from"):
+        await store(fs=fs).read_observation(uri)
+
+
+# --- what the sweep reflects *on* --------------------------------------------
+
+
+def scoped_paths(condition: Any) -> set[str]:
+    """The URI prefixes a change query asked the index for."""
+    found: set[str] = set()
+    for part in getattr(condition, "conds", []) or []:
+        if getattr(part, "path", None) is not None:
+            found.add(part.path)
+        found |= scoped_paths(part)
+    return found
+
+
+async def test_the_sweep_asks_only_for_the_types_it_reflects_on() -> None:
+    """Observations are level-2 memories under the same root as everything else.
+
+    Scoped in the query rather than filtered afterwards. Filtering afterwards
+    made `limit` count rows read instead of memories to reflect on, so a burst
+    of anything unreflectable -- events, preferences, or the sweep's own
+    observations -- filled the window with rows that were all discarded. The
+    sweep then reported nothing changed and held the watermark, which is not a
+    stall the step-over can clear: the same rows come back every tick, forever.
+    """
+    db = FakeDB([])
+
+    await store(db).changed_since(NOW, limit=10)
+
+    assert scoped_paths(db.calls[0]["filter"]) == {f"{MEMORIES}/entities"}
+
+
+async def test_the_scope_follows_the_configured_types() -> None:
+    db = FakeDB([])
+    adapter = store(db, settings=ReflectSettings(memory_types=["entities", "events"]))
+
+    await adapter.changed_since(NOW, limit=10)
+
+    assert scoped_paths(db.calls[0]["filter"]) == {
+        f"{MEMORIES}/entities",
+        f"{MEMORIES}/events",
+    }
+
+
+async def test_reflecting_on_no_type_asks_the_index_nothing() -> None:
+    """An empty disjunction is as likely to compile to everything as to nothing."""
+    db = FakeDB([{"uri": f"{MEMORIES}/entities/tool/e.md", "updated_at": NOW}])
+    adapter = store(db, settings=ReflectSettings(memory_types=[]))
+
+    assert await adapter.changed_since(NOW, limit=10) == []
+    assert db.calls == [], "no reflectable type means nothing to ask for"
+
+
+async def test_the_batch_limit_is_what_the_query_asks_for() -> None:
+    """The index returns only reflectable rows, so the limit counts memories."""
+    db = FakeDB([])
+    await store(db).changed_since(NOW, limit=3)
+    assert db.calls[0]["limit"] == 3
+
+
 async def test_a_resource_chunk_is_named_unambiguously() -> None:
     """Every chunk of every article is `chunk_N`; the stem alone says nothing."""
     from ov_ext.reflect.viking import _label
 
     chunk = "viking://user/jasper/resources/blog-scraper/nvidia/post.md/intro/chunk_3.md"
     assert _label(chunk) == "resources/blog-scraper/nvidia/post.md/intro/chunk_3"
+
+
+# --- identity: the file follows the memory being reflected on ----------------
+
+CHANGED = f"{MEMORIES}/entities/software_project/blog_scraper.md"
+
+
+def paired_with(partner: str) -> Observation:
+    """An observation about `CHANGED`, drawn beside one neighbour.
+
+    One quote each, which is what `min_evidence=2` produces and therefore the
+    modal shape. Both the rank and the count tie, so whatever breaks the tie
+    decides the filename.
+    """
+    return observation_over((CHANGED, "writes captures"), (partner, "a quote"))
+
+
+async def test_the_partner_an_observation_was_drawn_beside_does_not_name_it() -> None:
+    """The bug an evidence-ranked name has, once the hash is gone.
+
+    Five sweeps about `blog_scraper`, each pairing it with a different
+    neighbour. Ranking on evidence alone files four of them under the *other*
+    entity, because with the counts tied the tiebreak falls through to the
+    category folder at the front of the URI -- `cloud_service` before
+    `software_project`. Partner-sprawl instead of hash-sprawl.
+    """
+    partners = [
+        f"{MEMORIES}/entities/dev_tool/embark.md",
+        f"{MEMORIES}/entities/cloud_service/azure.md",
+        f"{MEMORIES}/entities/person/jasper.md",
+        f"{MEMORIES}/entities/library/httpx.md",
+        f"{MEMORIES}/entities/tool/zed.md",
+    ]
+    adapter = store()
+
+    landed = {adapter.observation_uri(paired_with(p), {CHANGED}) for p in partners}
+
+    assert len(landed) == 1, f"one subject, {len(landed)} files: {sorted(landed)}"
+    assert landed.pop().endswith("/observations/software_project/blog_scraper.md")
+
+
+async def test_two_subjects_reflected_on_together_keep_their_own_files() -> None:
+    """Both changed, so both are subjects; they must not be merged into one."""
+    other = f"{MEMORIES}/entities/dev_tool/embark.md"
+    adapter = store()
+    subjects = {CHANGED, other}
+
+    about_scraper = observation_over((CHANGED, "one"), (CHANGED, "two"), (other, "x"))
+    about_embark = observation_over((other, "one"), (other, "two"), (CHANGED, "x"))
+
+    assert adapter.observation_uri(about_scraper, subjects) != adapter.observation_uri(
+        about_embark, subjects
+    )
+
+
+async def test_a_subject_that_was_not_reflected_on_still_gets_a_name() -> None:
+    """Neighbours-only evidence happens; it must not land on an empty name."""
+    uri = store().observation_uri(paired_with(f"{MEMORIES}/entities/dev_tool/e.md"))
+    assert uri.rsplit("/", 1)[-1] not in {".md", "untitled.md"}
+
+
+async def test_two_memories_with_one_filename_do_not_share_an_observation() -> None:
+    """Every daily reflection is `daily_reflection.md`; the stem alone collides."""
+    adapter = store()
+    seventh = observation_over((EVENT, "one"), (EVENT, "two"))
+    eighth_uri = EVENT.replace("09/07", "09/08")
+    eighth = observation_over((eighth_uri, "one"), (eighth_uri, "two"))
+
+    assert adapter.observation_uri(seventh) != adapter.observation_uri(eighth)
+
+
+# --- what survives a round trip through OpenViking's own writer --------------
+
+
+async def round_tripped(obs: Observation) -> Observation:
+    """Write an observation, then read it back the way a revision does."""
+    fs = FakeFS()
+    adapter = store(fs=fs)
+    read_back = await adapter.read_observation(await adapter.write_observation(obs))
+    assert read_back is not None, "what was just written must be readable"
+    return read_back
+
+
+async def test_a_quote_linkified_into_the_claim_does_not_become_the_claim() -> None:
+    """OpenViking linkifies each `match_text` wherever it appears in the body.
+
+    A claim usually restates what it cites, so the stored H1 and paragraph come
+    back carrying `[quote](viking://...)`. Read raw, that markup becomes the
+    revise prompt's input and then the file's canonical claim, compounding on
+    every revision.
+    """
+    quoted = "retries failed jobs"
+    obs = Observation(
+        title=f"The scheduler {quoted}",
+        content=f"Both components agree that the scheduler {quoted}.",
+        evidence=((ENTITY, quoted), (EVENT, "a second span")),
+        areas=frozenset({"viking://x"}),
+    )
+
+    read_back = await round_tripped(obs)
+
+    assert "](" not in read_back.title, read_back.title
+    assert "](" not in read_back.content, read_back.content
+    assert read_back.title == obs.title
+    assert read_back.content == obs.content
+
+
+async def test_a_claim_that_mentions_the_evidence_heading_survives() -> None:
+    """`_render` writes one Evidence heading and writes it last."""
+    obs = Observation(
+        title="On rendering",
+        content="The body carries a line reading\n\n## Evidence\n\nand then goes on.",
+        evidence=((ENTITY, "one"), (EVENT, "two")),
+        areas=frozenset({"viking://x"}),
+    )
+
+    assert (await round_tripped(obs)).content == obs.content
+
+
+async def test_a_title_the_model_split_over_two_lines_stays_a_title() -> None:
+    """Otherwise the second line joins the claim, one line per revision."""
+    obs = Observation(
+        title="A title\nwith a second line",
+        content="The claim.",
+        evidence=((ENTITY, "one"), (EVENT, "two")),
+        areas=frozenset({"viking://x"}),
+    )
+
+    read_back = await round_tripped(obs)
+
+    assert read_back.title == "A title with a second line"
+    assert read_back.content == "The claim."
+
+
+async def test_an_empty_title_does_not_come_back_as_a_hash() -> None:
+    obs = Observation(
+        title="",
+        content="The claim.",
+        evidence=((ENTITY, "one"), (EVENT, "two")),
+        areas=frozenset({"viking://x"}),
+    )
+
+    read_back = await round_tripped(obs)
+
+    assert read_back.title == "Observation"
+    assert read_back.content == "The claim."
+
+
+# --- absence is not the same as a failed read --------------------------------
+
+
+async def test_a_read_that_fails_is_raised_not_reported_as_absence() -> None:
+    """The caller writes on `None`, so the two must not be spelled the same.
+
+    `VikingFS.read_file` re-raises everything that is not a missing file --
+    unreachable, timed out, not permitted -- and reporting any of those as "no
+    file yet" overwrites an observation that is still there.
+    """
+    from openviking_cli.exceptions import UnavailableError
+
+    from ov_ext.reflect.exceptions import ObservationUnreadableError
+
+    class FlakyFS(FakeFS):
+        async def read_file(self, uri: str, ctx: Any = None) -> str:
+            raise UnavailableError("the index is down")
+
+    with pytest.raises(ObservationUnreadableError):
+        await store(fs=FlakyFS()).read_observation("viking://user/jasper/x.md")
+
+
+async def test_a_file_that_is_simply_absent_is_still_absence() -> None:
+    absent = "viking://user/jasper/memories/observations/entities/nothing.md"
+    assert await store(fs=FakeFS()).read_observation(absent) is None
+
+
+async def test_entities_that_differ_only_at_the_end_keep_their_own_files() -> None:
+    """A word cap on the name merges them, and the merge is destructive.
+
+    OpenViking's own entity names run long and differ in the last word. Two
+    distinct entities sharing a file is not untidy: the revise pass is then told
+    they are one subject and asked to fold their claims into one paragraph, and
+    there is no other copy to recover from.
+    """
+    adapter = store()
+    pairs = [
+        (
+            "openviking_memory_plugin_for_claude_code",
+            "openviking_memory_plugin_for_claude_desktop",
+        ),
+        ("ov_clip_browser_extension_for_chrome", "ov_clip_browser_extension_for_firefox"),
+    ]
+    for first, second in pairs:
+        landed = {
+            adapter.observation_uri(
+                observation_over(
+                    (f"{MEMORIES}/entities/tool/{name}.md", "a quote"), (EVENT, "another")
+                ),
+                {f"{MEMORIES}/entities/tool/{name}.md"},
+            )
+            for name in (first, second)
+        }
+        assert len(landed) == 2, f"{first} and {second} share {landed}"
+
+
+async def test_a_name_too_long_for_a_filesystem_is_still_unique() -> None:
+    """Shortened, not truncated: the digest is over the entity's own name.
+
+    Stable in a way the evidence digest this replaced was not -- the name is the
+    same every sweep, while the quotes were never the same twice.
+    """
+    adapter = store()
+    stems = [f"a_very_long_entity_name_{'part_' * 20}{tail}" for tail in ("one", "two")]
+    landed = [
+        adapter.observation_uri(
+            observation_over((f"{MEMORIES}/entities/tool/{stem}.md", "q"), (EVENT, "r")),
+            {f"{MEMORIES}/entities/tool/{stem}.md"},
+        )
+        for stem in stems
+    ]
+
+    assert landed[0] != landed[1]
+    assert all(len(uri.rsplit("/", 1)[-1]) < 120 for uri in landed), landed
+    # Same name, same answer, every sweep.
+    assert landed[0] == adapter.observation_uri(
+        observation_over(
+            (f"{MEMORIES}/entities/tool/{stems[0]}.md", "different quote"),
+            (EVENT, "and another"),
+        ),
+        {f"{MEMORIES}/entities/tool/{stems[0]}.md"},
+    )
+
+
+# --- identity survives the subjects alternating ------------------------------
+
+
+async def test_a_claim_about_two_entities_follows_whichever_one_changed() -> None:
+    """The documented cost of filing by subject, asserted so it stays bounded.
+
+    Sweep 1 files under `blog_scraper` because that is what changed; sweep 2
+    files the same running claim under `embark` because that is what changed
+    then. Two files, each evolving, neither superseding the other.
+
+    Reusing another subject's file to close this was tried twice and regrew a
+    magnet both times -- a file's basin is its citation list, which grows with
+    every revision, so the most-revised file swallows the first observation
+    about every new entity and the revise pass is handed unrelated claims.
+    Closing it properly needs a test of whether two claims *say* the same thing,
+    which is a model call and a separate feature. Bounded duplication beats
+    unbounded destructive merging.
+    """
+    embark = f"{MEMORIES}/entities/dev_tool/embark.md"
+    fs = FakeFS()
+    adapter = store(fs=fs)
+    claim = observation_over((CHANGED, "writes captures"), (embark, "embeds them"))
+
+    first, standing = await adapter.resolve(claim, {CHANGED})
+    assert standing is None
+    await adapter.write_observation(claim, uri=first)
+
+    second, found = await adapter.resolve(claim, {embark})
+
+    assert first.endswith("/blog_scraper.md")
+    assert second.endswith("/embark.md")
+    assert found is None
+
+
+async def test_a_file_is_not_reused_just_because_it_cites_the_same_memory() -> None:
+    """Sharing a citation is not sharing a subject.
+
+    Otherwise the busiest memory in the store -- in a personal store, the user's
+    own person entity, which half of everything cites -- becomes a magnet. The
+    first observation about any new entity is swallowed into it, so that
+    entity's file is never created and every later observation about it is
+    swallowed too. The revise pass is then handed unrelated claims with the
+    instruction to fold them into one, and nothing keeps a second copy.
+    """
+    jasper = f"{MEMORIES}/entities/person/jasper.md"
+    fs = FakeFS()
+    adapter = store(fs=fs)
+
+    about_zed = observation_over(
+        (jasper, "prefers a terminal"),
+        (f"{MEMORIES}/entities/tool/zed.md", "is an editor"),
+    )
+    first, _ = await adapter.resolve(about_zed, {jasper})
+    await adapter.write_observation(about_zed, uri=first)
+
+    # A different claim, about a different entity, that happens to cite jasper.
+    about_scraper = observation_over((CHANGED, "writes captures"), (jasper, "runs it"))
+    landed, standing = await adapter.resolve(about_scraper, {CHANGED})
+
+    assert standing is None, "an unrelated claim must not be folded into this one"
+    assert landed != first
+    assert landed.endswith("/blog_scraper.md")
+
+
+async def test_a_much_revised_file_does_not_swallow_a_new_entity() -> None:
+    """The magnet, regrown through an accumulated citation list.
+
+    A file's citations grow with every revision, so a rule keyed on them gives
+    the busiest, most-revised file the widest reach. Here `jasper.md` has quite
+    legitimately come to cite `blog_scraper` -- and the first observation ever
+    written about `blog_scraper` must still get its own file.
+    """
+    jasper = f"{MEMORIES}/entities/person/jasper.md"
+    fs = FakeFS()
+    adapter = store(fs=fs)
+
+    accumulated = observation_over(
+        (jasper, "prefers a terminal"),
+        (f"{MEMORIES}/entities/tool/zed.md", "is an editor"),
+        (CHANGED, "was written by him"),
+    )
+    magnet, _ = await adapter.resolve(accumulated, {jasper})
+    await adapter.write_observation(accumulated, uri=magnet)
+    assert magnet.endswith("/jasper.md")
+
+    landed, standing = await adapter.resolve(
+        observation_over((CHANGED, "retries with backoff"), (jasper, "runs it")),
+        {CHANGED},
+    )
+
+    assert standing is None, "an unrelated claim must not be folded into this one"
+    assert landed.endswith("/blog_scraper.md")
+
+
+async def test_a_genuinely_new_subject_still_gets_its_own_file() -> None:
+    """Stickiness must not collapse every observation onto the first file made."""
+    embark = f"{MEMORIES}/entities/dev_tool/embark.md"
+    other = f"{MEMORIES}/entities/library/httpx.md"
+    fs = FakeFS()
+    adapter = store(fs=fs)
+
+    scraper = observation_over((CHANGED, "one"), (embark, "two"))
+    scraper_uri, _ = await adapter.resolve(scraper, {CHANGED})
+    await adapter.write_observation(scraper, uri=scraper_uri)
+
+    # Overlapping citation on purpose: with no overlap no candidate could hit,
+    # and the test would prove only that unrelated files stay apart -- which
+    # was never the risk.
+    fresh, standing = await adapter.resolve(
+        observation_over((other, "three"), (embark, "four")), {other}
+    )
+
+    assert standing is None
+    assert fresh != scraper_uri
+    assert fresh.endswith("/httpx.md")
+
+
+async def test_a_subjects_own_file_is_found_even_if_it_stopped_citing_it() -> None:
+    """Evidence rotates out under the cap; the file is still that subject's.
+
+    Without this the sweep would skip the file named after the subject, find
+    nothing, and write a fresh observation straight over it -- losing every
+    revision it had accumulated, precisely because it had accumulated enough for
+    the founding quotes to age out.
+    """
+    fs = FakeFS()
+    adapter = store(fs=fs)
+    embark = f"{MEMORIES}/entities/dev_tool/embark.md"
+
+    own_uri = adapter.observation_uri(paired_with(embark), {CHANGED})
+    # What stands there no longer quotes blog_scraper at all.
+    aged = observation_over((embark, "one"), (EVENT, "two"))
+    await adapter.write_observation(aged, uri=own_uri)
+
+    landed, standing = await adapter.resolve(paired_with(embark), {CHANGED})
+
+    assert landed == own_uri
+    assert standing is not None, "its own file must be found, cited or not"
+
+
+async def test_an_unreadable_candidate_stops_the_search_rather_than_stepping_past() -> (
+    None
+):
+    """Falling through would write a second file for a subject that may have one."""
+    from openviking_cli.exceptions import UnavailableError
+
+    from ov_ext.reflect.exceptions import ObservationUnreadableError
+
+    class FlakyFS(FakeFS):
+        async def read_file(self, uri: str, ctx: Any = None) -> str:
+            raise UnavailableError("the index is down")
+
+    with pytest.raises(ObservationUnreadableError):
+        await store(fs=FlakyFS()).resolve(paired_with(f"{MEMORIES}/entities/t/e.md"))
+
+
+async def test_a_watermark_plateau_that_wedges_the_sweep_is_reported(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`TimeRange` compiles `start` to `>=`, so rows on the mark repeat.
+
+    One is harmless. A full page of them is a sweep that reads the same rows
+    every tick, reports nothing changed, and holds the watermark with no stall
+    counted -- invisible unless it says so.
+    """
+    import logging
+
+    db = FakeDB(
+        [
+            {"uri": f"{MEMORIES}/entities/tool/e{n}.md", "updated_at": NOW}
+            for n in range(3)
+        ]
+    )
+
+    with caplog.at_level(logging.ERROR, logger="ov_ext.reflect.viking"):
+        assert await store(db).changed_since(NOW, limit=3) == []
+
+    assert "cannot see past them" in caplog.text
+    assert "OV_REFLECT_BATCH_LIMIT" in caplog.text
+
+
+async def test_a_partial_page_on_the_mark_is_not_a_plateau(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The ordinary boundary row must not cry wolf every sweep."""
+    import logging
+
+    db = FakeDB([{"uri": f"{MEMORIES}/entities/tool/e.md", "updated_at": NOW}])
+
+    with caplog.at_level(logging.ERROR, logger="ov_ext.reflect.viking"):
+        assert await store(db).changed_since(NOW, limit=10) == []
+
+    assert caplog.text == ""
+
+
+async def test_the_alternation_is_per_co_cited_entity_not_per_pair() -> None:
+    """State the accepted cost at its real size, so a reader is not surprised.
+
+    Someone finding one claim in four entity files in six months should be able
+    to confirm here that it is the design rather than a regression.
+    """
+    partners = [
+        f"{MEMORIES}/entities/dev_tool/embark.md",
+        f"{MEMORIES}/entities/library/httpx.md",
+        f"{MEMORIES}/entities/tool/zed.md",
+    ]
+    adapter = store()
+    claim = observation_over(
+        (CHANGED, "writes captures"), *((p, "a quote") for p in partners)
+    )
+
+    landed = {adapter.observation_uri(claim, {who}) for who in [CHANGED, *partners]}
+
+    assert len(landed) == 4, "one file per entity that is itself reflected on"
+    assert all(uri.endswith(".md") for uri in landed)

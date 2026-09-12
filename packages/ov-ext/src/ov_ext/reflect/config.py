@@ -366,6 +366,17 @@ class ReflectSettings(BaseSettings):
             "to doubt when reflection is wrong."
         ),
     )
+    max_evidence: int = Field(
+        default=12,
+        ge=2,
+        description=(
+            "Most quotes one observation file keeps. An observation is revised "
+            "in place as the memories behind it change, so without a cap its "
+            "evidence list grows for as long as the entity is worked on. The "
+            "newest quotes are kept, which also ages out ones whose source has "
+            "since been rewritten."
+        ),
+    )
     state_path: str = Field(
         default="viking://~/resources/reflect/watermark.json",
         description=(

@@ -16,7 +16,7 @@ a plugin interface would buy optionality nobody will spend.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import datetime
 from typing import Any, Protocol, TypeVar
 
@@ -171,13 +171,79 @@ class MemoryStore(Protocol):
         """
         ...
 
-    async def write_observation(self, observation: Observation) -> str:
+    def observation_uri(
+        self, observation: Observation, subjects: Collection[str] = ()
+    ) -> str:
+        """Return the file an observation belongs in, without writing anything.
+
+        One file per memory reflected on, named after that memory, so the same
+        subject resolves to the same file every sweep. That is what makes an
+        observation something the engine can revise rather than re-file.
+
+        ``subjects`` is what the batch reflected on. It has to decide, because
+        it is the only part of an observation that does not vary with the
+        sample -- evidence pairs the changed memory with whichever neighbours
+        the draw surfaced.
+        """
+        ...
+
+    async def resolve(
+        self, observation: Observation, subjects: Collection[str] = ()
+    ) -> tuple[str, Observation | None]:
+        """Return the file an observation belongs in and what already stands there.
+
+        One call rather than "where does this go" followed by "what is there",
+        because the answer to the first depends on the second: a subject whose
+        file already exists keeps it, even when another cited memory would rank
+        higher this sweep. That is what stops one running claim alternating
+        between two names as first one entity and then the other is edited.
+
+        Raises
+        ------
+        ObservationUnreadableError
+            When a candidate file could not be read, so it is unknown whether
+            an observation is already there.
+        """
+        ...
+
+    async def whole_memories(self, uris: Sequence[str]) -> list[MemoryRow]:
+        """Return the memories behind ``uris`` in full, never as deltas.
+
+        Distinct from :meth:`rows`, which serves a changed memory as the lines
+        that changed. Re-checking a carried-forward quote needs the whole
+        memory: the quote was drawn from all of it, and comparing it against
+        this sweep's few edited lines reports every older citation as stale.
+        """
+        ...
+
+    async def read_observation(self, uri: str) -> Observation | None:
+        """Return the observation already written at ``uri``, or ``None``.
+
+        The evidence must be the quotes that were verified when it was written,
+        not text parsed back out of the rendered file: a revision carries them
+        forward, and a citation nobody checked must not enter that way.
+
+        Raises
+        ------
+        ObservationUnreadableError
+            When the read failed for a reason other than the file being absent.
+            The caller writes on ``None``, so "unknown" must not be spelled the
+            same way as "nothing there".
+        """
+        ...
+
+    async def write_observation(
+        self, observation: Observation, *, uri: str | None = None
+    ) -> str:
         """Persist an observation as a memory file and return its URI.
 
         Written directly rather than through ``remember``, which would hand the
         text to the extractor and get back whatever it decided the text meant.
         The file is still a first-class memory -- indexed, searchable, linkable
         -- because OpenViking's own serializer writes it.
+
+        ``uri`` pins where it lands, for a revision that must go back to the
+        file it revised even when the merged evidence would now name another.
         """
         ...
 

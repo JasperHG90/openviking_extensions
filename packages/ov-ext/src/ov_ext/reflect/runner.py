@@ -130,10 +130,13 @@ async def _sweep_once(
         await viking_fs.write_file(state_uri, after.dumps(), ctx=ctx)
 
     logger.info(
-        "ov-ext reflect: batches=%d proposed=%d written=%d failures=%d dropped=%s",
+        "ov-ext reflect: batches=%d proposed=%d written=%d revised=%d "
+        "unwritten=%d failures=%d dropped=%s",
         report.batches,
         report.proposed,
         report.written,
+        report.revised,
+        report.unwritten,
         report.failures,
         report.dropped,
     )

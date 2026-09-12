@@ -26,7 +26,8 @@ import asyncio
 import hashlib
 import logging
 import random
-from collections.abc import Sequence
+from collections import Counter
+from collections.abc import Collection, Sequence
 from datetime import datetime, timezone
 from typing import Any, TypeVar
 
@@ -34,9 +35,9 @@ from pydantic import BaseModel
 
 from .citations import parse_timestamp
 from .config import ReflectSettings
-from .exceptions import ContentUnavailableError
+from .exceptions import ContentUnavailableError, ObservationUnreadableError
 from .models import MemoryRow, Observation
-from .verify import normalise
+from .verify import areas_of, is_resource
 
 __all__ = ["VikingLLM", "VikingStore"]
 
@@ -59,11 +60,6 @@ _ROW_FIELDS = ["uri", "content", "created_at", "updated_at"]
 # query stays a cheap indexed scan.
 _TAIL_WINDOW = 10
 
-# Between two changes to one memory in a batch. Verification normalises
-# whitespace before comparing, so joining with a newline would let a quote run
-# from the end of one change into the start of another -- a span that exists in
-# no memory, verified against a row that only looks like one. The rule is a
-# token normalisation cannot collapse away.
 # How much wider than the requested batch to read before filtering by memory
 # type. Most deltas in a busy store are entities, so a small factor is enough.
 _DELTA_OVERREAD = 4
@@ -73,7 +69,22 @@ _DELTA_OVERREAD = 4
 # discarded should not cost a neighbour its slot.
 _EVIDENCE_OVERREAD = 3
 
+# Between two changes to one memory in a batch. Verification normalises
+# whitespace before comparing, so joining with a newline would let a quote run
+# from the end of one change into the start of another -- a span that exists in
+# no memory, verified against a row that only looks like one. The rule is a
+# token normalisation cannot collapse away.
 _DELTA_SEPARATOR = "\n\n---\n\n"
+
+# Heading the rendered evidence bullets sit under. Written by `_render` and
+# looked for by `_claim_of`, which is why it is one constant and not two
+# strings that have to be kept the same.
+_EVIDENCE_HEADING = "## Evidence"
+
+# Longest observation filename before it is shortened and given a digest. Well
+# inside the 255 bytes a filesystem allows, with room for the `.md` and for a
+# store that is later exported onto a path with a deep prefix.
+_MAX_NAME_CHARS = 80
 
 
 class VikingLLM:
@@ -331,7 +342,14 @@ class VikingStore:
         if self._deltas is not None:
             return await self._changed_from_deltas(limit=limit)
 
-        from openviking.storage.expr import And, Eq, PathScope, TimeRange
+        from openviking.storage.expr import And, Eq, Or, PathScope, TimeRange
+
+        types = list(self._settings.memory_types)
+        if not types:
+            # Nothing is reflectable, so there is nothing to ask for. Guarded
+            # because an empty `Or` is an empty disjunction, which a backend is
+            # as likely to compile to "everything" as to "nothing".
+            return []
 
         # level=2 is the memory itself. Levels 0 and 1 are the generated
         # directory abstract and overview, whose refresh deliberately lags
@@ -339,7 +357,17 @@ class VikingStore:
         # exactly the large directories that matter most.
         condition = And(
             [
-                PathScope("uri", self._memory_root),
+                # Scoped to the reflectable types, not to the memory root with a
+                # filter afterwards. The root holds every type OpenViking ships
+                # -- events, preferences, trajectories, cases, and reflection's
+                # own observations -- while only `memory_types` is reflected on,
+                # so filtering in Python made `limit` mean "rows to read" rather
+                # than "memories to reflect on". A busy stretch of events then
+                # filled the window with rows that were all discarded, and the
+                # sweep reported nothing changed while holding the watermark:
+                # the same rows, every tick, forever. Asking the index for the
+                # right subtrees means the limit counts what it says it counts.
+                Or([PathScope("uri", f"{self._memory_root}/{name}") for name in types]),
                 Eq("context_type", "memory"),
                 Eq("level", 2),
                 # ISO string, not a datetime: the backends coerce a
@@ -367,11 +395,31 @@ class VikingStore:
             order_desc=False,
             ctx=self._ctx,
         )
-        return [
+        records = list(records)
+        changed = [
             str(record["uri"])
             for record in records
             if record.get("uri") and parse_timestamp(record.get("updated_at")) > moment
         ]
+        if records and not changed and len(records) >= limit:
+            # Every row came back sitting exactly on the mark, and the page was
+            # full. `TimeRange` compiles `start` to `>=`, so those rows are read
+            # and dropped every sweep, and anything newer is behind them --
+            # the sweep reports "nothing changed" and holds the watermark
+            # forever. Rare, because it needs `batch_limit` memories written
+            # within one timestamp tick, which is a bulk import rather than a
+            # day's work. Said loudly rather than fixed by nudging the mark
+            # past them: that would skip memories nothing has reflected on,
+            # which is the failure this whole path is arranged to avoid.
+            logger.error(
+                "ov-ext reflect: all %d rows read sit exactly on the watermark "
+                "(%s) and the page is full, so the sweep cannot see past them "
+                "and will not advance. Raise OV_REFLECT_BATCH_LIMIT above the "
+                "number of memories sharing that timestamp.",
+                len(records),
+                moment.isoformat(),
+            )
+        return changed
 
     async def _changed_from_deltas(self, *, limit: int) -> list[str]:
         """Return URIs with pending deltas, oldest change first.
@@ -406,7 +454,14 @@ class VikingStore:
                 ordered.append(uri)
             self._consumed[uri].append(int(record["id"]))
             self._delta_text.setdefault(uri, []).append(record)
-        if skipped:
+        if skipped and not self._settings.dry_run:
+            # Not during a dry run. This is the second place deltas are retired
+            # -- the engine's `mark_reflected` after a batch is the other -- and
+            # guarding only that one still let a dry run write to the delta
+            # table. The case it ruins is the main reason to dry-run at all:
+            # previewing a change to `memory_types`. Run the preview on the old
+            # setting and every delta the new setting would have covered is
+            # retired as "not reflectable", so the real run finds nothing left.
             logger.debug(
                 "ov-ext reflect: %d deltas outside %s retired without reflection",
                 skipped,
@@ -690,17 +745,221 @@ class VikingStore:
             return None
         return str(content) if content else None
 
-    async def write_observation(self, observation: Observation) -> str:
-        """Write an observation as a memory file and return its URI."""
-        from openviking.session.memory.dataclass import MemoryFile
-        from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
+    def observation_uri(
+        self, observation: Observation, subjects: Collection[str] = ()
+    ) -> str:
+        """Where an observation belongs: one file per memory reflected on.
 
-        topic = _topic(observation)
-        name = f"{_subject(observation)}-{_digest(observation)}"
+        Pure, and separate from the write, because the engine has to know the
+        file *before* it writes -- that is where it looks for the observation
+        already standing there and asks the model what holds now.
+
+        Parameters
+        ----------
+        observation :
+            The verified observation to file.
+        subjects :
+            The memories this batch was reflecting on. What an observation is
+            filed under, when it cites one of them -- see :func:`_primary` for
+            why the evidence alone is not a stable enough answer.
+        """
+        return self._uri_for(observation, list(subjects))
+
+    async def resolve(
+        self, observation: Observation, subjects: Collection[str] = ()
+    ) -> tuple[str, Observation | None]:
+        """The file an observation belongs in, and what already stands there.
+
+        One call rather than two, because the engine must not write before it
+        knows what it would be writing over.
+
+        The file is the subject's, and only the subject's. Reusing a *different*
+        subject's file when the subject has none of its own was tried, to close
+        one real gap: an observation about two entities is filed under whichever
+        of them changed, so as first one and then the other is edited, the same
+        running claim alternates between two names. Two files, neither
+        superseding the other.
+
+        It does not survive contact with a real store. Any structural test for
+        "these two are the same claim" has to be computed over the files'
+        citations, and citations accumulate: every revision folds new sources
+        into the standing observation, so the most-revised file ends up with the
+        widest basin, and the busiest memory in a personal store -- the user's
+        own person entity -- pulls in the first observation about every new
+        entity. That entity's own file is then never created, so every later
+        observation about it is pulled in too, and the revise pass is handed
+        unrelated claims with instructions to merge them. Two successive
+        versions of that test each looked airtight and each regrew the same
+        magnet one hop further out.
+
+        So the alternation stands, and is the documented cost. It is bounded --
+        one file per entity the claim is co-cited with and that is itself
+        reflected on, each of them evolving in place -- while the merge it was
+        traded against is unbounded and cannot be undone. Wider than "a pair":
+        three entities taking turns give three files, and a claim whose cited
+        partners drift gives one per partner. The duplication is of the claim,
+        not of the file: each file is legitimately what has been observed about
+        its own entity. Closing it properly needs a test of whether two claims
+        *say* the same thing, which is a model call and a separate feature.
+
+        Parameters
+        ----------
+        observation :
+            The verified observation to file.
+        subjects :
+            The memories this batch reflected on.
+
+        Returns
+        -------
+        tuple[str, Observation | None]
+            Where to write, and the observation already there, if any.
+
+        Raises
+        ------
+        ObservationUnreadableError
+            When the file could not be read, so it is unknown whether an
+            observation is already there.
+        """
+        uri = self.observation_uri(observation, subjects)
+        return uri, await self.read_observation(uri)
+
+    def _uri_for(self, observation: Observation, ranked: Sequence[str]) -> str:
+        """The URI an observation takes when ``ranked`` names its subject."""
         root = self._settings.observations_root.replace(
             "viking://~", f"viking://user/{self._ctx.user.user_id}"
         )
-        uri = f"{root.rstrip('/')}/{topic}/{name}.md"
+        # Filed under this one candidate: passing it as the batch's subjects
+        # makes it outrank everything else in the evidence, which is what
+        # "what would this be called if it were about that memory" means.
+        return f"{root.rstrip('/')}/{_topic(observation, ranked)}/{_subject(observation, ranked)}.md"
+
+    async def whole_memories(self, uris: Sequence[str]) -> list[MemoryRow]:
+        """Return the memories behind ``uris`` in full, never as deltas.
+
+        :meth:`rows` deliberately serves a changed memory as the lines that
+        changed, which is the whole point of the delta path. That makes it the
+        wrong thing to re-check a carried-forward quote against: the quote was
+        drawn from the whole memory, and comparing it to this sweep's few edited
+        lines reports every older citation as stale and deletes it. Since the
+        subject of a revision is by construction a memory that just changed,
+        that would strip an observation's provenance on every pass.
+        """
+        return await self._rows_from_index(uris)
+
+    async def read_observation(self, uri: str) -> Observation | None:
+        """Return the observation already written at ``uri``, or ``None``.
+
+        Rebuilt from the file's own ``derived_from`` links rather than by
+        parsing the Evidence bullets back out of the prose. The links are what
+        this store wrote, one per verified quote with the quote as
+        ``match_text``, so the round trip carries exactly the evidence that was
+        checked -- while a bullet is rendered text, and re-reading it would
+        promote whatever the file happens to say into a citation.
+
+        Returns ``None`` when there is no file yet, which is the usual case: an
+        entity gets an observation the first time a sweep has something to say
+        about it.
+
+        Raises
+        ------
+        ObservationUnreadableError
+            When the read failed for any reason other than the file not being
+            there, so what is at ``uri`` is unknown rather than absent.
+        """
+        from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
+
+        from openviking_cli.exceptions import NotFoundError
+
+        try:
+            raw = await self._fs.read_file(uri, ctx=self._ctx)
+        except NotFoundError:
+            # No file yet: the usual case, and the only one that means "write a
+            # first observation here".
+            return None
+        except Exception as exc:
+            # Anything else -- unreachable, timed out, not permitted -- means
+            # nothing is known about what is there. Raised rather than reported
+            # as absence, because the caller's response to absence is to write,
+            # and writing over a file you could not read destroys every revision
+            # it accumulated. A sweep that skips one observation during an
+            # outage costs a sweep; this costs the memory.
+            raise ObservationUnreadableError(
+                f"could not read the observation standing at {uri}"
+            ) from exc
+        if not raw:
+            return None
+        try:
+            memory_file = MemoryFileUtils.read(raw, uri=uri)
+        except Exception as exc:
+            raise ObservationUnreadableError(
+                f"{uri} did not parse as a memory file"
+            ) from exc
+
+        evidence = tuple(
+            (str(link["to_uri"]), str(link["match_text"]))
+            for link in (memory_file.links or [])
+            if link.get("link_type") == "derived_from"
+            and link.get("to_uri")
+            and link.get("match_text")
+        )
+        if not evidence:
+            # Parsing does not fail on text that is not a memory file --
+            # `MemoryFileUtils.read` hands back the raw bytes as `content` --
+            # so "it parsed" is not evidence that this is an observation. Every
+            # one this store writes carries a `derived_from` link per quote, so
+            # none at all means either something else is at this URI or an
+            # observation has lost its provenance. Refused either way: the
+            # caller writes on `None`, and writing here would replace whatever
+            # is there with a file built from text nobody verified.
+            raise ObservationUnreadableError(
+                f"{uri} carries no derived_from links, so it is not an "
+                "observation this sweep can revise"
+            )
+        # `plain_content`, not `content`. OpenViking linkifies each link's
+        # `match_text` where it appears in the body, and a claim usually
+        # restates what it cites -- so the stored H1 and paragraph come back
+        # carrying `[quote](viking://...)`. Read raw, that markup becomes the
+        # model's input and then the file's canonical claim, compounding every
+        # revision. Stripping puts back what was written.
+        body = str(memory_file.plain_content() or "")
+        return Observation(
+            title=_title_of(body),
+            content=_claim_of(body),
+            evidence=evidence,
+            areas=areas_of(uri for uri, _ in evidence),
+        )
+
+    async def write_observation(
+        self, observation: Observation, *, uri: str | None = None
+    ) -> str:
+        """Write an observation as a memory file and return its URI.
+
+        Parameters
+        ----------
+        observation :
+            What to write. Its own :meth:`observation_uri` is used when no
+            ``uri`` is given.
+        uri :
+            Write here instead. The engine passes the file it read the standing
+            observation from, because folding in new evidence can change which
+            memory is quoted most -- and a revision that relocated itself would
+            leave the file it was revising untouched and start a second one,
+            which is the sprawl this naming exists to end.
+        """
+        from openviking.session.memory.dataclass import MemoryFile
+        from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
+
+        if not observation.evidence:
+            # Every line of an observation is supposed to be traceable to a
+            # `derived_from` link, so one with no evidence is not an observation
+            # this store writes. Refused rather than written with no links,
+            # which would also divide by zero on the weight below.
+            raise ValueError(
+                f"refusing to write {uri or 'an observation'} with no evidence"
+            )
+        uri = uri or self.observation_uri(observation)
+        topic, name = uri.rsplit("/", 2)[-2:]
+        name = name.removesuffix(".md")
 
         links = [
             {
@@ -792,77 +1051,184 @@ class VikingStore:
         )
 
 
-def _topic(observation: Observation) -> str:
+def _ranked(observation: Observation, subjects: Collection[str] = ()) -> list[str]:
+    """The memories an observation could be filed under, best first.
+
+    More than one, because the best answer is not always available. See
+    :func:`_primary` for the ordering and :meth:`VikingStore.resolve` for what
+    the runners-up are for.
+    """
+    counts = Counter(uri for uri, _ in observation.evidence)
+    changed = set(subjects)
+    return sorted(
+        counts,
+        key=lambda uri: (
+            0 if uri in changed else 1,
+            _rank(uri),
+            -counts[uri],
+            _stem(uri),
+            uri,
+        ),
+    )
+
+
+def _primary(observation: Observation, subjects: Collection[str] = ()) -> str:
+    """The memory an observation is about, and is therefore filed under.
+
+    ``subjects`` is what the sweep was reflecting *on* -- the memories that
+    changed in this batch. It decides, and everything else is a tiebreak,
+    because the changed memory is the only thing in an observation that does not
+    vary with the draw. Evidence does: a batch pairs the changed memory with
+    whichever neighbours the sample happened to surface, so ranking on evidence
+    alone files the same running claim under a different partner every sweep.
+    Measured against the live store, five observations about ``blog_scraper``
+    landed in ``dev_tool/embark``, ``cloud_service/azure``, ``person/jasper``
+    and ``library/httpx`` -- four of them named after the other entity, because
+    with two sources quoted once each the alphabetical tiebreak fell through to
+    the category folder at the front of the URI.
+
+    Worse than untidy: unrelated claims sharing one busy partner -- and in a
+    personal store the busiest is the user's own ``person`` entity -- were then
+    handed to the revise pass together, which merges what it is given. Sprawl is
+    recoverable. A model folding "Zed is the editor of choice" into "the scraper
+    retries with backoff" is not.
+
+    Within a tier: most quotes, then the memory's own name, then its full URI.
+    The name before the URI so a tiebreak turns on what the memory is called
+    rather than on which folder it happens to sit in.
+
+    This is the *best* answer, not the only acceptable one. An observation about
+    a pair of entities is filed under whichever of them changed, so the same
+    running claim alternates between two files as first one and then the other
+    is edited. :meth:`VikingStore.resolve` closes that by preferring a file that
+    already exists over a better-ranked one that does not.
+    """
+    ranked = _ranked(observation, subjects)
+    return ranked[0] if ranked else ""
+
+
+def _rank(uri: str) -> int:
+    """How eligible a cited memory is to be what an observation is filed under.
+
+    An entity first: entities are what the sweep reflects on and what an
+    observation is *about*, while an event or a resource is how it was noticed.
+    A resource last -- it is captured third-party text, so filing a finding
+    about the user under someone else's article is wrong even when that article
+    is where most of the quotes came from.
+    """
+    if "/memories/entities/" in uri:
+        return 0
+    return 2 if is_resource(uri) else 1
+
+
+def _stem(uri: str) -> str:
+    """The memory's own filename, without the extension."""
+    return uri.rsplit("/", 1)[-1].removesuffix(".md")
+
+
+def _topic(observation: Observation, subjects: Collection[str] = ()) -> str:
     """The folder an observation is filed under.
 
-    The entity category it is about, when one of its sources is an entity --
-    which is the usual case, since entities are what the sweep reflects on.
+    The category of the memory it is about: ``software_project`` for an
+    observation about ``entities/software_project/blog_scraper.md``, so the
+    observations tree mirrors the entities tree it comments on.
 
-    Not the last segment of the first area, which is what this used to be. That
-    reads well for ``memories/entities/dev_tool/x.md`` and absurdly for
+    Not the last segment of the area, which is what this used to be. That reads
+    well for ``memories/entities/dev_tool/x.md`` and absurdly for
     ``memories/events/2026/09/07/x.md``, where the last segment is the day of
     the month -- which is how a store ends up with folders called 06, 07 and 08.
     """
-    for uri in sorted(observation.sources):
-        parts = uri.split("/memories/", 1)
-        if len(parts) != 2:
-            continue
+    primary = _primary(observation, subjects)
+    parts = primary.split("/memories/", 1)
+    if len(parts) == 2:
         segments = parts[1].split("/")
         if segments[0] == "entities" and len(segments) > 2:
             return _slug(segments[1])
-    # No entity among the sources: the memory type itself, which is at least a
-    # word rather than a number.
-    for uri in sorted(observation.sources):
-        parts = uri.split("/memories/", 1)
-        if len(parts) == 2:
-            return _slug(parts[1].split("/")[0])
+        # Not an entity: the memory type itself, which is at least a word
+        # rather than a number.
+        return _slug(segments[0])
+    if is_resource(primary):
+        return "resources"
     return "observations"
 
 
-def _subject(observation: Observation) -> str:
+def _subject(observation: Observation, subjects: Collection[str] = ()) -> str:
     """A readable, *stable* name for what the observation is about.
 
-    The memories it cites, not the title the model gave it. A title is the
-    model's wording and it does not survive a re-run: the same claim from the
-    same evidence came back as "Jasper consistently measures and optimizes
-    token usage", "Jasper focuses on token usage" and "Token usage and
-    measurement is a recurring concern" -- three files, one observation, and a
-    digest that was doing its job while the title in the filename cancelled it.
+    The memory it is most about, not the title the model gave it and not the
+    evidence it happens to rest on this time. Both of those were tried and both
+    multiply files:
+
+    A title is the model's wording and does not survive a re-run -- the same
+    claim from the same evidence came back as "Jasper consistently measures and
+    optimizes token usage", "Jasper focuses on token usage" and "Token usage and
+    measurement is a recurring concern".
+
+    A hash of the cited quotes fares no better. Each sweep samples different
+    neighbours and the model quotes different spans, so the hash moves even when
+    the claim does not: thirteen files in the live store were one running
+    observation about ``blog_scraper``, each a snapshot nothing would ever
+    revisit. Naming the subject instead means the next sweep opens the file that
+    is already there.
+
+    The file stem alone is not enough below a memory type that nests. Every
+    daily reflection is called ``daily_reflection.md``, so an observation about
+    2026-09-07 and one about 2026-09-08 would share a file and be merged into
+    each other. ``_topic`` already spends the category on entities, so what is
+    left of the path is folded into the name for everything else -- the same
+    lesson ``_label`` learned, applied to the filename instead of the bullet.
     """
-    names = []
-    for uri in sorted(observation.sources):
-        stem = uri.rsplit("/", 1)[-1].removesuffix(".md")
-        slug = _slug(stem)
-        if slug not in names:
-            names.append(slug)
-    return "_".join(names[:2]) or "observation"
+    primary = _primary(observation, subjects)
+    if not primary:
+        return "observation"
+    parts = primary.split("/memories/", 1)
+    if len(parts) != 2:
+        return _slug(_stem(primary))
+    segments = parts[1].removesuffix(".md").split("/")
+    if segments[0] == "entities" and len(segments) > 2:
+        # `entities/<category>/<name>`: the category is the folder, so the name
+        # alone already says which memory this is.
+        return _name(segments[-1])
+    # Everything else: the memory type is the folder, so the rest of the path
+    # has to carry the distinction. `2026/09/07/daily_reflection` becomes
+    # `2026_09_07_daily_reflection`.
+    return _name(" ".join(segments[1:] or segments))
 
 
-def _digest(observation: Observation) -> str:
-    """A short stable hash of what an observation rests on.
+def _slug(text: str, *, words: int | None = 5) -> str:
+    """Reduce free text to a lowercase, underscore-joined path segment.
 
-    Over the cited memories *and the spans cited in them*, both normalised.
-    Sources alone would collapse two genuinely different readings of the same
-    two memories into one file; adding the wording would stop a re-run
-    colliding at all, which is the bug this replaced. The quotes are the
-    middle: they are what the claim is built from, and the same claim drawn
-    again from the same evidence quotes the same spans.
-
-    Whitespace is normalised because the model reflows -- a quote differing
-    only in a line break is the same quote, and the verifier already treats it
-    that way.
+    ``words`` caps how many are kept, for a folder name that has to stay
+    readable. ``None`` keeps all of them, for a name that has to stay *unique*
+    -- see :func:`_name`.
     """
-    material = "\n".join(
-        sorted(f"{uri}\x00{normalise(quote)}" for uri, quote in observation.evidence)
-    )
-    return hashlib.sha256(material.encode()).hexdigest()[:8]
-
-
-def _slug(text: str) -> str:
-    """Reduce free text to a lowercase, underscore-joined path segment."""
     cleaned = "".join(char if char.isalnum() else " " for char in text.lower())
-    words = cleaned.split()
-    return "_".join(words[:5]) or "untitled"
+    parts = cleaned.split()
+    return "_".join(parts if words is None else parts[:words]) or "untitled"
+
+
+def _name(text: str) -> str:
+    """Name a memory's observation file, uniquely.
+
+    A word cap cannot be used here. OpenViking's own entity names run long and
+    differ at the end -- ``openviking_memory_plugin_for_claude_code`` and
+    ``..._for_claude_desktop``, ``ov_clip_browser_extension_for_chrome`` and
+    ``..._for_firefox`` -- so five words maps both members of each pair onto one
+    file. Two distinct entities sharing a file is not untidy, it is destructive:
+    the revise pass is then told they are one subject and asked to fold their
+    claims into a single paragraph, and there is no other copy to recover from.
+
+    So the whole name is kept, and only a name too long for a filesystem is
+    shortened -- with a digest of the full name appended, so two that shared a
+    prefix still land apart. A digest over the *entity's name* is stable in a
+    way the evidence digest this replaced was not: the name is the same every
+    sweep, while the quotes were never the same twice.
+    """
+    full = _slug(text, words=None)
+    if len(full) <= _MAX_NAME_CHARS:
+        return full
+    keep = full[:_MAX_NAME_CHARS].rstrip("_")
+    return f"{keep}_{hashlib.sha256(full.encode()).hexdigest()[:8]}"
 
 
 def _label(uri: str) -> str:
@@ -896,7 +1262,60 @@ def _render(observation: Observation) -> str:
     an explicit ``[uri](uri)`` as well produced two links per bullet -- the
     whole URI as its own label, and the quote linkified inside its quotation
     marks.
+
+    The title is flattened to one line. It is written as an H1 and read back as
+    one, so a model that returned two lines would otherwise donate the second to
+    the claim on the next revision, one line per revision.
     """
-    lines = [f"# {observation.title}", "", observation.content, "", "## Evidence", ""]
+    title = " ".join(observation.title.split()) or "Observation"
+    lines = [f"# {title}", "", observation.content, "", _EVIDENCE_HEADING, ""]
     lines += [f'- {_label(uri)}: "{quote}"' for uri, quote in observation.evidence]
     return "\n".join(lines)
+
+
+def _title_of(body: str) -> str:
+    """The title of a rendered observation: its H1, or its first line.
+
+    The fallback matters because this parses a file the *previous* version of
+    this module wrote, and a revision that lost the title would hand the model
+    an untitled standing observation and get back a new name for something that
+    already had one.
+    """
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            # `lstrip` rather than a fixed offset: a bare `#` is what an empty
+            # title renders as, and slicing two characters off it yields the
+            # hash itself as the observation's name.
+            return stripped.lstrip("#").strip()
+        if stripped:
+            return stripped
+    return ""
+
+
+def _claim_of(body: str) -> str:
+    """The claim of a rendered observation: everything between H1 and Evidence.
+
+    The bullets are dropped rather than carried into the revise prompt. They
+    are the quotes rendered for a reader, and feeding them back as prose is how
+    a model comes to treat "the memory says X" as the observation instead of as
+    its support.
+
+    Split on the *last* Evidence heading, not the first. ``_render`` writes
+    exactly one and writes it after the claim, so the last is always the real
+    one -- while a claim that happens to contain that line, which a model
+    writing about this very feature will produce, would be truncated at itself
+    and the loss written back as the new claim.
+    """
+    lines = body.splitlines()
+    start = 0
+    for index, line in enumerate(lines):
+        if line.strip().startswith("#"):
+            start = index + 1
+            break
+    end = len(lines)
+    for index in range(len(lines) - 1, start - 1, -1):
+        if lines[index].strip() == _EVIDENCE_HEADING:
+            end = index
+            break
+    return "\n".join(lines[start:end]).strip()

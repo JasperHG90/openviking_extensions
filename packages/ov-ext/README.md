@@ -407,8 +407,18 @@ for dir, uris in group_by_parent(changed):
     mems  = deltas(uris) + neighbours() + tail_sample()
     obs   = propose(scope, mems)               # the one model call
     obs   = verify_quotes(obs, mems)           # code, no model
-    write(obs)
+    for o in obs:
+        standing = read(file_for(o, changed))  # the subject's one file
+        write(revise(standing, o) if standing else o)
 ```
+
+The change query asks the index for `memory_types` only, by scoping to those
+subtrees. Filtering after the query instead made `BATCH_LIMIT` count rows read
+rather than memories to reflect on, so a busy stretch of events — or the
+sweep's own observations, which live under the same root — filled the window
+with rows that were all discarded. The sweep then reported nothing changed and
+held the watermark, which is not a stall `MAX_STALLS` can step over: the same
+rows come back every tick, forever.
 
 A changed memory is shown to the model as the lines that changed, not the
 file they sit in — measured on a real 23 KB memory, two edited lines, that is
@@ -441,6 +451,116 @@ with the quote as `match_text`. That is not a structure invented here:
 OpenViking's link vocabulary already defines `derived_from` for summary facts
 and already contracts `match_text` to appear verbatim. Verification is what
 makes reflection's links legal rather than merely plausible.
+
+### One observation per subject, revised in place
+
+An observation is filed under the memory it is about, so
+`entities/software_project/blog_scraper.md` has exactly one observation at
+`observations/software_project/blog_scraper.md` however many times it is
+reflected on.
+
+**The subject is what the sweep was reflecting on**, not what the evidence
+happened to pair it with — and a file that already exists beats a
+better-ranked one that does not. Those two rules together are what make the
+identity stable. A batch shows the
+model the changed memories plus whichever neighbours the sample drew, so
+evidence varies every sweep while the changed memory does not. Ranking on
+evidence alone files the same running claim under a different partner each
+time: with two memories quoted once each — the shape `MIN_EVIDENCE=2` produces,
+so the common one — the tiebreak falls through to the category folder at the
+front of the URI, and five observations about `blog_scraper` land under
+`dev_tool/embark`, `cloud_service/azure`, `person/jasper` and `library/httpx`.
+
+That is worse than the sprawl it replaces, because unrelated claims sharing one
+busy partner — in a personal store, usually the user's own `person` entity —
+then get handed to the revise pass together, and revision merges what it is
+given. Redundant files can be read and reconciled. A model folding "Zed is the
+editor of choice" into "the scraper retries with backoff" cannot be undone.
+
+**A known, bounded cost.** An observation about two entities is filed under
+whichever of them changed, so as first one and then the other is edited, the
+same running claim ends up in more than one file — one per entity it is
+co-cited with that is itself reflected on, each evolving, none superseding the
+others. A claim about three entities that take turns changing reaches three
+files, and a claim whose cited partners drift over time reaches one per
+partner. Reusing the first entity's file to close that was built twice and
+reverted twice. Any structural test for "these are the same claim" has to run
+over the two files' citations, and citations accumulate: every revision folds
+new sources in, so the most-revised file acquires the widest reach and the
+busiest memory in a personal store — your own `person` entity — swallows the
+first observation about every new entity. That entity's file is then never
+created, so every later observation about it is swallowed too, and unrelated
+claims reach a pass that merges what it is given. Bounded duplication beats
+unbounded destructive merging — and it is duplication at the level of the
+*claim*, not the file: every one of those files is legitimately "what has been
+observed about this entity", and every one evolves in place. Closing this properly needs a test of whether
+two claims *say* the same thing, which is a model call and a separate feature.
+
+Only when an observation cites no changed memory does evidence decide: entity
+first, then most-quoted, then the memory's own name. A resource ranks last —
+it is captured third-party text, so a finding about you does not belong under
+someone else's article.
+
+Filenames keep the entity's whole name. A word cap looks tidier and quietly
+merges `openviking_memory_plugin_for_claude_code` with `..._for_claude_desktop`
+— two entities, one file, and the revise pass then told they are one subject.
+A name too long for a filesystem is shortened with a digest of the full name
+appended, which is stable across sweeps in the way the evidence digest this
+design replaced was not.
+
+When a sweep has something new to say about a subject, it reads the file that
+is already there and asks the model for the observation that holds now: fold in
+what the new claim adds, drop what it supersedes, state a reversal as what is
+true today rather than as a history of what was believed. That call gets the
+two claims and no quotes — the evidence on both sides has already been verified
+against the memories it cites, and letting the model restate a quote would put
+unchecked text into a file whose every line is supposed to be traceable. The
+merged evidence is attached in code, this sweep's first, capped at
+`OV_REFLECT_MAX_EVIDENCE` so an observation revised for months does not drag
+its founding quotes along forever. Carried-forward quotes are re-checked
+against the whole memory they cite *as it is now* — never against the delta,
+which holds only this sweep's edited lines and would call every older citation
+stale — and dropped when the memory no longer contains them — they were verified when the standing observation was written,
+which may have been months ago, and a file that re-asserts a stale citation at
+every revision is worse than one that forgets it.
+
+**A file that could not be read is not treated as absent.** "No file yet" comes
+back as `None` and means write; a failed read — unreachable, timed out, not
+permitted, or a file carrying no `derived_from` links and so not an observation
+at all — raises, and the sweep leaves that file alone. The two must not be
+spelled the same way: the response to absence is to write, so one timed-out
+read would replace months of accumulated revisions with a single sweep's
+observation.
+
+One window remains, and it is upstream. `VikingFS.read_file` stats and then
+reads, and converts a failure of the *read* into `NotFoundError` — so a blip
+between the two is indistinguishable from a missing file. The guarantee here is
+therefore "every failure ov-ext can see is refused", not "no overwrite is
+possible".
+
+If the revise call fails, the standing file is left exactly as it is, and the
+changes *that observation was drawn from* stay pending rather than being
+retired — reaching the write is not the same as writing. Only those: the delta
+path pools every change into one batch, so retiring per batch would let one
+stuck subject hold up the whole sweep indefinitely, and drag every healthy
+subject back through a revise call on every tick.
+
+**This protects the delta path only.** Without `OV_REFLECT_DELTAS_DSN` there is
+nothing to keep pending — the watermark is the only record of progress, and it
+advances on whether the model calls ran, not on whether each observation landed.
+A change whose observation could not be written is counted in `unwritten` and
+then passed over. Reflection will come back to that memory the next time it is
+edited; it will not come back on its own. Writing the new claim to a file of its own is the failure mode
+this design exists to end, and overwriting an observation with one the model
+never got to reconcile loses what it says. Both cases are counted as
+`unwritten`, kept apart from `failures`: nothing was abandoned and nothing was
+lost, but a number that stays high means one subject's file is stuck.
+
+Naming a file after its evidence instead is what this replaced, and it does not
+degrade gracefully: each sweep samples different neighbours, so the model quotes
+different spans and the name moves even when the claim does not. One running
+observation about a scraper became thirteen files — each true, none of them the
+current answer, and all of them eligible to be cited by the next sweep.
 
 Change detection, evidence and verification all run against the vector index:
 the L2 rows carry the memory text, so the sweep never opens a file to find or
@@ -519,7 +639,7 @@ the one path every sweep goes through, so there is no second, unlocked way in.
 | Variable | Default | What it does |
 |---|---|---|
 | `OV_REFLECT_ENABLED` | `false` | Register the memory type and allow sweeps. Off until you turn it on |
-| `OV_REFLECT_DRY_RUN` | `false` | Read, prompt and verify; report what it would write |
+| `OV_REFLECT_DRY_RUN` | `false` | Read, prompt, verify and resolve; report the file each observation would land in, and whether it would create or revise. Writes nothing and makes no revise call |
 | `OV_REFLECT_MODEL` | _(the server's)_ | Model the sweep reasons with. Reflection needs no vision and does need to finish |
 | `OV_REFLECT_PASSES` | `3` | Model calls per sweep, each over a different random sample |
 | `OV_REFLECT_PASS_SIZE` | `12` | Changed entities shown in one pass |
@@ -532,6 +652,7 @@ the one path every sweep goes through, so there is no second, unlocked way in.
 | `OV_REFLECT_NEIGHBOUR_LIMIT` | `8` | Semantic neighbours per changed memory |
 | `OV_REFLECT_TAIL_SAMPLE` | `3` | Memories drawn from the far end of the store |
 | `OV_REFLECT_MIN_EVIDENCE` | `2` | Distinct memories an observation must cite to survive |
+| `OV_REFLECT_MAX_EVIDENCE` | `12` | Most quotes one observation keeps as it is revised. Newest survive |
 | `OV_REFLECT_REQUIRE_CROSS_AREA` | `false` | Keep only observations spanning several directories |
 | `OV_REFLECT_MAX_STALLS` | `3` | Sweeps that may advance nothing before stepping over a failing batch |
 | `OV_REFLECT_INTERVAL_SECONDS` | `900` | Gap between the end of one sweep and the start of the next |

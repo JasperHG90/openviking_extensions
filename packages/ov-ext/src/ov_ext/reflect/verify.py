@@ -36,12 +36,13 @@ differs in a word is a quote the model wrote rather than read.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 
 from .models import CandidateObservation, MemoryRow, Observation
 
 __all__ = [
     "areas_covered",
+    "areas_of",
     "is_resource",
     "normalise",
     "quote_is_present",
@@ -93,6 +94,16 @@ def areas_covered(uris: Sequence[str], rows: Mapping[str, MemoryRow]) -> frozens
     together, which is what a cross-area pass is looking for.
     """
     return frozenset(rows[uri].area for uri in uris if uri in rows)
+
+
+def areas_of(uris: Iterable[str]) -> frozenset[str]:
+    """The distinct directories a set of URIs spans, read off the URIs alone.
+
+    The same rule as :attr:`ov_ext.reflect.models.MemoryRow.area`, for a caller
+    holding no rows -- an observation rebuilt from its file cites memories that
+    were read by a sweep which finished long ago.
+    """
+    return frozenset(uri.rsplit("/", 1)[0] for uri in uris if "/" in uri)
 
 
 def is_resource(uri: str) -> bool:
