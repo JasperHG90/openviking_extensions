@@ -447,7 +447,15 @@ discarded — counted over sources, not quotes, so three quotes from one
 paragraph do not stand in for a synthesis.
 
 Observations land as their own memory type, one `derived_from` link per quote
-with the quote as `match_text`. That is not a structure invented here:
+with the quote as `match_text`, and are indexed as they are written.
+
+That last part is not free. A raw `write_file` writes bytes and nothing else —
+the vector row, the `abstract` the UI shows and the directory overview are all
+built during vectorization, which a direct write never reaches. Observations
+written before v0.7.1 exist on disk and are absent from search; the sweep now
+calls `MemoryUpdater.refresh_file_embedding` after each write. The abstract is
+not a second model call: it is the observation's own text, link-stripped and
+truncated. That is not a structure invented here:
 OpenViking's link vocabulary already defines `derived_from` for summary facts
 and already contracts `match_text` to appear verbatim. Verification is what
 makes reflection's links legal rather than merely plausible.

@@ -1655,3 +1655,141 @@ async def test_the_alternation_is_per_co_cited_entity_not_per_pair() -> None:
 
     assert len(landed) == 4, "one file per entity that is itself reflected on"
     assert all(uri.endswith(".md") for uri in landed)
+
+
+# --- an observation nothing can find is an observation nobody has ------------
+
+
+class Indexer:
+    """Stands in for the two MemoryUpdater classmethods that index a write."""
+
+    def __init__(self, indexed: bool = True, blow_up: bool = False) -> None:
+        self.indexed = indexed
+        self.blow_up = blow_up
+        self.embeddings: list[dict[str, Any]] = []
+        self.overviews: list[str] = []
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from openviking.session.memory.memory_updater import MemoryUpdater
+
+        async def refresh_file_embedding(**kwargs: Any) -> bool:
+            if self.blow_up:
+                raise RuntimeError("the embedding queue is down")
+            self.embeddings.append(kwargs)
+            return self.indexed
+
+        async def refresh_schema_overview(**kwargs: Any) -> bool:
+            self.overviews.append(kwargs["directory_uri"])
+            return True
+
+        monkeypatch.setattr(
+            MemoryUpdater, "refresh_file_embedding", refresh_file_embedding
+        )
+        monkeypatch.setattr(
+            MemoryUpdater, "refresh_schema_overview", refresh_schema_overview
+        )
+
+
+async def test_a_written_observation_is_put_in_the_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`write_file` writes bytes and stops.
+
+    Everything that makes a memory findable -- the vector row, the abstract the
+    UI shows, the directory overview entry -- is done during vectorization, and
+    a raw write reaches none of it. Observations were on disk and nowhere else:
+    no abstract, and absent from search entirely.
+    """
+    indexer = Indexer()
+    indexer.install(monkeypatch)
+    fs = FakeFS()
+    db = FakeDB()
+
+    uri = await store(db, fs).write_observation(observation())
+
+    assert [call["uri"] for call in indexer.embeddings] == [uri]
+    assert indexer.embeddings[0]["memory_type"] == "observations"
+    assert indexer.embeddings[0]["vikingdb"] is db, "the index needs the backend"
+    assert indexer.overviews == [uri.rsplit("/", 1)[0]], (
+        "the overview must refresh the directory holding the file"
+    )
+
+
+async def test_an_observation_survives_an_indexer_that_falls_over(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The file is already written; failing the sweep would lose that too."""
+    Indexer(blow_up=True).install(monkeypatch)
+    fs = FakeFS()
+
+    uri = await store(fs=fs).write_observation(observation())
+
+    assert fs.writes, "the observation must still be on disk"
+    assert uri.endswith(".md")
+
+
+async def test_a_backend_with_no_embedding_queue_is_said_out_loud(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The symptom is a file that looks right and can never be found again."""
+    import logging
+
+    Indexer(indexed=False).install(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="ov_ext.reflect.viking"):
+        await store(fs=FakeFS()).write_observation(observation())
+
+    assert "not come back from search" in caplog.text
+
+
+def test_the_observations_schema_loads_the_way_the_indexer_loads_it() -> None:
+    """`refresh_file_embedding` builds its own registry from a templates dir.
+
+    Loaded here the same way, against OpenViking's real loader, rather than
+    asserting the loader's source text mentions the setting -- which passes as
+    long as the identifier appears anywhere in the function. If `observations`
+    stops resolving, every written observation is indexed against no schema and
+    silently loses the embedding template the memory type defines.
+    """
+    from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
+
+    from ov_ext.reflect.registration import TEMPLATES_DIR
+
+    registry = MemoryTypeRegistry(load_schemas=False)
+    registry.load_from_directory(str(TEMPLATES_DIR), replace=True)
+
+    schema = registry.get("observations")
+    assert schema is not None, "the indexer would find no schema for observations"
+    assert schema.embedding_template, (
+        "the embedding text would fall back to plain content"
+    )
+
+
+async def test_an_observation_is_always_one_level_under_its_topic() -> None:
+    """What keeps the overview refresh off the delete branch.
+
+    `_index` refreshes `uri.rsplit("/", 1)[0]`, which is the right directory
+    only while an observation sits exactly one level below the root. It does,
+    because `_topic`, `_subject` and `_name` all run through `_slug`, which
+    turns every non-alphanumeric character -- `/` included -- into a separator,
+    so a nested path flattens rather than surviving. Pinned because the branch
+    it avoids deletes a directory's overview and, on an empty listing, the
+    directory itself: a later change preserving nesting would put that back in
+    reach without touching `_index` at all.
+    """
+    adapter = store()
+    root = "viking://user/jasper/memories/observations"
+    hostile = [
+        ENTITY,
+        EVENT,
+        f"{MEMORIES}/events/2026/09/07/a/b/c/deeply_nested_thing.md",
+        f"{MEMORIES}/entities/cat/name with spaces and/slashes.md",
+        f"{MEMORIES}/entities/cat/{'x' * 200}.md",
+    ]
+
+    for source in hostile:
+        uri = adapter.observation_uri(
+            observation_over((source, "one"), (EVENT, "two")), {source}
+        )
+        below = uri[len(root) + 1 :]
+        assert below.count("/") == 1, f"{source} produced {below!r}"

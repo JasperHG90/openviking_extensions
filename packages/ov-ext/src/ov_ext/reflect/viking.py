@@ -15,9 +15,16 @@ an observation, and merging its ``derived_from`` edges back onto it.
 Reflection writes observations with ``write_file`` rather than through
 ``remember``. ``remember`` hands text to the extractor, which would rewrite the
 observation into whatever it decided the text meant -- the opposite of the
-point. A memory file written directly is still a first-class memory: it is
-indexed, searchable and linkable, and OpenViking's own ``MemoryFileUtils``
-serializes it so the format is theirs rather than ours.
+point. OpenViking's own ``MemoryFileUtils`` serializes the file, so the format
+is theirs rather than ours.
+
+A direct write is *not* on its own a first-class memory, which this module
+claimed for months and which was false. ``write_file`` writes bytes: the vector
+row, the ``abstract`` shown in the UI and the directory overview are all built
+during vectorization, which runs from ``apply_operations`` or the content-write
+path and never from a raw write. Every observation written before this was on
+disk and absent from search. :meth:`VikingStore._index` is the step that was
+missing.
 """
 
 from __future__ import annotations
@@ -982,7 +989,78 @@ class VikingStore:
         )
         self._warn_about_unrenderable(uri, observation)
         await self._fs.write_file(uri, MemoryFileUtils.write(memory_file), ctx=self._ctx)
+        await self._index(uri)
         return uri
+
+    async def _index(self, uri: str) -> None:
+        """Put a written observation into the index, and refresh its folder.
+
+        ``write_file`` writes bytes and stops. Everything that makes a memory
+        findable -- the vector row, the ``abstract`` the UI shows, the entry in
+        the directory overview -- is done by ``MemoryUpdater`` during
+        vectorization, and that runs from ``apply_operations`` or from the
+        content-write path, neither of which a raw write touches. So an
+        observation written here existed on disk and nowhere else: no abstract,
+        and absent from search entirely. Measured against the live store, a
+        semantic search scoped to the observations tree returned nothing while
+        the same search over entities returned five hits.
+
+        Added after the write rather than by moving to the content-write
+        coordinator. That coordinator is the blessed path and does slightly
+        more, but it also takes a path lock and raises where this does not, and
+        the write itself is not what was broken. This is the step that was
+        missing; a failure here leaves exactly what was there before.
+
+        The abstract is not model-written, incidentally -- it is the
+        observation's own text with links stripped, truncated. There is no
+        second model call here.
+
+        Runs before the engine's ``link`` calls, which re-serialize the file and
+        grow it -- ``MemoryFileUtils.write`` renders links back into the body.
+        The index stays correct anyway because the abstract is computed through
+        ``strip_all_links``, so the linkified and plain bodies reduce to the
+        same text. That is an upstream detail rather than a guarantee: if the
+        rendering or the stripping changes, this needs re-checking.
+        """
+        from openviking.session.memory.memory_updater import MemoryUpdater
+
+        try:
+            indexed = await MemoryUpdater.refresh_file_embedding(
+                viking_fs=self._fs,
+                vikingdb=self._db,
+                uri=uri,
+                memory_type="observations",
+                ctx=self._ctx,
+            )
+            if not indexed:
+                # False covers three cases upstream -- no embedding queue, no
+                # rows attempted, and any internal exception, which it logs
+                # itself and swallows. So the cause is not ours to name; the
+                # consequence is, and that is the part an operator needs.
+                logger.warning(
+                    "ov-ext reflect: %s was written but not indexed, so it will "
+                    "not come back from search. Check the vector backend's "
+                    "embedding queue, and openviking.session.memory."
+                    "memory_updater at WARNING for the reason.",
+                    uri,
+                )
+            # The directory holding the file, NOT the observations root.
+            # `generate_overview` lists a directory's direct `.md` children, and
+            # the root's direct children are topic folders -- so pointing it
+            # there finds no files and takes the *delete* branch, removing the
+            # root's own overview on every single write. Worse, that branch
+            # guards a recursive remove with `all(...)` over the listing, and
+            # `all([])` is True: an empty listing at the root would read as
+            # "this directory is empty, delete it".
+            await MemoryUpdater.refresh_schema_overview(
+                viking_fs=self._fs,
+                directory_uri=uri.rsplit("/", 1)[0],
+                ctx=self._ctx,
+            )
+        except Exception:
+            # The observation is already on disk. Failing the sweep over the
+            # indexing step would lose the write as well as the index.
+            logger.exception("ov-ext reflect: could not index %s", uri)
 
     def _warn_about_unrenderable(self, uri: str, observation: Observation) -> None:
         """Say when OpenViking will decline to link one of the quotes.
