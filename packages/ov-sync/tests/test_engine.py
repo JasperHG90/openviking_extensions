@@ -17,6 +17,7 @@ from helpers import write
 from ov_sync.client import OvClient
 from ov_sync.config import SERVER_MAX_FILE_BYTES, Credentials, SyncConfig
 from ov_sync.engine import sync, target_uri
+from ov_sync.scanner import LocalFile
 from ov_sync.state import RootUriMismatch, SyncState
 
 BASE = "https://openviking.example/api/v1"
@@ -87,6 +88,446 @@ def test_target_uri_maps_a_path_onto_the_root() -> None:
     """The URI is the key, so the mapping has to be positional and stable."""
     assert target_uri(ROOT, "sub/note.md") == f"{ROOT}/sub/note.md"
     assert target_uri(f"{ROOT}/", "note.md") == f"{ROOT}/note.md"
+
+
+def test_a_name_a_uri_cannot_hold_is_rewritten_and_sent(
+    folder: Path,
+    client: OvClient,
+    sync_config: SyncConfig,
+    state: SyncState,
+    routes: respx.MockRouter,
+) -> None:
+    """A `#` in a file name used to fail the whole batch it travelled in."""
+    write(folder / "tickets" / "[#TDAI-709] hub and spoke.md", "hello")
+
+    result = sync(folder, ROOT, client, sync_config, state)
+
+    assert result.created == 1
+    assert operations(routes) == [
+        {
+            "uri": f"{ROOT}/tickets/[_TDAI-709] hub and spoke.md",
+            "content": "hello",
+            "mode": "upsert",
+        }
+    ]
+    assert result.plan.renamed[0].relative_path == "tickets/[#TDAI-709] hub and spoke.md"
+    assert result.plan.renamed[0].uri_path == "tickets/[_TDAI-709] hub and spoke.md"
+
+
+def test_a_rewritten_file_is_recorded_under_the_uri_it_landed_on(
+    folder: Path,
+    client: OvClient,
+    sync_config: SyncConfig,
+    state: SyncState,
+    routes: respx.MockRouter,
+) -> None:
+    """The state has to point where the file actually went, or a delete misses."""
+    write(folder / "a#b.md", "hello")
+
+    sync(folder, ROOT, client, sync_config, state)
+
+    assert state.all_files()["a#b.md"].uri == f"{ROOT}/a_b.md"
+
+
+def test_a_rewritten_file_is_not_re_sent_next_run(
+    folder: Path,
+    client: OvClient,
+    sync_config: SyncConfig,
+    state: SyncState,
+    routes: respx.MockRouter,
+) -> None:
+    """The rewrite is part of the key, so it settles like any other file."""
+    write(folder / "a#b.md", "hello")
+    sync(folder, ROOT, client, sync_config, state)
+
+    result = sync(folder, ROOT, client, sync_config, state)
+
+    assert result.written == 0
+    assert result.unchanged == 1
+    assert result.plan.renamed == []
+    assert len(batches(routes)) == 1
+
+
+def test_two_files_that_want_one_uri_are_both_held_back(
+    folder: Path,
+    client: OvClient,
+    sync_config: SyncConfig,
+    state: SyncState,
+    routes: respx.MockRouter,
+) -> None:
+    """Sending both would have the second silently overwrite the first."""
+    write(folder / "a#b.md", "first")
+    write(folder / "a?b.md", "second")
+    write(folder / "fine.md", "untouched by any of this")
+
+    result = sync(folder, ROOT, client, sync_config, state)
+
+    assert operations(routes) == [
+        {
+            "uri": f"{ROOT}/fine.md",
+            "content": "untouched by any of this",
+            "mode": "upsert",
+        }
+    ]
+    assert sorted(skipped.relative_path for skipped in result.skipped) == [
+        "a#b.md",
+        "a?b.md",
+    ]
+    assert set(state.all_files()) == {"fine.md"}
+
+
+def test_the_file_that_owns_the_name_is_the_one_that_goes(
+    folder: Path,
+    client: OvClient,
+    sync_config: SyncConfig,
+    state: SyncState,
+    routes: respx.MockRouter,
+) -> None:
+    """A rewrite never evicts the file whose name was safe all along."""
+    write(folder / "a_b.md", "the real one")
+    write(folder / "a#b.md", "the impostor")
+
+    result = sync(folder, ROOT, client, sync_config, state)
+
+    assert operations(routes) == [
+        {"uri": f"{ROOT}/a_b.md", "content": "the real one", "mode": "upsert"}
+    ]
+    assert [skipped.relative_path for skipped in result.skipped] == ["a#b.md"]
+
+
+def test_renaming_a_file_onto_its_own_uri_does_not_delete_it(
+    folder: Path,
+    client: OvClient,
+    sync_config: SyncConfig,
+    state: SyncState,
+    routes: respx.MockRouter,
+) -> None:
+    """The fix for a clash must not destroy the file it fixes.
+
+    `a#b.md` lands at `a_b.md`. Renaming it to `a_b.md` on disk — what the
+    clash message asks for — leaves a state row pointing at the URI the
+    renamed file now occupies. Acting on that row as a deletion would remove
+    what this run just wrote, and the state would still call it synced.
+    """
+    path = write(folder / "a#b.md", "hello")
+    sync(folder, ROOT, client, sync_config, state)
+    path.rename(folder / "a_b.md")
+
+    result = sync(folder, ROOT, client, sync_config, state, apply_deletes=True)
+
+    assert routes["rm"].calls == []
+    assert result.deleted_detected == []
+    assert result.deleted_applied == 0
+    # The old row is gone, so nothing claims a file is synced that is not.
+    assert set(state.all_files()) == {"a_b.md"}
+
+
+def test_the_uri_a_file_still_occupies_is_never_deleted_later(
+    folder: Path,
+    client: OvClient,
+    sync_config: SyncConfig,
+    state: SyncState,
+    routes: respx.MockRouter,
+) -> None:
+    """A later run must not act on the stale row either, --delete or not."""
+    path = write(folder / "a#b.md", "hello")
+    sync(folder, ROOT, client, sync_config, state)
+    path.rename(folder / "a_b.md")
+    sync(folder, ROOT, client, sync_config, state)
+
+    result = sync(folder, ROOT, client, sync_config, state, apply_deletes=True)
+
+    assert routes["rm"].calls == []
+    assert result.unchanged == 1
+
+
+def test_a_real_deletion_is_still_reported(
+    folder: Path,
+    client: OvClient,
+    sync_config: SyncConfig,
+    state: SyncState,
+    routes: respx.MockRouter,
+) -> None:
+    """Guarding the rename case must not blunt ordinary deletion."""
+    path = write(folder / "a#b.md", "hello")
+    sync(folder, ROOT, client, sync_config, state)
+    path.unlink()
+
+    result = sync(folder, ROOT, client, sync_config, state, apply_deletes=True)
+
+    assert result.deleted_detected == [f"{ROOT}/a_b.md"]
+    assert result.deleted_applied == 1
+    assert state.all_files() == {}
+
+
+def test_a_blocked_file_stops_claiming_a_uri_it_lost(
+    folder: Path,
+    client: OvClient,
+    sync_config: SyncConfig,
+    state: SyncState,
+    routes: respx.MockRouter,
+) -> None:
+    """The outright owner takes the URI, so the rewritten row is no longer true."""
+    write(folder / "a#b.md", "the rewritten one")
+    sync(folder, ROOT, client, sync_config, state)
+    write(folder / "a_b.md", "the real one")
+
+    result = sync(folder, ROOT, client, sync_config, state)
+
+    assert [skipped.relative_path for skipped in result.skipped] == ["a#b.md"]
+    assert set(state.all_files()) == {"a_b.md"}
+    assert result.unchanged == 0
+
+
+def test_replacing_a_synced_copy_is_reported(
+    folder: Path,
+    client: OvClient,
+    sync_config: SyncConfig,
+    state: SyncState,
+    routes: respx.MockRouter,
+) -> None:
+    """Taking a URI over costs a file its copy, so it is not done quietly."""
+    write(folder / "a#b.md", "the rewritten one")
+    sync(folder, ROOT, client, sync_config, state)
+    write(folder / "a_b.md", "the real one")
+
+    result = sync(folder, ROOT, client, sync_config, state)
+
+    assert len(result.plan.taken_over) == 1
+    taken = result.plan.taken_over[0]
+    assert taken.relative_path == "a#b.md"
+    assert taken.taken_by == "a_b.md"
+    assert taken.uri == f"{ROOT}/a_b.md"
+
+
+def test_a_takeover_is_reported_once(
+    folder: Path,
+    client: OvClient,
+    sync_config: SyncConfig,
+    state: SyncState,
+    routes: respx.MockRouter,
+) -> None:
+    """It is news on the run that does it, not on every run after."""
+    write(folder / "a#b.md", "the rewritten one")
+    sync(folder, ROOT, client, sync_config, state)
+    write(folder / "a_b.md", "the real one")
+    sync(folder, ROOT, client, sync_config, state)
+
+    result = sync(folder, ROOT, client, sync_config, state)
+
+    assert result.plan.taken_over == []
+
+
+def test_a_takeover_is_not_announced_by_a_run_that_will_not_do_it(
+    folder: Path,
+    client: OvClient,
+    sync_config: SyncConfig,
+    state: SyncState,
+    routes: respx.MockRouter,
+) -> None:
+    """Watch mode narrows a run to one file; the rest are somebody else's turn."""
+    write(folder / "a#b.md", "the rewritten one")
+    sync(folder, ROOT, client, sync_config, state)
+    write(folder / "a_b.md", "the real one")
+    write(folder / "other.md", "unrelated")
+
+    result = sync(folder, ROOT, client, sync_config, state, only={"other.md"})
+
+    assert result.plan.write == ["other.md"]
+    assert result.plan.taken_over == []
+
+
+def test_a_folder_cannot_be_synced_under_a_file_an_earlier_run_left(
+    folder: Path,
+    client: OvClient,
+    sync_config: SyncConfig,
+    state: SyncState,
+    routes: respx.MockRouter,
+) -> None:
+    """Writing under a stale file node hides the new file from listing.
+
+    OpenViking takes the write and reports success, but `ls` on that node
+    returns nothing from then on, and no further write digs it out — only
+    removing the file and writing again does. The deletion is merely reported
+    until --delete acts on it, so this would otherwise happen on a default run
+    that looks completely clean.
+    """
+    path = write(folder / "notes.md", "the old file")
+    sync(folder, ROOT, client, sync_config, state)
+    path.unlink()
+    write(folder / "notes.md" / "inner.md", "the new file")
+
+    result = sync(folder, ROOT, client, sync_config, state)
+
+    # One batch, from the first sync. The second sent nothing.
+    assert len(batches(routes)) == 1
+    assert result.plan.write == []
+    assert [skipped.relative_path for skipped in result.skipped] == ["notes.md/inner.md"]
+    assert "--delete" in result.skipped[0].reason
+    assert result.deleted_detected == [f"{ROOT}/notes.md"]
+
+
+def test_a_copy_in_the_way_blocks_even_when_its_file_is_still_here(
+    folder: Path,
+    client: OvClient,
+    sync_config: SyncConfig,
+    state: SyncState,
+    routes: respx.MockRouter,
+) -> None:
+    """The node is in the way because it was synced, not because it is gone.
+
+    `a#b.md` syncs to `a_b.md` and stays on disk. A folder called `a_b.md`
+    turns up later. The clash rule holds the rewritten file back, but its copy
+    from the first run is still the file at that URI, so anything written
+    inside the folder would be buried under it.
+    """
+    write(folder / "a#b.md", "the rewritten one")
+    sync(folder, ROOT, client, sync_config, state)
+    write(folder / "a_b.md" / "inner.md", "would be buried")
+
+    result = sync(folder, ROOT, client, sync_config, state)
+
+    assert len(batches(routes)) == 1
+    assert result.plan.write == []
+    reasons = {skipped.relative_path: skipped.reason for skipped in result.skipped}
+    assert "a_b.md/inner.md" in reasons
+    assert "synced from 'a#b.md'" in reasons["a_b.md/inner.md"]
+    # Still on disk, so a delete alone will not do: it has to be renamed too,
+    # or the next run just sends it back to the same URI.
+    assert "Rename one of them, then re-run with --delete" in reasons["a_b.md/inner.md"]
+
+
+def test_nested_nodes_in_the_way_name_the_outermost_one(
+    folder: Path,
+    client: OvClient,
+    sync_config: SyncConfig,
+    state: SyncState,
+    routes: respx.MockRouter,
+) -> None:
+    """Two files in the way, one inside the other: the outer one has to go first.
+
+    Naming `a/b` would send the operator to clear it and find the file still
+    blocked, because `a` is a file node above it and still in the way.
+
+    The state is seeded rather than synced into place: this check is what stops
+    a run from writing under a node, so the only way to hold rows at `a` and
+    `a/b` at once is to have them from a version that had no such check — which
+    is exactly whose mess this has to report well.
+    """
+    rows = [
+        (LocalFile(path=folder / name, relative_path=name, mtime=1.0, size=1), uri, "d")
+        for name, uri in (("a", f"{ROOT}/a"), ("a/b", f"{ROOT}/a/b"))
+    ]
+    state.mark_synced(rows)
+    write(folder / "a" / "b" / "c.md", "the file that gets buried")
+
+    result = sync(folder, ROOT, client, sync_config, state)
+
+    reason = {skipped.relative_path: skipped.reason for skipped in result.skipped}
+    assert "a/b/c.md" in reason
+    assert "'a' in OpenViking" in reason["a/b/c.md"]
+    assert "'a/b' in OpenViking" not in reason["a/b/c.md"]
+
+
+def test_the_remedy_for_a_file_still_on_disk_actually_clears_it(
+    folder: Path,
+    client: OvClient,
+    sync_config: SyncConfig,
+    state: SyncState,
+    routes: respx.MockRouter,
+) -> None:
+    """Follow the advice the message gives, and check the block goes away.
+
+    Renaming alone is not enough: the copy the first run sent is still the
+    file at that URI until a delete clears it, which is why the message says
+    both steps.
+    """
+    path = write(folder / "a#b.md", "the rewritten one")
+    sync(folder, ROOT, client, sync_config, state)
+    write(folder / "a_b.md" / "inner.md", "would be buried")
+
+    # Step one: rename it, as the message says.
+    path.rename(folder / "ab.md")
+    after_rename = sync(folder, ROOT, client, sync_config, state)
+    assert [s.relative_path for s in after_rename.skipped] == ["a_b.md/inner.md"]
+
+    # Step two: the delete it also says to run.
+    sync(folder, ROOT, client, sync_config, state, apply_deletes=True)
+    cleared = sync(folder, ROOT, client, sync_config, state)
+
+    assert cleared.skipped == []
+    assert set(state.all_files()) == {"ab.md", "a_b.md/inner.md"}
+
+
+def test_the_folder_syncs_once_the_stale_file_is_gone(
+    folder: Path,
+    client: OvClient,
+    sync_config: SyncConfig,
+    state: SyncState,
+    routes: respx.MockRouter,
+) -> None:
+    """--delete clears the node, and the next run sends the folder."""
+    path = write(folder / "notes.md", "the old file")
+    sync(folder, ROOT, client, sync_config, state)
+    path.unlink()
+    write(folder / "notes.md" / "inner.md", "the new file")
+    sync(folder, ROOT, client, sync_config, state, apply_deletes=True)
+
+    result = sync(folder, ROOT, client, sync_config, state)
+
+    assert result.created == 1, result.errors
+    assert result.skipped == []
+    assert set(state.all_files()) == {"notes.md/inner.md"}
+
+
+def test_a_failed_write_keeps_the_row_that_still_names_the_uri(
+    folder: Path,
+    client: OvClient,
+    sync_config: SyncConfig,
+    state: SyncState,
+    routes: respx.MockRouter,
+) -> None:
+    """Forgetting the row before the write lands would strand the old copy.
+
+    The row is the only thing naming that URI. Drop it, let the write fail,
+    and the copy already in OpenViking is untracked for good: no later run
+    would delete it, because nothing remembers it is there.
+    """
+    path = write(folder / "a#b.md", "the rewritten one")
+    sync(folder, ROOT, client, sync_config, state)
+    path.unlink()
+    write(folder / "a_b.md", "the real one")
+    routes["batch_write"].mock(side_effect=httpx.ConnectError("kaboom"))
+
+    failed = sync(folder, ROOT, client, sync_config, state)
+
+    assert failed.errors
+    assert set(state.all_files()) == {"a#b.md"}
+
+    # And once the write does land, the row goes and the URI has one owner.
+    routes["batch_write"].mock(side_effect=batch_reply)
+    recovered = sync(folder, ROOT, client, sync_config, state)
+
+    assert recovered.created == 1, recovered.errors
+    assert set(state.all_files()) == {"a_b.md"}
+
+
+def test_a_dry_run_reports_the_clash_without_reading_anything(
+    folder: Path,
+    client: OvClient,
+    sync_config: SyncConfig,
+    state: SyncState,
+    routes: respx.MockRouter,
+) -> None:
+    """The operator finds out before the first byte moves."""
+    write(folder / "a#b.md", "first")
+    write(folder / "a?b.md", "second")
+
+    result = sync(folder, ROOT, client, sync_config, state, dry_run=True)
+
+    assert result.plan.write == []
+    assert len(result.plan.skipped) == 2
+    assert batches(routes) == []
 
 
 def test_a_new_file_is_sent_and_recorded(
