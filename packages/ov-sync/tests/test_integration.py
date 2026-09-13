@@ -131,6 +131,31 @@ def test_a_folder_round_trips(
     assert live_client.stat(target_uri(live_root, "deep/two.md")) is None
 
 
+def test_a_name_a_uri_cannot_hold_reaches_the_server(
+    folder: Path, live_client: OvClient, live_root: str
+) -> None:
+    """The rewrite is built against the server's rules, so ask the server.
+
+    This is the whole point of the sanitizing: `[#TDAI-709] plan.md` used to
+    fail the batch it travelled in, and the mocks would happily accept a
+    rewrite that the real validator still refused.
+    """
+    awkward = "[#TDAI-709] plan.md"
+    write(folder / awkward, "hello")
+    write(folder / "quiet.md", "the rest of the batch")
+    config = SyncConfig(root_uri=live_root)
+
+    with SyncState(folder / config.state_file) as state:
+        result = sync(folder, live_root, live_client, config, state)
+
+    # Two, not one: the bug was that the bad name took the batch down with it.
+    assert result.created == 2, result.errors
+    assert result.errors == []
+    stored = live_client.stat(target_uri(live_root, awkward))
+    assert stored is not None
+    assert stored.name == "[_TDAI-709] plan.md"
+
+
 def test_binary_content_survives_the_round_trip(
     folder: Path, live_client: OvClient, live_root: str
 ) -> None:
