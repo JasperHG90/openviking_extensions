@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import signal
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from types import FrameType
 from typing import NoReturn
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.progress import (
     BarColumn,
     Progress,
@@ -28,11 +30,28 @@ from .config import (
     load_config,
     load_credentials,
 )
-from .engine import SyncResult, plan_sync, sync
+from .engine import (
+    RenamedFile,
+    SkippedFile,
+    SyncResult,
+    TakenOverFile,
+    plan_sync,
+    sync,
+)
 from .state import RootUriMismatch, SyncState
 
 console = Console()
 errors = Console(stderr=True)
+
+# How many paths a listing prints before it summarizes the rest. Long enough to
+# be useful on a first sync, short enough not to scroll the counts off screen.
+_LIST_LIMIT = 20
+
+# Rich reads square brackets as style tags, so a file called
+# `[#TDAI-709] plan.pdf` prints as ` plan.pdf` -- the name loses the part that
+# identifies it, and a file called `[bold]x` would style the rest of the line.
+# Every path, URI and error message is escaped before it is interpolated, so
+# the only markup left in a line is the colour written here.
 
 app = typer.Typer(
     name="ovsync",
@@ -52,7 +71,7 @@ RootUriOption = typer.Option(
 
 def _fail(message: str) -> NoReturn:
     """Print an error and exit with a non-zero status."""
-    errors.print(f"[red]{message}[/red]")
+    errors.print(f"[red]{escape(message)}[/red]")
     raise typer.Exit(1)
 
 
@@ -143,7 +162,10 @@ def _progress() -> Progress:
         BarColumn(),
         TextColumn("{task.completed}/{task.total}"),
         TimeElapsedColumn(),
-        TextColumn("{task.fields[detail]}"),
+        # The detail is whatever file is being read right now, so it carries a
+        # name this module did not choose. No markup, rather than escaping it
+        # on every frame.
+        TextColumn("{task.fields[detail]}", markup=False),
         console=console,
     )
 
@@ -163,20 +185,83 @@ def _report(result: SyncResult) -> None:
     if result.deleted_applied:
         console.print(f"[yellow]Deleted:[/yellow] {result.deleted_applied}")
         if result.snapshot_id:
-            console.print(f"  Undo with: ov snapshot restore {result.snapshot_id}")
+            console.print(
+                f"  Undo with: ov snapshot restore {escape(result.snapshot_id)}"
+            )
     elif result.deleted_detected:
         console.print(
             f"[yellow]Gone from the folder:[/yellow] {len(result.deleted_detected)} "
             "still in OpenViking. Re-run with --delete to remove them."
         )
-    for skipped in result.skipped:
-        console.print(
-            f"[yellow]Skipped[/yellow] {skipped.relative_path}: {skipped.reason}"
-        )
+    _report_renames(result.plan.renamed)
+    _report_takeovers(result.plan.taken_over)
+    _report_skips(result.skipped)
     for error in result.errors:
-        console.print(f"[red]{error}[/red]")
+        console.print(f"[red]{escape(error)}[/red]")
     if is_settled(result):
         console.print("[green]Everything is up to date.[/green]")
+
+
+def _report_renames(renamed: Sequence[RenamedFile]) -> None:
+    r"""List the files landing under a name other than their own.
+
+    A `#`, a `?`, a `\`, an escape that decodes to a dot segment, or trailing
+    whitespace cannot survive in a URI, so the sync rewrites the name. Saying
+    nothing would leave the operator hunting for a file that is there under a
+    name they never chose.
+    """
+    for entry in renamed[:_LIST_LIMIT]:
+        console.print(
+            f"[yellow]Renamed[/yellow] {escape(entry.relative_path)} -> "
+            f"{escape(entry.uri_path)}"
+        )
+    if len(renamed) > _LIST_LIMIT:
+        console.print(f"  ... and {len(renamed) - _LIST_LIMIT} more renamed")
+
+
+def _report_takeovers(
+    taken_over: Sequence[TakenOverFile], *, prospective: bool = False
+) -> None:
+    """Say which stored copies this run replaces with another file's contents.
+
+    The URI belongs to whoever owns the name, so the replacement is right, but
+    it costs a file its copy in OpenViking and the operator never asked for it
+    by name. They hear about it once, on the run that does it.
+
+    Parameters
+    ----------
+    taken_over :
+        What the plan says will be replaced.
+    prospective :
+        Whether this is a report of what would happen rather than what did, so
+        a dry run does not claim to have replaced anything.
+    """
+    label = "Would take over" if prospective else "Taken over"
+    for entry in taken_over[:_LIST_LIMIT]:
+        console.print(
+            f"[yellow]{label}[/yellow] {escape(entry.uri)}: "
+            f"{escape(entry.taken_by)} replaces the copy sent from "
+            f"{escape(entry.relative_path)}"
+        )
+    if len(taken_over) > _LIST_LIMIT:
+        console.print(f"  ... and {len(taken_over) - _LIST_LIMIT} more taken over")
+
+
+def _report_paths(paths: Sequence[str]) -> None:
+    """List paths or URIs, one per line, summarizing anything past the limit."""
+    for path in paths[:_LIST_LIMIT]:
+        console.print(f"  {escape(path)}")
+    if len(paths) > _LIST_LIMIT:
+        console.print(f"  ... and {len(paths) - _LIST_LIMIT} more")
+
+
+def _report_skips(skipped: Sequence[SkippedFile]) -> None:
+    """List the files left out of the sync, and why."""
+    for entry in skipped:
+        console.print(
+            f"[yellow]Skipped[/yellow] {escape(entry.relative_path)}: "
+            f"{escape(entry.reason)}"
+        )
 
 
 def is_settled(result: SyncResult) -> bool:
@@ -203,8 +288,8 @@ def init(folder: Path = FolderArgument) -> None:
     if path.exists():
         _fail(f"{path} already exists.")
     path.write_text(DEFAULT_CONFIG_TOML, encoding="utf-8")
-    console.print(f"[green]Created {path}[/green]")
-    console.print("Set root_uri under [sync], then run: ovsync run .")
+    console.print(f"[green]Created {escape(str(path))}[/green]")
+    console.print(escape("Set root_uri under [sync], then run: ovsync run ."))
 
 
 @app.command()
@@ -223,33 +308,27 @@ def status(
         table = Table(title="ov-sync status")
         table.add_column("", style="bold")
         table.add_column("")
-        table.add_row("Folder", str(resolved))
-        table.add_row("Target", target)
-        table.add_row("Last sync", state.last_sync or "never")
+        table.add_row("Folder", escape(str(resolved)))
+        table.add_row("Target", escape(target))
+        table.add_row("Last sync", escape(state.last_sync or "never"))
         table.add_row("Files found", str(detail.scanned))
         table.add_row("To send", str(len(plan.write)))
         table.add_row("Unchanged", str(plan.unchanged))
         table.add_row("Touched, not changed", str(plan.touched))
         table.add_row("Gone from the folder", str(len(plan.delete)))
+        table.add_row("Renamed to fit a URI", str(len(plan.renamed)))
         table.add_row("Skipped", str(len(plan.skipped)))
         console.print(table)
 
         if plan.write:
             console.print("\n[bold]Would send:[/bold]")
-            for path in plan.write[:20]:
-                console.print(f"  {path}")
-            if len(plan.write) > 20:
-                console.print(f"  ... and {len(plan.write) - 20} more")
+            _report_paths(plan.write)
         if plan.delete:
             console.print("\n[bold]Gone from the folder:[/bold]")
-            for uri in plan.delete[:20]:
-                console.print(f"  {uri}")
-            if len(plan.delete) > 20:
-                console.print(f"  ... and {len(plan.delete) - 20} more")
-        for skipped in plan.skipped:
-            console.print(
-                f"[yellow]Skipped[/yellow] {skipped.relative_path}: {skipped.reason}"
-            )
+            _report_paths(plan.delete)
+        _report_renames(plan.renamed)
+        _report_takeovers(plan.taken_over, prospective=True)
+        _report_skips(plan.skipped)
 
 
 @app.command()
@@ -331,10 +410,10 @@ def run(
     if dry_run:
         console.print(f"[bold]Would send:[/bold] {len(result.plan.write)} file(s)")
         console.print(f"[bold]Gone from the folder:[/bold] {len(result.plan.delete)}")
-        for path in result.plan.write[:20]:
-            console.print(f"  {path}")
-        if len(result.plan.write) > 20:
-            console.print(f"  ... and {len(result.plan.write) - 20} more")
+        _report_paths(result.plan.write)
+        _report_renames(result.plan.renamed)
+        _report_takeovers(result.plan.taken_over, prospective=True)
+        _report_skips(result.plan.skipped)
         return
 
     _report(result)
@@ -389,7 +468,8 @@ def watch(
         signal.signal(signal.SIGTERM, handle_signal)
 
         console.print(
-            f"Watching [cyan]{resolved}[/cyan] -> [cyan]{target}[/cyan] "
+            f"Watching [cyan]{escape(str(resolved))}[/cyan] -> "
+            f"[cyan]{escape(target)}[/cyan] "
             f"({settings.watch.mode} mode). Ctrl-C to stop."
         )
         watcher.run()
@@ -434,7 +514,7 @@ def _report_watch_error(exc: Exception) -> None:
     A watched folder on a removable or network volume can vanish for a second.
     The next cycle picks it up again, so the loop reports and carries on.
     """
-    errors.print(f"[red]Sync failed, will retry: {exc}[/red]")
+    errors.print(f"[red]Sync failed, will retry: {escape(str(exc))}[/red]")
 
 
 def main() -> None:

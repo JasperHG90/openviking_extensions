@@ -124,6 +124,36 @@ def test_dry_run_lists_the_work_without_doing_it(folder: Path, configured: None)
     assert not batch.called
 
 
+def test_a_bracketed_name_survives_the_report(folder: Path) -> None:
+    """Rich reads brackets as style tags, so an unescaped name loses them.
+
+    `[#TDAI-709] plan.pdf` printed as ` plan.pdf`, which is how the file that
+    started all this looked in the error that reported it.
+    """
+    write(folder / "[#TDAI-709] plan.md", "hello")
+
+    outcome = runner.invoke(app, ["status", str(folder), "--root-uri", ROOT])
+
+    assert "[#TDAI-709] plan.md" in outcome.output
+    assert "[_TDAI-709] plan.md" in outcome.output
+
+
+def test_a_name_cannot_smuggle_markup_into_the_report(folder: Path) -> None:
+    """A file called `[bold]...` must not restyle the rest of the output."""
+    write(folder / "[bold]loud.md", "hello")
+
+    outcome = runner.invoke(app, ["status", str(folder), "--root-uri", ROOT])
+
+    assert "[bold]loud.md" in outcome.output
+
+
+def test_init_keeps_the_toml_section_it_points_at(folder: Path) -> None:
+    """`[sync]` is the section to edit, and rich used to swallow it whole."""
+    outcome = runner.invoke(app, ["init", str(folder)])
+
+    assert "[sync]" in outcome.output
+
+
 def test_status_never_contacts_the_server(folder: Path) -> None:
     """Status reads the local state only, so it works offline.
 

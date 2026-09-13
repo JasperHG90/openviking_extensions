@@ -15,6 +15,24 @@ $ ovsync run ~/notes                       # sends nothing; it already matches
 $ ovsync watch ~/notes                     # keeps sending as you edit
 ```
 
+## Install
+
+```bash
+uv tool install ov-sync --from "git+https://github.com/JasperHG90/openviking_extensions@ov-sync-v0.2.0#subdirectory=packages/ov-sync"
+```
+
+Or from a checkout:
+
+```bash
+uv tool install ./packages/ov-sync
+```
+
+That puts `ovsync` on your path. It needs Python 3.11+ (for `tomllib`) and an
+OpenViking server to talk to. Credentials come from the `ov` CLI's config file
+or from two environment variables — see [Credentials](#credentials) — so there
+is nothing else to set up. To upgrade, run the same command with a newer tag
+and `--force`.
+
 ## How it maps
 
 A file's path under the folder is its path under the root:
@@ -26,6 +44,65 @@ A file's path under the folder is its path under the root:
 That mapping is the whole idempotency story. The target URI **is** the key, so
 re-sending a file replaces it instead of duplicating it, and a run can be
 repeated, interrupted, or resumed with no cleanup.
+
+### Names a URI cannot hold
+
+Disk allows names a `viking://` URI does not. A `#`, a `?` or a `\` is refused
+by the server outright — and refused for the whole batch the file travelled in,
+so one badly named PDF used to take 255 innocent files down with it. Trailing
+whitespace is worse: the server trims it silently, and the file lands somewhere
+the local state does not point.
+
+`ovsync` rewrites those on the way through, replacing each with `_`, and says
+so:
+
+```console
+$ ovsync run ~/notes
+Created: 1
+Renamed [#TDAI-709] hub and spoke.pdf -> [_TDAI-709] hub and spoke.pdf
+```
+
+Nothing the server would have accepted is touched. Spaces, brackets, colons,
+accents, emoji, and CJK all survive verbatim, so a folder that syncs today
+keeps syncing to the same URIs — that rule is what keeps the rewrite from
+re-uploading your library under new names.
+
+When the rewrite makes two files want one URI, neither is guessed at — sending
+both would have the second quietly overwrite the first:
+
+```console
+Skipped a#b.md: its name becomes 'a_b.md' in OpenViking, which 'a?b.md' also claims. Rename one of them, or exclude it.
+Skipped a?b.md: its name becomes 'a_b.md' in OpenViking, which 'a#b.md' also claims. Rename one of them, or exclude it.
+```
+
+Both wait, because neither has a better claim than the other. Add a real
+`a_b.md` and it wins outright — it is the file whose own name that is — while
+the two rewritten rivals keep waiting.
+
+A rewrite can also land a file on a *folder's* name. OpenViking stores that
+pair without complaint, and that is the trap: the file wins the node, so `ls`
+on it returns nothing and every file underneath is invisible to listing, though
+`stat` still finds them. It does not heal on its own — syncing more files into
+that folder changes nothing. Only removing the file and then writing under the
+node again brings the listing back. So the rewritten side waits instead.
+
+The same pair can arrive without any rewrite — sync `notes.md`, delete it, then
+make a folder called `notes.md`. A deletion is only *reported* until `--delete`
+acts on it, so the old file is still sitting at that URI. `ovsync` holds the
+folder back rather than burying it:
+
+```console
+Gone from the folder: 1 still in OpenViking. Re-run with --delete to remove them.
+Skipped notes.md/inner.md: 'notes.md' in OpenViking is the file synced from 'notes.md'. Writing underneath it would hide this file from listing. Re-run with --delete to remove it first.
+```
+
+Renaming the loser is the fix, and renaming it *to* the name it was landing on
+is safe: `ovsync` knows the old URI has a new owner, so it updates the file
+rather than deleting it. When a name is taken over that way, the run says so:
+
+```console
+Taken over viking://resources/notes/a_b.md: a_b.md replaces the copy sent from a#b.md
+```
 
 ## What makes a second run cheap
 
