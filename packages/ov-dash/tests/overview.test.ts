@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parentOf } from "../src/server/ov";
-import { describeFile, stripUnrendered } from "../src/server/overview";
+import { describeFile, folderOverview, stripUnrendered } from "../src/server/overview";
 
 /**
  * A folder overview, in the shape OpenViking writes them.
@@ -406,5 +406,115 @@ describe("a description that is a failed render", () => {
     // strip ever ran, so it passed with the strip deleted.
     const real = "A plan, with an em dash — and    aligned    columns.";
     expect(stripUnrendered(real)).toBe(real);
+  });
+});
+
+/**
+ * Showing a folder's overview, which is the fix for the image complaint.
+ *
+ * The overview text below is the real thing, captured from the lab cluster on
+ * 13 Sep 2026 by uploading a 4600x900 PNG — over the 4096px threshold in
+ * OpenViking's `ImageConfig`, so it took the large-image path. That is worth
+ * knowing about, because it is what made the dashboard look broken: OpenViking
+ * stores a large image as a preview, a grid and a set of tiles and does *not*
+ * keep the original, and the thorough description of what it saw goes into the
+ * folder's overview. The dashboard read that overview only to mine one file's
+ * section out of it and never showed it, so the folder page carried a one-line
+ * abstract and looked like a page where nothing had been described.
+ */
+const IMAGE_OVERVIEW = `# ovdash_gridprobe_portal
+
+The ovdash_gridprobe_portal directory appears to contain graphic design assets,
+test images, and geometric visual compositions.
+
+## Directory Coverage
+
+Total direct entries: 3. All direct entries are represented below.
+
+## Quick Navigation
+
+What do you want to learn?
+
+- View the detailed grid probe test image → [ovdash_gridprobe_portal_grid.jpg](viking://user/jasper/resources/ovdash_gridprobe_portal/ovdash_gridprobe_portal_grid.jpg)
+
+## Detailed Description
+
+### [ovdash_gridprobe_portal_grid.jpg](viking://user/jasper/resources/ovdash_gridprobe_portal/ovdash_gridprobe_portal_grid.jpg)
+This image features three distinct geometric shapes overlaid on a vertically
+striped background, divided into three vertical panels by red grid lines.
+`;
+
+describe("a folder's overview, ready to show", () => {
+  it("keeps the description of every entry, which is the whole point", () => {
+    const shown = folderOverview(IMAGE_OVERVIEW);
+    expect(shown).toContain("three distinct geometric shapes");
+    expect(shown).toContain("## Detailed Description");
+    // The navigation links are viking:// uris the pane opens in place, so a
+    // person lands on the grid image from here rather than hunting the tree.
+    expect(shown).toContain(
+      "viking://user/jasper/resources/ovdash_gridprobe_portal/ovdash_gridprobe_portal_grid.jpg",
+    );
+  });
+
+  it("drops the title, because the pane prints it directly above", () => {
+    const shown = folderOverview(IMAGE_OVERVIEW);
+    expect(shown.startsWith("#")).toBe(false);
+    expect(shown).not.toContain("# ovdash_gridprobe_portal\n");
+    // The sentence under the title survives: it *is* the abstract, and this is
+    // shown instead of the abstract rather than beside it.
+    expect(shown).toMatch(/^The ovdash_gridprobe_portal directory/);
+  });
+
+  it("keeps Directory Coverage, which says how much the model sampled", () => {
+    // Not tidied away with the title. It is not a truncation marker — the cut
+    // lands in the `###` sections below and this line survives it — but it does
+    // say whether the model looked at every entry, which is worth reading.
+    expect(folderOverview(IMAGE_OVERVIEW)).toContain("Total direct entries: 3");
+  });
+
+  it("gives nothing for a folder OpenViking has not got to", () => {
+    // The pane says so in its own words instead of printing the placeholder.
+    expect(folderOverview("# notes\n\n[Directory overview is not ready]")).toBe("");
+    expect(folderOverview("")).toBe("");
+    expect(folderOverview("   \n\n  ")).toBe("");
+    // A title and nothing under it says only what the folder is called, which
+    // the pane prints anyway.
+    expect(folderOverview("# notes\n")).toBe("");
+  });
+
+  it("strips a failed template render, like any other generated text", () => {
+    const raw = "# notes\n\nA folder of {{ no such element: dict object['x'] }} plans.";
+    expect(folderOverview(raw)).toBe("A folder of plans.");
+  });
+
+  it("only ever takes an H1, never a section heading", () => {
+    /*
+     * The title is model output, not a wrapper — `overview_generation.yaml` asks
+     * for it — so a run that skips the H1 opens with its first section instead.
+     * An earlier version stripped `#{1,2}` and ate that heading, leaving the
+     * bullets under it orphaned with nothing to say what they were. No path
+     * produces a `##` title, so the wider match bought nothing.
+     */
+    const noTitle = "## Quick Navigation\n\n- [a](./a.md) — the first plan";
+    expect(folderOverview(noTitle)).toBe(noTitle);
+
+    const coverageFirst = "## Directory Coverage\n\nTotal direct entries: 3.";
+    expect(folderOverview(coverageFirst)).toBe(coverageFirst);
+
+    // Deeper headings are just as safe, and the H1 still goes when there is one.
+    expect(folderOverview("### [a.md](viking://x/a.md)\n\nThe plan.")).toBe(
+      "### [a.md](viking://x/a.md)\n\nThe plan.",
+    );
+    expect(folderOverview("# notes\n\n## Quick Navigation\n\n- a")).toBe(
+      "## Quick Navigation\n\n- a",
+    );
+  });
+
+  it("leaves a body that merely starts with a hash-like line", () => {
+    // A `#` that is not a heading is prose, and the title strip must not reach
+    // it. Only the first line, and only when that line is an H1.
+    expect(folderOverview("Notes on #hashtags and #tags.")).toBe(
+      "Notes on #hashtags and #tags.",
+    );
   });
 });

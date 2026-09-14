@@ -17,6 +17,7 @@ import {
   type JobState,
   type MemoryGroup,
   type Opened,
+  type Saved,
   type SearchMode,
   type SessionState,
   type Tree,
@@ -32,12 +33,14 @@ import {
   memoryGroupSchema,
   movedSchema,
   openedSchema,
+  savedSchema,
   searchResponseSchema,
   sessionStateSchema,
   treeSchema,
   uploadResultSchema,
 } from "../../shared/schemas";
 import { cached, invalidate } from "./cache";
+import { drafts } from "./drafts";
 
 /** A failed call, carrying the server's own code and message. */
 export class ApiError extends Error {
@@ -201,6 +204,8 @@ export const api = {
     invalidate("home");
     invalidate(`file:${uri}`);
     invalidate(`open:${uri}`);
+    // And any unsaved typing for it is typing for a file that no longer exists.
+    drafts.forget(uri);
   },
 
   /**
@@ -209,10 +214,42 @@ export const api = {
    * Everything cached is dropped rather than picked over: a file's own entries
    * are the obvious loss, but the tree that listed it, the home counts, the
    * folder it sat in and any search that returned it are all wrong now too.
+   *
+   * Unsaved typing for it goes as well, and for everything under it when the
+   * thing deleted was a folder.
    */
   async remove(uri: string): Promise<void> {
     await send(`/api/file?uri=${encodeURIComponent(uri)}`, { method: "DELETE" });
     invalidate();
+    drafts.forget(uri);
+  },
+
+  /**
+   * Save an edit to a file's text.
+   *
+   * Everything cached goes, not just this file: the tree drew its size, the
+   * folder above it lists it, the home page counted it, and OpenViking may
+   * rewrite the description the pane shows — which lives in the folder's
+   * overview, under a different key again. One `invalidate()` covers the lot, so
+   * a caller needs no `refresh()` after this.
+   *
+   * @param seen - What the editor was holding when it opened. The save is refused
+   *   with `STALE_EDIT` when the stored file no longer matches, which is what
+   *   stops an agent's write being replaced without anybody being told. Leave it
+   *   out to write regardless.
+   * @returns The file's stamp after this write, so a second save from the same
+   *   editor compares against it rather than against what it opened on.
+   */
+  async save(uri: string, content: string, seen?: Saved): Promise<Saved> {
+    const saved = await call(`/api/file?uri=${encodeURIComponent(uri)}`, savedSchema, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      // `seen` left out is a deliberate answer, not a missing one: it is how
+      // the overwrite button gets its way once a conflict has been reported.
+      body: JSON.stringify(seen ? { content, seen } : { content }),
+    });
+    invalidate();
+    return saved;
   },
 
   /**
@@ -237,6 +274,16 @@ export const api = {
     // 204 means it was already there, so nothing moved and nothing is sent.
     if (response.status === 204) return from;
 
+    /*
+     * Unsaved typing follows the file, rather than being stranded on its old uri.
+     *
+     * This and the two `forget` calls above live here, in the one place that knows
+     * a uri stopped existing, rather than in the components that happen to call
+     * them. They were in a component first, and the second component — the one
+     * that forgets a memory — did not have them. A rule kept in one place cannot
+     * be half-applied.
+     */
+
     // Parsed the way `call` parses, not with a bare `.parse`. A zod failure
     // thrown from here reaches a toast, and a page of zod issues is not a
     // sentence anybody can act on.
@@ -248,6 +295,7 @@ export const api = {
         response.status,
       );
     }
+    drafts.follow(from, parsed.data.uri);
     return parsed.data.uri;
   },
 
@@ -281,10 +329,19 @@ export const api = {
   job: (taskId: string): Promise<JobState> =>
     call(`/api/job?id=${encodeURIComponent(taskId)}`, jobStateSchema),
 
-  async upload(file: File, to?: string): Promise<UploadResult> {
+  /**
+   * Add a file.
+   *
+   * @param why - Why it is worth keeping. OpenViking uses it as the parsing
+   *   instruction, so it shapes what the model writes about the file and what
+   *   the file is then findable by — it is worth filling in, and it is not a
+   *   note filed beside the bytes.
+   */
+  async upload(file: File, to?: string, why?: string): Promise<UploadResult> {
     const form = new FormData();
     form.set("file", file);
     if (to) form.set("to", to);
+    if (why) form.set("why", why);
     const result = await call("/api/upload", uploadResultSchema, {
       method: "POST",
       body: form,
@@ -300,11 +357,27 @@ export const api = {
       credentials: "same-origin",
     });
     // Everything cached was read as the person signing out. Left in place, the
-    // next person to sign in on this tab would be shown it.
+    // next person to sign in on this tab would be shown it. Cleared whether or
+    // not the call succeeded, because the session may be gone either way and a
+    // wrong invalidate costs one refetch.
     invalidate();
     if (!response.ok) {
       throw new ApiError("could not sign out", "LOGOUT_FAILED", response.status);
     }
+    /*
+     * Unsaved typing goes too — but only once the sign-out has actually landed.
+     *
+     * Deliberately on the far side of the check, unlike `invalidate()` above, and
+     * the asymmetry is the point: a wrong invalidate costs a refetch, a wrong
+     * clear costs work nobody can get back. Both reasons to clear hold only on
+     * success. The leak-to-the-next-person threat needs a session that really
+     * ended, and the "Leave site?" suppression needs the navigation that only
+     * happens on success — `Account.svelte` catches a failure, toasts, and leaves
+     * the person on the page, still signed in. Clearing before the check meant a
+     * 502 or a dropped connection silently destroyed their edit and left them
+     * sitting there able to keep working.
+     */
+    drafts.clear();
   },
 
   /** The URL a download link points at. Files stream; folders arrive zipped. */
@@ -324,6 +397,7 @@ export type {
   Job,
   JobState,
   MemoryGroup,
+  Saved,
   SessionState,
   Tree,
 };

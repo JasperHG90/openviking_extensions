@@ -33,6 +33,35 @@ export function namesNothing(segment: string): boolean {
 }
 
 /**
+ * Whether a uri names a memory rather than a resource.
+ *
+ * OpenViking treats the two differently on a write — a memory keeps a metadata
+ * trailer and gets no model pass, a resource is re-described — and the editor
+ * says which it is about to do, so getting this wrong tells somebody the opposite
+ * of what will happen to their own file.
+ *
+ * Positional, because upstream is. `_content_segment_index` in
+ * `openviking/core/namespace.py` reads the content type off a **fixed segment**:
+ * index 2 under `user/<id>`, index 4 under `user/<id>/peers/<peer>`, and index 1
+ * for `agent/skills` or index 2 under `agent/<x>`. Anything deeper is part of the
+ * path, not a namespace.
+ *
+ * So `includes("/memories/")` is not a near-enough approximation: a folder called
+ * `memories` under resources is a thing this dashboard's own New folder button
+ * will happily make, and "memories" is the product's own vocabulary, so somebody
+ * will. Upstream calls that a resource, and the editor has to agree.
+ *
+ * `agent/skills` is excluded because upstream tests it first and answers with
+ * index 1 — everything under it is a skill, `memories` directory or not.
+ */
+const MEMORY_URI =
+  /^viking:\/\/(?:user\/[^/]+(?:\/peers\/[^/]+)?|agent\/(?!skills\/)[^/]+)\/memories\/.+/;
+
+export function isMemoryUri(uri: string): boolean {
+  return MEMORY_URI.test(uri);
+}
+
+/**
  * Longest one path segment may be.
  *
  * 255 bytes is the limit on every filesystem this lands on, and the cleaned

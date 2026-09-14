@@ -16,6 +16,7 @@ import { describe, expect, it } from "vitest";
 import {
   MAX_SEGMENT,
   folderNameProblem,
+  isMemoryUri,
   namesNothing,
   safeSegment,
 } from "../src/shared/names";
@@ -97,5 +98,66 @@ describe("why a name cannot be a folder", () => {
     expect(folderNameProblem("a".repeat(MAX_SEGMENT + 1))).toContain(
       `${MAX_SEGMENT} characters`,
     );
+  });
+});
+
+/**
+ * Telling a memory from a resource, the way OpenViking tells them apart.
+ *
+ * The editor says which of two different things a save is about to do — replace a
+ * memory's body and keep its metadata trailer with no model pass, or replace a
+ * resource and have it re-described — so a uri read wrongly here tells somebody
+ * the opposite of what will happen to their own file.
+ *
+ * Upstream reads the content type off a **fixed segment**: `_content_segment_index`
+ * in `openviking/core/namespace.py` looks at index 2 under `user/<id>`, index 4
+ * under `user/<id>/peers/<peer>`, and index 1 or 2 under `agent`. So this is
+ * positional too. A substring test on `/memories/` agreed with upstream on the
+ * easy cases and disagreed on every deeper one.
+ */
+describe("telling a memory from a resource by its uri", () => {
+  it("recognises a memory at the segment OpenViking reads", () => {
+    expect(isMemoryUri("viking://user/jasper/memories/soul.md")).toBe(true);
+    expect(isMemoryUri("viking://user/jasper/memories/preferences/jasper/style.md")).toBe(
+      true,
+    );
+    // A peer's memories sit two segments deeper and are still memories.
+    expect(isMemoryUri("viking://user/jasper/peers/ada/memories/note.md")).toBe(true);
+    expect(isMemoryUri("viking://agent/hermes/memories/note.md")).toBe(true);
+  });
+
+  it("does not read a resource merely named after memory as one", () => {
+    expect(isMemoryUri("viking://user/jasper/resources/memories-of-2024.md")).toBe(false);
+    expect(isMemoryUri("viking://user/jasper/resources/my-memories/notes.md")).toBe(
+      false,
+    );
+    expect(isMemoryUri("viking://user/jasper/resources/a.md")).toBe(false);
+  });
+
+  it("does not read a folder called memories under resources as one", () => {
+    /*
+     * The case a substring test got wrong, and it is not hypothetical: the Files
+     * `+` button and the Add page both accept "memories" as a folder name, and
+     * "memories" is this product's own vocabulary, so somebody will type it.
+     * Upstream calls everything under `resources` a resource whatever it is
+     * called, and the editor has to agree.
+     */
+    expect(isMemoryUri("viking://user/jasper/resources/memories/notes.md")).toBe(false);
+    expect(isMemoryUri("viking://user/jasper/resources/proj/memories/deep/x.md")).toBe(
+      false,
+    );
+    expect(isMemoryUri("viking://user/jasper/sessions/abc/memories/x.md")).toBe(false);
+    expect(isMemoryUri("viking://agent/skills/memories/x.md")).toBe(false);
+  });
+
+  it("does not count the memories root itself, which holds no text", () => {
+    expect(isMemoryUri("viking://user/jasper/memories")).toBe(false);
+    expect(isMemoryUri("viking://user/jasper/memories/")).toBe(false);
+  });
+
+  it("says no to anything that is not a viking uri at all", () => {
+    expect(isMemoryUri("")).toBe(false);
+    expect(isMemoryUri("/memories/soul.md")).toBe(false);
+    expect(isMemoryUri("https://example.com/memories/soul.md")).toBe(false);
   });
 });

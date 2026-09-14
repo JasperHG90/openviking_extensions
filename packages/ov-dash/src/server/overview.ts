@@ -112,6 +112,48 @@ export function stripUnrendered(text: string): string {
 }
 
 /**
+ * A folder's overview, ready to read, or `""` when there is nothing in it.
+ *
+ * The overview is the only place OpenViking's real work on a folder shows up.
+ * Its abstract is one sentence; the overview carries the Quick Navigation links
+ * and a `###` section describing every entry — which for an imported image is
+ * the whole point, since the description of the grid and the preview lives
+ * there and nowhere else.
+ *
+ * Two things come off before it is shown. The opening `# <folder>` is the
+ * folder's own name, which the pane prints as the title directly above; and the
+ * abstract is derived *from* this document rather than written beside it —
+ * `SemanticProcessor._extract_abstract_from_overview` takes everything down to
+ * the first `##` and truncates it at a sentence boundary, so the paragraph under
+ * the title is a superset of the abstract. That is what licenses showing this
+ * *instead of* the abstract rather than both. A failed template render is
+ * stripped too, the same as any other generated text.
+ *
+ * @param overview - The folder's overview document (L1), as OpenViking wrote it.
+ */
+export function folderOverview(overview: string): string {
+  const cleaned = stripUnrendered(overview).trim();
+  if (!cleaned) return "";
+
+  /*
+   * The `#` title only, and the level matters.
+   *
+   * `prompts/templates/semantic/overview_generation.yaml` asks a model for the
+   * whole document, title included — so the title is model output, not a
+   * deterministic wrapper, and a run that skips the H1 opens with `## Quick
+   * Navigation` instead. An earlier version stripped `#{1,2}`, which ate that
+   * section's heading and left its bullets orphaned. No path produces a `##`
+   * title, so the wider match bought nothing and cost that.
+   */
+  const body = cleaned.replace(/^#(?!#)[^\n]*\n?/, "").trim();
+  if (!body) return "";
+  // "[Directory overview is not ready]" and friends: a folder OpenViking has
+  // not got to yet, which the pane says in its own words instead.
+  if (/^\[[^\]]*\]$/.test(body)) return "";
+  return body;
+}
+
+/**
  * The description OpenViking wrote for one file, or `""` if it wrote none.
  *
  * @param overview - The folder's overview document (L1).

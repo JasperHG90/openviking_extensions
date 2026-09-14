@@ -11,6 +11,7 @@
    * before anything is sent, because a destination you cannot see is one you
    * only discover by getting it wrong.
    */
+  import { MAX_REASON_CHARS } from "../../shared/limits";
   import { api, type Destinations } from "../lib/api";
   import Icon from "../lib/Icon.svelte";
   import PageHead from "../lib/PageHead.svelte";
@@ -31,6 +32,17 @@
   let scope = $state("");
   /** A folder under the scope. Empty means the scope root itself. */
   let folder = $state("");
+
+  /**
+   * Why these are worth keeping, in your own words.
+   *
+   * Not a note filed beside the bytes. OpenViking takes it as the parsing
+   * instruction when nothing else gives one, so it steers the abstract and
+   * overview the model writes — and those are what the file is later found by.
+   * Typing "for the Q3 pricing argument" is the difference between a file
+   * described as what it is and one described as what it is for.
+   */
+  let why = $state("");
 
   $effect(() => {
     api
@@ -67,21 +79,48 @@
     ];
   }
 
+  /** True while the queue is being sent, so the fields it reads cannot move. */
+  let sending = $state(false);
+
   async function send(): Promise<void> {
-    for (const item of queue) {
-      if (item.status !== "waiting") continue;
-      item.status = "sending";
-      try {
-        await api.upload(item.file, destination);
-        item.status = "done";
-        item.detail = "";
-      } catch (error) {
-        item.status = "failed";
-        item.detail = (error as Error).message;
+    if (sending) return;
+    sending = true;
+    /*
+     * Both fields read once, before the first upload.
+     *
+     * A batch is several awaits long and the boxes stay on screen throughout, so
+     * reading them per file meant a keystroke half-way through gave the rest of
+     * the batch a different reason and a different folder — after the page had
+     * said the reason applies to every file in it. The inputs are disabled while
+     * this runs as well; the snapshot is what makes that a promise rather than a
+     * hope.
+     */
+    const reason = why.trim();
+    const into = destination;
+    try {
+      for (const item of queue) {
+        if (item.status !== "waiting") continue;
+        item.status = "sending";
+        try {
+          await api.upload(item.file, into, reason);
+          item.status = "done";
+          item.detail = "";
+        } catch (error) {
+          item.status = "failed";
+          item.detail = (error as Error).message;
+        }
       }
+    } finally {
+      sending = false;
     }
     const done = queue.filter((item) => item.status === "done").length;
-    if (done > 0) toast(`Added ${done} ${done === 1 ? "file" : "files"}`);
+    if (done > 0) {
+      toast(`Added ${done} ${done === 1 ? "file" : "files"}`);
+      // Cleared once something landed, so a second batch does not silently
+      // inherit the first one's reason. Left alone on a total failure, since
+      // that is the case where somebody is about to press the button again.
+      why = "";
+    }
   }
 
   const pending = $derived(queue.filter((item) => item.status === "waiting").length);
@@ -110,7 +149,7 @@
     <div class="fields">
       <label class="field">
         <span class="lbl">Scope</span>
-        <select bind:value={scope}>
+        <select bind:value={scope} disabled={sending}>
           {#each places.scopes as s (s.uri)}
             <option value={s.uri}>{s.label}</option>
           {/each}
@@ -123,6 +162,7 @@
           list="ovdash-folders"
           placeholder="e.g. notes/meetings — or pick an existing one"
           bind:value={folder}
+          disabled={sending}
         />
         <datalist id="ovdash-folders">
           {#each inScope as f (f.uri)}
@@ -140,6 +180,35 @@
     <p class="note">
       Each file gets a folder of its own, named after it, so adding two files
       never mixes them together.
+    </p>
+
+    <!--
+      Why you are keeping it.
+
+      Worth its own block rather than a third box in the row above, because it
+      is the one field here that changes what OpenViking writes rather than
+      where it writes it — and it needs room to say a sentence.
+    -->
+    <!--
+      `reason`, not `why`: `.why` is already the class on the red line under a
+      failed row further down this page, and a label carrying both picked up its
+      30px indent and sat out of line with the fields above.
+    -->
+    <label class="field reason">
+      <span class="lbl">Why you are keeping it <span class="opt">optional</span></span>
+      <textarea
+        rows="2"
+        maxlength={MAX_REASON_CHARS}
+        placeholder="e.g. the pricing numbers for the Q3 argument — I will want these again"
+        bind:value={why}
+        disabled={sending}
+      ></textarea>
+    </label>
+    <p class="note">
+      This is not a label. OpenViking reads it as the instruction for how to
+      describe what you are adding, so it shapes the summary written about the
+      file — and therefore what finds it later. It applies to every file in this
+      batch.
     </p>
   {:else}
     <p class="pdesc">Loading destinations…</p>
@@ -224,7 +293,7 @@
   {/if}
 
   <p style="margin-top:18px">
-    <button class="tbtn primary" disabled={pending === 0} onclick={send}>
+    <button class="tbtn primary" disabled={pending === 0 || sending} onclick={send}>
       <Icon name="upload" /> Add {pending} {pending === 1 ? "file" : "files"}
     </button>
   </p>
@@ -266,7 +335,8 @@
     opacity: 0.7;
   }
   .field select,
-  .field input {
+  .field input,
+  .field textarea {
     width: 100%;
     font: inherit;
     font-size: 14px;
@@ -277,12 +347,22 @@
     padding: 9px 11px;
   }
   .field select:focus,
-  .field input:focus {
+  .field input:focus,
+  .field textarea:focus {
     outline: none;
     border-color: var(--accent);
   }
-  .field input::placeholder {
+  .field input::placeholder,
+  .field textarea::placeholder {
     color: var(--ink-3);
+  }
+
+  .field.reason {
+    margin-top: var(--s4);
+  }
+  .field.reason textarea {
+    resize: vertical;
+    line-height: 1.55;
   }
 
   .preview {

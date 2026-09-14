@@ -14,6 +14,7 @@ import { Hono } from "hono";
 import type { Context, MiddlewareHandler } from "hono";
 import { csrf } from "hono/csrf";
 import { HTTPException } from "hono/http-exception";
+import { MAX_EDIT_CHARS, MAX_REASON_CHARS, describeLimit } from "../shared/limits";
 import { inlineImageType } from "../shared/media";
 import { folderNameProblem, namesNothing, safeSegment } from "../shared/names";
 import type {
@@ -26,6 +27,7 @@ import type {
   Moved,
   Node,
   Opened,
+  Saved,
   SessionState,
   Tree,
   Viewer,
@@ -45,7 +47,7 @@ import {
   parentOf,
   relativeTo,
 } from "./ov";
-import { describeFile } from "./overview";
+import { describeFile, folderOverview } from "./overview";
 import {
   SessionError,
   endSession,
@@ -88,6 +90,37 @@ const MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024;
 
 /** Most bytes accepted from one upload. */
 const MAX_UPLOAD_BYTES = 256 * 1024 * 1024;
+
+/**
+ * Most bytes one save may arrive as, before its text is even parsed.
+ *
+ * The character cap below bounds what gets stored; this bounds what gets
+ * buffered, and they are different defences. `c.req.json()` materialises and
+ * parses the whole body, so a limit applied to the parsed string is a limit
+ * applied once the memory is already gone — the same lesson `/api/upload`
+ * records, where a 300 MB post cost ~1.8 GB of RSS before the 413 came back.
+ *
+ * Six bytes per character, which is the true worst case rather than a round
+ * number: a control character escapes to `\u0000`, six bytes per unit of
+ * `String.length`. Three would cover ordinary UTF-8 and four would cover most
+ * escaping, and both would refuse saves that are *inside* the character cap —
+ * which is the one thing this must not do, since the cap is what people are told.
+ * Buffering 12 MB to reject a body is cheap; refusing a legitimate save is not.
+ *
+ * The slack is the envelope, and it is not decoration: `× 6` on its own refused a
+ * save of exactly `MAX_EDIT_CHARS` control characters by the width of the JSON
+ * around the text — precisely the outcome the paragraph above says must never
+ * happen.
+ *
+ * It is a kilobyte rather than a measured fit because a measured fit broke the
+ * moment the body grew a field. `{"content":"…"}` is fourteen bytes; adding the
+ * `seen` stamp took it to seventy-one, and a slack of sixty-four — sized against
+ * the old shape — put a save at exactly the cap seven bytes over the line. The
+ * budget exists to stop a runaway body being buffered, and a kilobyte is nothing
+ * against twelve megabytes, so there is no reason to trim it to the current
+ * request shape and every reason not to.
+ */
+const MAX_EDIT_BYTES = MAX_EDIT_CHARS * 6 + 1024;
 
 /**
  * Most bytes one image may buffer to be shown inline.
@@ -547,6 +580,9 @@ export function createApp(services: Services) {
       nodes: nodes.sort((a, b) => a.relPath.localeCompare(b.relPath)),
       truncated: nodes.length >= TREE_NODE_LIMIT,
       summary: "",
+      // The whole-tree listing describes no single folder, so there is nothing
+      // to read here. The pane only asks for one folder at a time.
+      overview: "",
     };
     return c.json(tree);
   });
@@ -554,15 +590,7 @@ export function createApp(services: Services) {
   app.get("/api/folder", async (c) => {
     const ov = c.get("ov");
     const uri = requireUri(c);
-    // Listed and summarised together: the reader shows both at once, so two
-    // round trips from the browser would only make it flash.
-    const [nodes, summary] = await Promise.all([ov.list(uri, false), ov.abstract(uri)]);
-    return c.json({
-      root: uri,
-      nodes: nodes.sort(directoriesFirst),
-      truncated: false,
-      summary,
-    } satisfies Tree);
+    return c.json(await readFolder(ov, uri));
   });
 
   app.get("/api/file", async (c) => {
@@ -596,16 +624,10 @@ export function createApp(services: Services) {
     const uri = node.uri || requested;
 
     if (node.isDir) {
-      const [nodes, summary] = await Promise.all([ov.list(uri, false), ov.abstract(uri)]);
       return c.json({
         kind: "folder",
         name: node.name,
-        folder: {
-          root: uri,
-          nodes: nodes.sort(directoriesFirst),
-          truncated: false,
-          summary,
-        },
+        folder: await readFolder(ov, uri),
       } satisfies Opened);
     }
 
@@ -812,6 +834,127 @@ export function createApp(services: Services) {
   });
 
   /**
+   * Save an edit to a file's text.
+   *
+   * The dashboard could read a memory and not change a word of it, so fixing a
+   * preference or a line of `soul.md` meant going to a terminal. This is the
+   * other half of the reading pane.
+   *
+   * Only files OpenViking already hands over as text may be saved, and that is
+   * the load-bearing check rather than a convenience: the reader has no bytes
+   * for a binary, so accepting one here would write a JSON string over a PNG.
+   * `isTextKind` is the same table that decided whether to inline it in the
+   * first place, so what can be edited is exactly what can be read.
+   */
+  app.put("/api/file", async (c) => {
+    const ov = c.get("ov");
+    const uri = requireInScope(config, c.get("viewer"), requireUri(c));
+
+    /*
+     * Checked before the body is read, the way the upload route does it.
+     *
+     * `readJson` materialises and parses the whole thing, so a cap applied to
+     * the parsed string is applied once the memory is spent. Content-Length can
+     * be absent or a lie, which is why the character check below stays as the
+     * real bound; this only stops the honest enormous body from being buffered.
+     */
+    const declared = Number(c.req.header("content-length") ?? "0");
+    if (Number.isFinite(declared) && declared > MAX_EDIT_BYTES) {
+      throw new OvError(
+        `that save is larger than ${describeLimit(MAX_EDIT_CHARS)} of text`,
+        413,
+        "TOO_LARGE",
+      );
+    }
+
+    const body = await readJson(c);
+
+    // An absent field and an empty string are different requests: clearing a
+    // file is a thing somebody may mean, and `body.content || ""` would have
+    // turned a malformed body into one.
+    if (typeof body.content !== "string") {
+      throw new OvError("content must be a string", 400, "INVALID_ARGUMENT");
+    }
+    const content = body.content;
+    if (content.length > MAX_EDIT_CHARS) {
+      throw new OvError(
+        `that is longer than ${describeLimit(MAX_EDIT_CHARS)}`,
+        413,
+        "TOO_LARGE",
+      );
+    }
+
+    // Stat first. A uri nothing is stored at should say so rather than have
+    // OpenViking create it — `content/write` in `replace` mode makes a missing
+    // file, so without this a typo in the address bar writes a new document
+    // somewhere nobody asked for.
+    const node = await ov.stat(uri);
+    if (node.isDir) {
+      throw new OvError(
+        `${node.name} is a folder, not a file to edit`,
+        400,
+        "INVALID_ARGUMENT",
+      );
+    }
+    if (!isTextKind(node.kind)) {
+      throw new OvError(
+        `${node.name} is a ${node.kind} file, which this dashboard cannot edit as text`,
+        400,
+        "INVALID_ARGUMENT",
+      );
+    }
+
+    /*
+     * Refuse a save onto a file that changed while it was being edited.
+     *
+     * OpenViking offers nothing to build this on: `content/write` takes a uri and
+     * content, there is no conditional write, and no version tag comes back with a
+     * read. So the comparison is made from what a read *does* carry — the modified
+     * time and the size — against what the editor was holding when it opened.
+     *
+     * The comparison itself costs nothing: the stat above already happened, for
+     * the two checks that had to run anyway. The round trip this route did gain is
+     * the second stat below, after the write.
+     *
+     * Three honest limits, all of which leave this worth having. The stat and the
+     * write are not one operation, so a write landing between them still wins
+     * silently — and the same gap exists after the write, where a stamp read a
+     * moment later can describe somebody else's version rather than this one, which
+     * would let this editor's *next* save pass the guard and replace them. Closing
+     * either would need a conditional write OpenViking does not offer. And `modTime` is second-resolution — measured against the lab
+     * cluster, `2026-09-14T06:19:55Z` — so a change inside the same second is
+     * invisible to it. The size is compared as well precisely because of that: a
+     * same-second write is caught unless it also happens to leave the file exactly
+     * as long. What this reliably catches is the case that actually happens, where
+     * an agent or a cron wrote the file minutes ago.
+     */
+    const seen = seenStamp(body.seen);
+    if (seen && (seen.modTime !== node.modTime || seen.size !== node.size)) {
+      throw new OvError(
+        `${node.name} has changed since you opened it — something else wrote to it, and saving now would replace that`,
+        409,
+        "STALE_EDIT",
+      );
+    }
+
+    await ov.write(uri, content);
+
+    /*
+     * Answer with the new stamp, so a second save from the same editor compares
+     * against this write rather than against the version it opened on.
+     *
+     * Without it, typing on after a save and pressing Save again is refused as a
+     * conflict with your own writing — the guard firing on the one person it is
+     * supposed to protect.
+     */
+    const after = await ov.stat(uri).catch(() => null);
+    return c.json({
+      modTime: after?.modTime ?? "",
+      size: after?.size ?? 0,
+    } satisfies Saved);
+  });
+
+  /**
    * Move a file or folder into another folder.
    *
    * The destination is the folder, not the finished path: the name comes off
@@ -1006,6 +1149,24 @@ export function createApp(services: Services) {
       typeof body.to === "string" ? body.to : "",
     );
 
+    /*
+     * Why this is worth keeping, in the uploader's own words.
+     *
+     * Passed to OpenViking as the resource's `reason`, which is not a label it
+     * files away: with no explicit instruction the parser uses it as one
+     * (`utils/resource_processor.py`), so it steers the abstract and overview
+     * the model writes and therefore what the resource is findable by. Which is
+     * why it is worth typing, and why it is capped — this is a prompt.
+     */
+    const why = typeof body.why === "string" ? body.why.trim() : "";
+    if (why.length > MAX_REASON_CHARS) {
+      throw new OvError(
+        `the reason can be at most ${MAX_REASON_CHARS} characters`,
+        400,
+        "INVALID_ARGUMENT",
+      );
+    }
+
     // The stored name is the sanitized one, so that is what gets reported
     // back — answering with the name as uploaded would hand the caller a URI
     // to a file that is not there under that name.
@@ -1037,7 +1198,7 @@ export function createApp(services: Services) {
         );
       }
       await writeFile(path, bytes, { mode: 0o600 });
-      await importWithRetry(ov, path, target);
+      await importWithRetry(ov, path, target, why);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -1361,6 +1522,34 @@ export function requireInScope(
 }
 
 /**
+ * Read one folder: what is in it, and both things OpenViking says about it.
+ *
+ * All three at once, because the pane draws them together and three round trips
+ * from the browser would only make it flash. Shared by `/api/folder` and the
+ * folder half of `/api/open` so a folder reads the same whichever route opened
+ * it — the overview was added in one place first, and a link followed into a
+ * folder then showed less than the same folder picked in the tree.
+ */
+async function readFolder(ov: OvClient, uri: string): Promise<Tree> {
+  const [nodes, summary, overview] = await Promise.all([
+    ov.list(uri, false, TREE_NODE_LIMIT),
+    ov.abstract(uri),
+    ov.overview(uri),
+  ]);
+  return {
+    root: uri,
+    nodes: nodes.sort(directoriesFirst),
+    // Reported rather than asserted. Both of the old call sites hardcoded
+    // `false` while asking with a limit, so a folder of 2000 entries came back
+    // claiming to be the whole folder — the one claim a listing must not make
+    // falsely. `/api/tree` has always derived it; now a folder read does too.
+    truncated: nodes.length >= TREE_NODE_LIMIT,
+    summary,
+    overview: folderOverview(overview),
+  };
+}
+
+/**
  * Say what one file is, and what folder it sits in.
  *
  * OpenViking keeps no abstract per file. `abstract(fileUri)` answers with the
@@ -1399,6 +1588,21 @@ async function readJson(c: Context): Promise<Record<string, unknown>> {
   return body !== null && typeof body === "object" && !Array.isArray(body)
     ? (body as Record<string, unknown>)
     : {};
+}
+
+/**
+ * The version an editor says it was holding, or null when it did not say.
+ *
+ * Absent is a real answer and means "write it regardless" — that is how the
+ * overwrite button gets its way after a conflict is reported. A half-formed
+ * stamp is not an answer, though, and is treated as absent rather than as a
+ * comparison against `undefined`, which would refuse every save.
+ */
+function seenStamp(value: unknown): { modTime: string; size: number } | null {
+  if (!value || typeof value !== "object") return null;
+  const { modTime, size } = value as { modTime?: unknown; size?: unknown };
+  if (typeof modTime !== "string" || typeof size !== "number") return null;
+  return { modTime, size };
 }
 
 /** Require one named field of a JSON body to be a Viking uri. */
@@ -1517,11 +1721,12 @@ async function importWithRetry(
   ov: OvClient,
   path: string,
   target: string,
+  reason = "",
   attempts = 4,
 ): Promise<void> {
   for (let attempt = 1; ; attempt++) {
     try {
-      await ov.addResource(path, target);
+      await ov.addResource(path, target, reason);
       return;
     } catch (error) {
       const locked = error instanceof OvError && error.code === "CONFLICT";

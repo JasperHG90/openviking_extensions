@@ -533,9 +533,51 @@ export class OvClient {
     return { state: "waiting", error: "" };
   }
 
-  /** Import a resource from a local path or a remote URL. */
-  async addResource(source: string, to: string): Promise<void> {
-    await this.guard(`adding ${source}`, () => this.sdk.addResource(source, { to }));
+  /**
+   * Replace a file's text.
+   *
+   * The bytes land before this returns whatever `wait` says: both of
+   * OpenViking's write paths await their own `_write_in_place` before answering
+   * and defer only the indexing (`storage/content_write.py`). So a read straight
+   * afterwards sees the new text.
+   *
+   * What happens to the *description* after that depends on where the file
+   * lives, and the two differ enough to be worth stating, because the memory
+   * case is the one this dashboard added editing for:
+   *
+   * - A **memory** takes `_write_memory_with_refresh`, which opens with
+   *   `del processing_mode`. It re-embeds the file and re-renders the memory
+   *   folder's templated overview; **no model runs**, and it reports
+   *   `semantic_status: "skipped"`. So an edited memory is findable by its new
+   *   words, and what was written *about* it stands until somebody asks for a
+   *   describe.
+   * - Anything else takes `_write_direct_with_refresh`, which queues a semantic
+   *   refresh — `content/write` defaults `processing_mode` to
+   *   `semantic_and_vectors` — so there the model does rerun, out of band.
+   *
+   * A memory also keeps its `MEMORY_FIELDS` trailer across the write rather than
+   * losing it: `_write_in_place` parses the stored file, swaps the body for this
+   * content, and writes it back with the metadata intact. That is why
+   * `content/read` on a memory answers with less than its size on disk — the
+   * body is the part anybody edits, and it is the part this replaces.
+   */
+  async write(uri: string, content: string): Promise<void> {
+    await this.guard(`writing ${uri}`, () => this.sdk.write(uri, content));
+  }
+
+  /**
+   * Import a resource from a local path or a remote URL.
+   *
+   * @param reason - Why this is worth keeping. Not a label: OpenViking passes
+   *   it to the parser as the instruction when no explicit one is given
+   *   (`utils/resource_processor.py`, `effective_instruction = instruction ||
+   *   reason`), so it shapes the abstract and overview the model writes and
+   *   therefore what the resource is findable by.
+   */
+  async addResource(source: string, to: string, reason = ""): Promise<void> {
+    await this.guard(`adding ${source}`, () =>
+      this.sdk.addResource(source, reason ? { to, reason } : { to }),
+    );
   }
 
   /**

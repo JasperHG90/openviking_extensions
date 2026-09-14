@@ -13,6 +13,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildServices, createApp } from "../src/server/app";
 import { loadConfig } from "../src/server/env";
 import { statusFor } from "../src/server/ov";
+import { MAX_EDIT_CHARS, MAX_REASON_CHARS } from "../src/shared/limits";
 
 const ORIGIN = "http://localhost:8080";
 
@@ -887,5 +888,505 @@ describe("the traversal rules on every write", () => {
       expect(response.status, root).toBe(403);
     }
     expect(calls).toHaveLength(0);
+  });
+});
+
+/**
+ * Saving an edit.
+ *
+ * The pane could read a memory and change nothing in it, so fixing a line of
+ * `soul.md` meant going to a terminal. The interesting cases are the refusals
+ * again: a save that reaches outside the caller's scopes, one aimed at a folder,
+ * and one aimed at a file whose bytes are not text — that last one is the
+ * dangerous one, because the reader has no bytes for a binary and accepting it
+ * would write a JSON string over a PNG.
+ */
+describe("saving a file's text", () => {
+  const URI = "viking://user/jasper/memories/soul.md";
+
+  /** Say what exists, and answer a write with OpenViking's own envelope. */
+  function tree(entries: Record<string, { isDir: boolean } | null>) {
+    return stubOv((url) => {
+      if (url.includes("/content/write")) return { uri: URI, mode: "replace" };
+      return statting(entries)(url);
+    });
+  }
+
+  function save(uri: string, body: unknown, headers = FROM_THE_APP) {
+    return appFor().request(`/api/file?uri=${encodeURIComponent(uri)}`, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify(body),
+    });
+  }
+
+  it("replaces the file with what was sent", async () => {
+    const calls = tree({ [URI]: { isDir: false } });
+
+    const response = await save(URI, { content: "# Soul\n\nBe kind.\n" });
+
+    // 200 with the file's new stamp, not 204: the editor compares its next save
+    // against this rather than against the version it opened on, or a second save
+    // would be refused as a clash with the first.
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ modTime: "", size: 10 });
+    const written = calls.find((call) => call.url.includes("/content/write"));
+    expect(written?.body).toMatchObject({
+      uri: URI,
+      content: "# Soul\n\nBe kind.\n",
+      // Replace, not append: an edit is the new whole text of the file.
+      mode: "replace",
+    });
+  });
+
+  it("lets a file be emptied, which is a thing somebody may mean", async () => {
+    // `body.content || ""` would read an absent field as a deliberate clear.
+    // These are different requests and the route has to tell them apart.
+    const calls = tree({ [URI]: { isDir: false } });
+
+    expect((await save(URI, { content: "" })).status).toBe(200);
+    expect(calls.find((call) => call.url.includes("/content/write"))?.body).toMatchObject(
+      { content: "" },
+    );
+  });
+
+  it("refuses a body with no content field at all", async () => {
+    const calls = stubOv();
+    for (const body of [{}, { content: null }, { content: 12 }, { text: "hi" }]) {
+      const response = await save(URI, body);
+      expect(response.status, JSON.stringify(body)).toBe(400);
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  it("refuses to write text over a file that is not text", async () => {
+    // The reader never offers this — it has no bytes for a binary — so the only
+    // way here is a hand-made request, and the cost of letting it through is a
+    // PNG replaced by a JSON string with nothing to undo it.
+    const png = "viking://user/jasper/resources/shot/shot.png";
+    const calls = tree({ [png]: { isDir: false } });
+
+    const response = await save(png, { content: "not a picture" });
+
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: { message: string } };
+    expect(body.error.message).toContain("cannot edit as text");
+    expect(calls.some((call) => call.url.includes("/content/write"))).toBe(false);
+  });
+
+  it("refuses to write over a folder", async () => {
+    const folder = "viking://user/jasper/resources/notes";
+    const calls = tree({ [folder]: { isDir: true } });
+
+    const response = await save(folder, { content: "hello" });
+
+    expect(response.status).toBe(400);
+    expect(calls.some((call) => call.url.includes("/content/write"))).toBe(false);
+  });
+
+  it("refuses a uri nothing is stored at, rather than creating one", async () => {
+    // `content/write` in replace mode makes a missing file, so without the stat
+    // a typo in the address bar writes a new document nobody asked for.
+    const calls = tree({ [URI]: null });
+
+    const response = await save(URI, { content: "hello" });
+
+    expect(response.status).toBe(404);
+    expect(calls.some((call) => call.url.includes("/content/write"))).toBe(false);
+  });
+
+  it("refuses a uri outside the caller's scopes", async () => {
+    const calls = stubOv();
+    const response = await save("viking://user/ada/memories/soul.md", {
+      content: "hello",
+    });
+    expect(response.status).toBe(403);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("refuses a scope root, which is not a file", async () => {
+    const calls = stubOv();
+    const response = await save("viking://user/jasper", { content: "hello" });
+    expect(response.status).toBe(403);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("refuses the traversal spellings, like every other write", async () => {
+    const calls = stubOv();
+    for (const bad of [
+      "viking://user/jasper/../ada/x.md",
+      "viking://user/jasper/%2e%2e/ada/x.md",
+      "viking://user/jasper/./x.md",
+    ]) {
+      const response = await save(bad, { content: "hello" });
+      expect(response.status, bad).toBe(400);
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  it("refuses more text than it will hold", async () => {
+    const calls = stubOv();
+    const response = await save(URI, { content: "x".repeat(MAX_EDIT_CHARS + 1) });
+    expect(response.status).toBe(413);
+    // Refused before the stat, so an oversize paste costs no upstream call.
+    expect(calls).toHaveLength(0);
+  });
+
+  it("refuses a save that did not come from this dashboard", async () => {
+    const calls = stubOv();
+    const response = await save(
+      URI,
+      { content: "hello" },
+      { "content-type": "application/json", origin: "https://evil.example" },
+    );
+    expect(response.status).toBe(403);
+    expect(((await response.json()) as { error: { code: string } }).error.code).toBe(
+      "BAD_ORIGIN",
+    );
+    expect(calls).toHaveLength(0);
+  });
+});
+
+/**
+ * Saying why a file is worth keeping.
+ *
+ * Not a label filed beside the bytes: OpenViking passes `reason` to the parser
+ * as the instruction when nothing else gives one, so it steers the abstract and
+ * overview the model writes and therefore what the file is later found by.
+ * Dropped on the way, this would be a box that changes nothing.
+ */
+describe("why an upload is worth keeping", () => {
+  /** An import is two upstream calls: bytes to `temp_upload`, then the id. */
+  function stubImport() {
+    return stubOv((url) =>
+      url.includes("temp_upload") ? { temp_file_id: "tmp_1" } : { ok: true },
+    );
+  }
+
+  function upload(fields: Record<string, string>) {
+    const form = new FormData();
+    form.append("file", new File(["the numbers"], "q3.md", { type: "text/markdown" }));
+    for (const [key, value] of Object.entries(fields)) form.append(key, value);
+    return appFor().request("/api/upload", {
+      method: "POST",
+      headers: { origin: ORIGIN },
+      body: form,
+    });
+  }
+
+  /** The body of the `POST /resources` call, which is the import itself. */
+  function imported(calls: Call[]): Record<string, unknown> {
+    const call = calls.find(
+      (candidate) =>
+        candidate.url.endsWith("/api/v1/resources") && candidate.method === "POST",
+    );
+    return (call?.body ?? {}) as Record<string, unknown>;
+  }
+
+  it("passes the reason to OpenViking, where it becomes the instruction", async () => {
+    const calls = stubImport();
+
+    const response = await upload({ why: "the pricing numbers for the Q3 argument" });
+
+    expect(response.status).toBe(200);
+    expect(imported(calls).reason).toBe("the pricing numbers for the Q3 argument");
+  });
+
+  it("trims it, so a stray newline is not part of the prompt", async () => {
+    const calls = stubImport();
+    await upload({ why: "  for the Q3 argument \n" });
+    expect(imported(calls).reason).toBe("for the Q3 argument");
+  });
+
+  it("sends none at all when nothing was typed", async () => {
+    // Not an empty string: `reason: ""` is a field OpenViking would then read,
+    // and an empty instruction is not the same as no instruction.
+    const calls = stubImport();
+    await upload({ why: "   " });
+    expect(imported(calls)).not.toHaveProperty("reason");
+  });
+
+  it("still uploads when no reason is given, because it is optional", async () => {
+    const calls = stubImport();
+    expect((await upload({})).status).toBe(200);
+    expect(imported(calls)).not.toHaveProperty("reason");
+  });
+
+  it("refuses one long enough to be a document in its own right", async () => {
+    // This is a prompt, not a note. A page pasted in here becomes the
+    // instruction that decides how the file is described.
+    const calls = stubOv();
+    const response = await upload({ why: "x".repeat(MAX_REASON_CHARS + 1) });
+    expect(response.status).toBe(400);
+    expect(calls).toHaveLength(0);
+  });
+});
+
+/**
+ * The bounds a save is held to before its body is even read.
+ *
+ * Two different defences, and both matter. The character cap bounds what gets
+ * *stored*; the content-length check bounds what gets *buffered*. `readJson`
+ * materialises and parses the whole body, so a cap applied to the parsed string
+ * is applied once the memory is spent — the lesson `/api/upload` already records
+ * in a comment, from a measured 300 MB post that cost ~1.8 GB of RSS.
+ */
+describe("what a save is refused for before it is read", () => {
+  const URI = "viking://user/jasper/memories/soul.md";
+
+  it("refuses an enormous body on its declared length, before parsing it", async () => {
+    const calls = stubOv();
+
+    /*
+     * The body is a stream that fails on the first read.
+     *
+     * That is what makes the assertion mean something. A route that reached
+     * `readJson` could only answer with a parse failure — `readJson` treats an
+     * unparseable body as `{}`, so `content` would be missing and the answer
+     * would be 400 INVALID_ARGUMENT. Getting 413 TOO_LARGE is only reachable
+     * from the check that runs *before* the read.
+     */
+    const response = await appFor().request(`/api/file?uri=${encodeURIComponent(URI)}`, {
+      method: "PUT",
+      headers: { ...FROM_THE_APP, "content-length": String(9_000_000_000) },
+      body: new ReadableStream({
+        pull() {
+          throw new Error("this body cannot be read");
+        },
+      }),
+      // Node's fetch requires this for a stream body.
+      duplex: "half",
+    } as RequestInit);
+
+    expect(response.status).toBe(413);
+    expect(((await response.json()) as { error: { code: string } }).error.code).toBe(
+      "TOO_LARGE",
+    );
+    expect(calls).toHaveLength(0);
+  });
+
+  it("still refuses an oversize body that lied about its length", async () => {
+    // Content-Length can be absent or wrong, which is why the character check
+    // stays as the real bound rather than being replaced by the one above.
+    const calls = stubOv();
+    const response = await appFor().request(`/api/file?uri=${encodeURIComponent(URI)}`, {
+      method: "PUT",
+      headers: { ...FROM_THE_APP, "content-length": "10" },
+      body: JSON.stringify({ content: "x".repeat(MAX_EDIT_CHARS + 1) }),
+    });
+
+    expect(response.status).toBe(413);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("lets a legitimate save through at the character cap", async () => {
+    /*
+     * What pins the byte factor, and it has to be at the cap to do that.
+     *
+     * The first version of this test sent a thousand control characters — six
+     * kilobytes against a twelve-megabyte gate — so every factor from x1 upward
+     * passed it. Measured: with that fixture, changing `* 6` to `* 1` left all
+     * 385 tests green, which is the exact failure the test was written to prevent.
+     *
+     * A control character escapes to six bytes for one unit of `String.length`,
+     * so a body at the cap is 6 x MAX_EDIT_CHARS plus whatever JSON wraps it.
+     * That is over `x 6` alone, which is why the constant carries slack: refusing
+     * a save that is inside the cap people are told about is the one thing this
+     * gate must not do.
+     *
+     * Sent *with* the stamp, because that is the request the editor actually
+     * makes and because the envelope is what broke last time: the slack was fitted
+     * to `{"content":"..."}` at fourteen bytes, the `seen` field took the envelope
+     * to seventy-one, and a save at exactly the cap started coming back 413. A
+     * body-shape change must fail here rather than in somebody's editor.
+     */
+    const content = "\u0001".repeat(MAX_EDIT_CHARS);
+    const seen = { modTime: "2026-09-14T06:19:55Z", size: MAX_EDIT_CHARS };
+    const body = JSON.stringify({ content, seen });
+    // Six bytes per character plus the envelope, and the envelope is bigger than
+    // the text-only one it was once sized against.
+    expect(body.length).toBeGreaterThan(MAX_EDIT_CHARS * 6 + 14);
+
+    const uri = "viking://user/jasper/resources/ctl.md";
+    const calls = stubOv((url) => {
+      if (url.includes("/content/write")) return { uri, mode: "replace" };
+      if (!url.includes("/fs/stat")) return {};
+      return { name: "ctl.md", uri, isDir: false, ...seen };
+    });
+    const response = await appFor().request(`/api/file?uri=${encodeURIComponent(uri)}`, {
+      method: "PUT",
+      headers: { ...FROM_THE_APP, "content-length": String(body.length) },
+      body,
+    });
+
+    expect(response.status).toBe(200);
+    expect(calls.some((call) => call.url.includes("/content/write"))).toBe(true);
+  });
+
+  it("checks the scope before the size, so a stranger learns nothing", async () => {
+    const calls = stubOv();
+    const response = await appFor().request(
+      `/api/file?uri=${encodeURIComponent("viking://user/ada/memories/soul.md")}`,
+      {
+        method: "PUT",
+        headers: { ...FROM_THE_APP, "content-length": String(9_000_000_000) },
+        body: JSON.stringify({ content: "hello" }),
+      },
+    );
+
+    expect(response.status).toBe(403);
+    expect(calls).toHaveLength(0);
+  });
+});
+
+/**
+ * Refusing a save that would replace somebody else's write.
+ *
+ * OpenViking offers nothing to build this on: `content/write` takes a uri and
+ * content, there is no conditional write, and a read carries no version tag. So
+ * the editor sends back the modified time and size it opened on, and the route
+ * compares them against what is stored now — free, since it already stats the
+ * file for two other checks.
+ *
+ * The realistic case is an agent or a cron writing a memory while somebody has it
+ * open in the dashboard, which on this user's cluster is a daily occurrence.
+ */
+describe("saving over something that changed underneath", () => {
+  const URI = "viking://user/jasper/memories/soul.md";
+
+  /** Stat answers with a chosen stamp, and accepts the write. */
+  function stored(modTime: string, size: number) {
+    return stubOv((url) => {
+      if (url.includes("/content/write")) return { uri: URI, mode: "replace" };
+      if (!url.includes("/fs/stat")) return {};
+      return { name: "soul.md", uri: URI, isDir: false, size, modTime };
+    });
+  }
+
+  function save(body: unknown) {
+    return appFor().request(`/api/file?uri=${encodeURIComponent(URI)}`, {
+      method: "PUT",
+      headers: FROM_THE_APP,
+      body: JSON.stringify(body),
+    });
+  }
+
+  const SEEN = { modTime: "2026-09-14T06:19:55Z", size: 12 };
+
+  it("writes when the file is still what the editor opened on", async () => {
+    const calls = stored(SEEN.modTime, SEEN.size);
+
+    const response = await save({ content: "mine", seen: SEEN });
+
+    expect(response.status).toBe(200);
+    expect(calls.some((call) => call.url.includes("/content/write"))).toBe(true);
+  });
+
+  it("refuses when the time moved, and does not write", async () => {
+    // Measured against the lab cluster: a write moves `modTime` from
+    // 06:19:55Z to 06:19:59Z and the size from 12 to 35.
+    const calls = stored("2026-09-14T06:19:59Z", 35);
+
+    const response = await save({ content: "mine", seen: SEEN });
+
+    expect(response.status).toBe(409);
+    const body = (await response.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("STALE_EDIT");
+    expect(body.error.message).toContain("changed since you opened it");
+    expect(calls.some((call) => call.url.includes("/content/write"))).toBe(false);
+  });
+
+  it("refuses when only the size moved, which is what covers a same-second write", async () => {
+    /*
+     * `modTime` is second-resolution, so a write inside the same second is
+     * invisible to it. The size is compared as well precisely for that: it closes
+     * every same-second change except one that leaves the file exactly as long.
+     */
+    const calls = stored(SEEN.modTime, 999);
+
+    expect((await save({ content: "mine", seen: SEEN })).status).toBe(409);
+    expect(calls.some((call) => call.url.includes("/content/write"))).toBe(false);
+  });
+
+  it("writes regardless when the editor sends no stamp", async () => {
+    // How "Overwrite theirs" gets its way once the clash has been reported. An
+    // absent stamp is a decision, not a missing field.
+    const calls = stored("2026-09-14T09:00:00Z", 4096);
+
+    expect((await save({ content: "mine" })).status).toBe(200);
+    expect(calls.some((call) => call.url.includes("/content/write"))).toBe(true);
+  });
+
+  it("ignores a half-formed stamp rather than refusing every save", async () => {
+    // Compared against `undefined`, a partial stamp would never match and would
+    // make the file permanently unsaveable.
+    const calls = stored(SEEN.modTime, SEEN.size);
+
+    for (const seen of [{}, { modTime: SEEN.modTime }, { size: 12 }, "nonsense", null]) {
+      const response = await save({ content: "mine", seen });
+      expect(response.status, JSON.stringify(seen)).toBe(200);
+    }
+    expect(calls.filter((call) => call.url.includes("/content/write"))).toHaveLength(5);
+  });
+
+  it("answers with the stamp from after the write, not the one it checked", async () => {
+    /*
+     * The distinction is the whole point, and it needs a stub that changes: with a
+     * constant stat, echoing the *pre-write* stamp passes every assertion, and a
+     * route that did so would make every second save from an open editor a false
+     * 409 in production.
+     *
+     * So this stat answers differently once the write has gone through, the way a
+     * real one does.
+     */
+    let written = false;
+    const calls = stubOv((url) => {
+      if (url.includes("/content/write")) {
+        written = true;
+        return { uri: URI, mode: "replace" };
+      }
+      if (!url.includes("/fs/stat")) return {};
+      return written
+        ? { name: "soul.md", uri: URI, isDir: false, size: 4, modTime: "AFTER" }
+        : { name: "soul.md", uri: URI, isDir: false, ...SEEN };
+    });
+
+    const response = await save({ content: "mine", seen: SEEN });
+
+    expect(await response.json()).toEqual({ modTime: "AFTER", size: 4 });
+    // Two stats: the one that guarded the write, and the one that describes it.
+    expect(calls.filter((call) => call.url.includes("/fs/stat"))).toHaveLength(2);
+  });
+
+  it("answers an empty stamp when it cannot see what the file became", async () => {
+    /*
+     * The post-write stat can fail — lock contention or a 5xx right after a write
+     * is exactly when. Saying so lets the editor stop guarding rather than guard
+     * against a stamp it would know to be wrong.
+     */
+    let written = false;
+    stubOv((url) => {
+      if (url.includes("/content/write")) {
+        written = true;
+        return { uri: URI, mode: "replace" };
+      }
+      if (!url.includes("/fs/stat")) return {};
+      if (written) {
+        return new Response(
+          JSON.stringify({
+            status: "error",
+            error: { code: "UNAVAILABLE", message: "busy" },
+          }),
+          { status: 503, headers: { "content-type": "application/json" } },
+        );
+      }
+      return { name: "soul.md", uri: URI, isDir: false, ...SEEN };
+    });
+
+    const response = await save({ content: "mine", seen: SEEN });
+
+    // The write itself succeeded, so this is a 200 carrying an honest "unknown".
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ modTime: "", size: 0 });
   });
 });

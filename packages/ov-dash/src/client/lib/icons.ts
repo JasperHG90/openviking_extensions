@@ -26,6 +26,8 @@ const PATHS: Record<string, string> = {
     '<path d="M3.1 4.3h8.8"/><path d="M6 4.3V2.9h3v1.4"/><path d="M4.3 4.3v7.8h6.4V4.3"/>',
   upload: '<path d="M7.5 12.6V5.2M5.1 7.6L7.5 5.2l2.4 2.4M3.1 2.5h8.8"/>',
   close: '<path d="M4 4l7 7M11 4l-7 7"/>',
+  // A nib on the same 15-unit grid: the body, then the collar across its neck.
+  pencil: '<path d="M9.9 2.7l2.4 2.4-6.6 6.6-3 .6.6-3z"/><path d="M8.4 4.2l2.4 2.4"/>',
   key: '<circle cx="5.6" cy="9.4" r="2.8"/><path d="M7.6 7.4l5-5M10.6 4.4l1.5 1.5"/>',
   refresh: '<path d="M12.8 6.4a5.4 5.4 0 10-.5 3.6"/><path d="M12.9 2.6v3.9H9"/>',
   sun: '<circle cx="7.5" cy="7.5" r="3"/><path d="M7.5 1v1.6M7.5 12.4V14M1 7.5h1.6M12.4 7.5H14M3 3l1.1 1.1M10.9 10.9L12 12M12 3l-1.1 1.1M4.1 10.9L3 12"/>',
