@@ -19,35 +19,54 @@
   let hits = $state<SearchHit[]>([]);
   let found = $state(0);
   let failure = $state("");
-  let ran = $state(false);
   let searching = $state(false);
 
+  /**
+   * The query the results on screen belong to, or "" before the first search.
+   *
+   * Held rather than read off `query`, because the box keeps changing while an
+   * answer is on screen: "Nothing matched X" has to name what was actually
+   * asked, not whatever has been typed since.
+   */
+  let asked = $state("");
+
   let token = 0;
-  let timer: ReturnType<typeof setTimeout> | undefined;
 
-  function schedule(): void {
-    clearTimeout(timer);
-    timer = setTimeout(run, 300);
-  }
-
+  /**
+   * Run the search, once, when it is asked for.
+   *
+   * Typing used to start one 300ms after the last keystroke, which meant a
+   * query was sent on the way to being finished — "kube" searched before
+   * "kubernetes" was typed. Each one is a real call to OpenViking's vector face,
+   * about two seconds against the lab cluster, so a half-typed question cost a
+   * round trip and put results on screen for something nobody asked. Now the
+   * button, or Enter, is what asks.
+   */
   async function run(): Promise<void> {
     const q = query.trim();
     const mine = ++token;
     hits = [];
     found = 0;
     failure = "";
+    // Unreachable through the form — the submit button is disabled on an empty
+    // box, and implicit submission does nothing when the default button is
+    // disabled. Here so `run()` is safe to call from anywhere, not because an
+    // empty submit is expected.
     if (!q) {
-      ran = false;
+      asked = "";
       searching = false;
       return;
     }
-    ran = true;
+    asked = q;
     searching = true;
 
     try {
       const result = await api.search(q, "meaning");
-      // A slow answer landing after the query moved on must not overwrite the
-      // newer results.
+      // Belt and braces. Two searches cannot currently overlap — the submit
+      // button is the only way in and it is disabled while one is running — so
+      // this never fires today. Kept because the guard is one line and a second
+      // entry point added later would otherwise let a slow answer overwrite a
+      // newer one, which is a bug nobody would look for here.
       if (token !== mine) return;
       hits = result.hits;
       found = result.counts.meaning;
@@ -58,24 +77,50 @@
     }
   }
 
+  /** Whether there is anything to search for. */
+  const ready = $derived(query.trim() !== "");
+  /**
+   * True once a search has run and come back with an answer.
+   *
+   * A failure is not an answer: without that clause the page drew the error
+   * callout, "0 by meaning", and "Nothing matched" all at once — telling somebody
+   * their query found nothing when the truth is that nothing was searched.
+   */
+  const answered = $derived(asked !== "" && !searching && !failure);
 </script>
 
-<PageHead eyebrow="Search" title="Search" desc="Ask in your own words." />
+<PageHead
+  eyebrow="Search"
+  title="Search"
+  desc="Ask in your own words, then press Search."
+/>
 
-<div class="sfield">
-  <Icon name="search" />
-  <input
-    type="search"
-    placeholder="Search your files and memories"
-    bind:value={query}
-    oninput={schedule}
-    onkeydown={(event) => {
-      if (event.key === "Enter") void run();
-    }}
-  />
-</div>
+<!--
+  A form, so Enter submits it the way Enter submits any search box, and the
+  button is a real submit button rather than a click handler pretending to be
+  one. Nothing runs until one of those two happens.
+-->
+<form
+  class="sbar"
+  onsubmit={(event) => {
+    event.preventDefault();
+    void run();
+  }}
+>
+  <div class="sfield">
+    <Icon name="search" />
+    <input
+      type="search"
+      placeholder="Search your files and memories"
+      bind:value={query}
+    />
+  </div>
+  <button class="tbtn primary" type="submit" disabled={!ready || searching}>
+    {searching ? "Searching…" : "Search"}
+  </button>
+</form>
 
-{#if ran && !searching}
+{#if answered}
   <div class="views" style="border-bottom:none">
     <span class="sp"></span>
     <span class="mono tally">{found} by meaning</span>
@@ -105,14 +150,41 @@
     <div class="hs">{hit.snippet}</div>
   </button>
 {:else}
-  {#if ran && !searching}
-    <p class="pdesc">Nothing matched “{query}”.</p>
-  {:else if !ran}
-    <p class="pdesc">Type to search.</p>
+  {#if answered}
+    <!-- Names the query the results belong to, not what the box says now. -->
+    <p class="pdesc">Nothing matched “{asked}”.</p>
+  {:else if !searching && !failure}
+    <p class="pdesc">Type a question, then press Search.</p>
   {/if}
 {/each}
 
 <style>
+  /*
+   * The box and its button on one line, the box taking what is left.
+   *
+   * The measure and the top margin move from the box to the bar: `.sfield`
+   * carries both globally, and left there the button would sit adrift past the
+   * end of a 74ch box rather than against it.
+   */
+  .sbar {
+    display: flex;
+    align-items: center;
+    gap: var(--s2);
+    max-width: 74ch;
+    margin-top: var(--s5);
+  }
+  .sbar .sfield {
+    flex: 1;
+    min-width: 0;
+    max-width: none;
+    margin-top: 0;
+  }
+  /* Tall enough to match the box beside it, which is padded for reading. */
+  .sbar .tbtn {
+    padding: 13px 20px;
+    flex: none;
+  }
+
   .tally {
     font-size: 12px;
     color: var(--ink-3);

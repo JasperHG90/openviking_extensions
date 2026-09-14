@@ -87,6 +87,21 @@ export const treeSchema = z.object({
    * for a folder written to a moment ago.
    */
   summary: z.string().default(""),
+  /**
+   * The fuller thing OpenViking wrote about the folder: its overview (L1).
+   *
+   * Where `summary` is one sentence, this carries a description of every entry
+   * inside, and a link to each. It matters most on an imported image: OpenViking
+   * stores a large one as a preview, a grid and a set of tiles, keeps no
+   * original, and writes what it made of them here. The file pane could already
+   * reach one entry's section (`describeFile` mines it), but the folder page —
+   * the page named after the thing somebody uploaded — showed one vague sentence
+   * and read as a folder nothing had been described in.
+   *
+   * Empty for a folder OpenViking has not summarised yet, and for a listing
+   * that was never a folder read.
+   */
+  overview: z.string().default(""),
 });
 export type Tree = z.infer<typeof treeSchema>;
 
@@ -258,6 +273,22 @@ export const jobStateSchema = z.object({
   error: z.string().default(""),
 });
 export type JobState = z.infer<typeof jobStateSchema>;
+
+/**
+ * What a file looked like after a save, so the next save can compare.
+ *
+ * OpenViking issues no version tag, so this is the nearest thing a read carries:
+ * when it was last written and how long it is. The editor holds the pair it opened
+ * on and sends it back, and a save is refused when the stored file no longer
+ * matches — which is the only thing standing between an agent's write and being
+ * silently replaced by yours.
+ */
+export const savedSchema = z.object({
+  /** ISO 8601, second resolution. Empty if the stat after the write failed. */
+  modTime: z.string(),
+  size: z.number(),
+});
+export type Saved = z.infer<typeof savedSchema>;
 
 /** Where a moved resource ended up. */
 export const movedSchema = z.object({ uri: z.string() });

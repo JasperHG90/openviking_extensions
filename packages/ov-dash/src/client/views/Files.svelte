@@ -476,6 +476,8 @@
    * with a 404 that reads like a bug.
    */
   function follow(from: string, to: string): void {
+    // Unsaved typing follows the file too, but not from here: `api.move` does
+    // it, so every caller gets it and no new one can forget. See `api.ts`.
     if (selected === from) {
       openUri(to);
     } else if (selected.startsWith(`${from}/`)) {

@@ -263,16 +263,17 @@ afterwards, which this mode never gets.
 | Home | recursive `fs/ls`, plus memory and session counts |
 | Files | one recursive `fs/ls`, hierarchy built client-side |
 | Folder / File | `fs/ls`, `fs/stat`, `content/read`, `content/abstract`, `content/overview` |
-| Search | `search/find` |
+| Search | `search/find`, on a button press |
 | Memories | files under `<scope>/memories`, grouped by category |
 | Sessions | `sessions` |
 | Add a file | `resources` import, via a private temp file |
 
-The reading pane also acts on what it is showing: **Describe again** hands the
-file back to OpenViking's model, **Delete** removes it, and dragging a row in
-the tree onto a folder moves it there (`fs/mv`). The **+** in the Files toolbar
-makes a folder to drag things into (`fs/mkdir`). See below for what each of
-those does and does not do.
+The reading pane also acts on what it is showing: **Edit** replaces the text
+(`content/write`, refusing a save that would overwrite somebody else's),
+**Describe again** hands the file back to OpenViking's model,
+**Delete** removes it, and dragging a row in the tree onto a folder moves it
+there (`fs/mv`). The **+** in the Files toolbar makes a folder to drag things
+into (`fs/mkdir`). See below for what each of those does and does not do.
 
 Downloads use `content/download`. A folder has no archive endpoint upstream, so
 the server fetches each file and zips them. `/api/image` serves the same bytes
@@ -313,6 +314,44 @@ and `[name](viking://…)` links in it; printed as source it read as a wall of
 asterisks. Same renderer and same sanitizing as the document below it, so the
 links inside a description open in the pane like any other.
 
+### A folder shows its overview, not just its abstract
+
+The overview is also the folder's own page, and for a while it was fetched only
+to be mined and thrown away: the folder pane showed the abstract, which is one
+sentence, while the document holding a line about every entry inside — and a
+`viking://` link to each — went unread.
+
+That looked worst on an image, which is how it was found. Measured against the
+lab cluster on 13 Sep 2026 by importing the same 4600px PNG twice, once the way
+this dashboard does it and once the way `ov add` does: **both produce identical
+results**, a preview, a grid overlay, a directory of tiles, and a thorough
+description of what the model saw in each. The upload was never the problem. But
+OpenViking deliberately does not keep a large image's original
+(`parse/parsers/media/image.py`), and what it saw goes into the folder's
+overview — so somebody who added a screenshot opened its folder, found two JPEGs
+they had not uploaded and one vague sentence, and concluded OpenViking had not
+looked at it.
+
+So a folder pane now renders its overview, labelled as OpenViking's words like
+every other generated block here, and shows it *instead of* the abstract rather
+than beside it. That is not a guess about the two usually agreeing: OpenViking
+derives the abstract **from** the overview —
+`SemanticProcessor._extract_abstract_from_overview` skips the leading `#` lines
+and takes everything down to the first `##` — so the overview contains the
+abstract by construction. `folderOverview` in `src/server/overview.ts` takes the
+duplicated `# <folder>` title off the front, and only a `#`: the title is model
+output, not a wrapper (`prompts/templates/semantic/overview_generation.yaml`
+asks for it), so a run that skips it opens with `## Quick Navigation` — and stripping
+`#{1,2}` ate that heading and orphaned its bullets.
+
+`## Directory Coverage` stays, but be clear about what it does and does not tell
+you. It reports whether the model *sampled* every entry. Truncation happens after
+generation — `_truncate_generated_text` returns a prefix — and it is the `###`
+detail sections at the bottom that get cut, while Coverage sits near the top and
+survives. So a truncated overview can read "all direct entries are represented
+below" with the entries below missing. Coverage is worth showing; it is not a
+truncation marker, and nothing here is.
+
 ### Describe again
 
 A description is written once, by a model, and sometimes it does not arrive —
@@ -339,6 +378,143 @@ file under `OV_SHARED_ROOT` this comes back 403 with OpenViking's own words,
 unless the dashboard's key carries an admin role. And a scope root is refused
 here for the same reason a delete is: reindexing one reruns the model over
 every document under it.
+
+### Editing a file
+
+`PUT /api/file` writes the pane's text back with `content/write`. It exists
+because the dashboard could read `soul.md` and a page of preferences and change
+nothing in them, so a wrong line meant opening a terminal.
+
+Offered for whatever OpenViking hands over as text, which is the same
+`isTextKind` table that decided to inline it — so what can be edited is exactly
+what can be read. That is the load-bearing check, not a convenience: the pane
+holds no bytes for a binary, so accepting one here would write a JSON string over
+a PNG. The route also stats first and refuses a uri nothing is stored at, because
+`content/write` in `replace` mode *creates* a missing file — without the stat, a
+typo in the address bar writes a new document nobody asked for.
+
+What a save does next depends on where the file lives, and the editor says which,
+because the two differ:
+
+- A **memory** takes `_write_memory_with_refresh`, which opens with
+  `del processing_mode` and reports `semantic_status: "skipped"`. It re-embeds
+  the file and re-renders the memory folder's templated overview; **no model
+  runs**. So an edited memory is findable by its new words, and what OpenViking
+  says *about* it stands until somebody presses "Describe again". It also keeps
+  its `MEMORY_FIELDS` trailer: `_write_in_place` parses the stored file, swaps
+  the body, and writes it back with the metadata intact — which is why
+  `content/read` on a memory answers with less than its size on disk, and why the
+  editor holds the body rather than the file.
+- **Anything else** takes `_write_direct_with_refresh`, which queues a semantic
+  refresh, since `content/write` defaults `processing_mode` to
+  `semantic_and_vectors`. There the model does rerun, out of band.
+
+In both, the bytes land before the call returns whatever `wait` says — both paths
+await their own `_write_in_place` and defer only the indexing — so the pane reads
+the file straight back and sees the new text.
+
+**Unsaved typing is not thrown away by a stray click.** The tree sits beside the
+pane, so picking the next row mid-edit is the easy mistake, and the first version
+of this dropped the text on that click without asking — while Delete two buttons
+along asks twice. Now leaving a file parks its draft (`src/client/lib/drafts.ts`),
+the Edit button says "Resume editing" when there is one waiting, Escape closes the
+editor rather than discarding, and throwing the text away is its own two-click
+Discard. "Describe again" and "Delete" are disabled while the editor is open,
+because both replace what the pane is holding, and typing on after pressing Save
+leaves the editor open with the newer text rather than clearing it.
+
+Three operations make a draft invalid rather than worth keeping, and all three are
+handled in `api.ts` next to the cache invalidation — deliberately, not in the
+components that call them. A move carries the draft to the new uri; a delete and a
+memory *forget* drop it, along with every draft under a deleted folder. They lived
+in a component first, and the second component — the one that forgets a memory —
+did not have them, so a deleted file's draft stayed for the life of the tab:
+unreachable by any button, still counted by the close warning, and ready to be
+offered back as "Resume editing" if anything recreated the uri. A rule kept in one
+place cannot be half-applied.
+
+The book of drafts is a **module singleton**, and that is load-bearing rather than
+tidy. Held in the component it lived only as long as that component did — and the
+reading pane is unmounted by every route change and mounted separately by the
+Files page and the File page, so parking a draft meant keeping it until you
+clicked anything in the nav. Module scope, the same as `cache.ts`.
+
+That alone was not enough, and the half-fix is worth recording because it looked
+finished. The singleton saved drafts that had **already been parked** — but the
+state somebody is actually in when they click the nav is "typed, not parked", and
+parking happened only when the selection moved *within* the page. Unmounting ran no
+park, and `beforeunload` does not fire for an in-app route change, so an open
+editor's typing still died silently on every nav click. The pane's destroy hook
+parks it now.
+
+A save is allowed to forget the text it stored and nothing else, and that cuts both
+ways. Dropping by whatever was open rather than by the file saved left the *stored*
+text parked forever; dropping unconditionally destroyed typing added after the
+click, which leaving had parked, under a toast saying "Saved". `drafts.dropSaved`
+compares before it deletes. Signing out clears the lot — one person's words, for a
+session that is over, and it also stops the browser asking "Leave site?" about work
+nobody can save any more.
+
+Drafts live for the tab, so closing it is the one exit that loses them by accident,
+and that one warns.
+
+### A save will not quietly replace somebody else's write
+
+An agent, a cron or another tab can write a file while you have it open here, and
+that is not hypothetical on a cluster where a daily job writes memories. Until
+recently your save won: their version went, with no warning and nothing to undo.
+
+OpenViking gives nothing to build a proper guard on. `content/write` takes a uri
+and content — no conditional write — and a read carries no version tag. An *etag*
+is that tag: a short string a server hands out with a file so a client can later
+say "store this only if it is still the version I read". There isn't one.
+
+So the comparison is made from what a read *does* carry. The editor holds the
+modified time and the size it opened on, sends them back with the save, and the
+route refuses when the stored file no longer matches — `STALE_EDIT`, and the pane
+offers **Overwrite theirs** or **Open theirs, keep mine**. Your typing is parked
+either way, so neither choice loses it. Overwriting works by sending no stamp at
+all, which is why an absent one means "write regardless" rather than "field
+missing".
+
+The comparison is free — the route already stats the file for two other checks.
+The reply then carries the file's new stamp, and that *is* a second round trip on
+the save path, paid so a later save from the same open editor compares against this
+write rather than the version it opened on. Otherwise the guard fires on the one
+person it exists to protect.
+
+When that post-write stat fails, the reply says so with an empty stamp and the
+editor stops guarding rather than guarding against a value it knows is wrong: the
+write certainly changed the file, so the old stamp is not merely stale but false,
+and keeping it would refuse every later save until somebody overwrote. An unguarded
+save costs one write; a stamp known to be wrong costs the editor.
+
+Nothing is remembered across editor sessions. A version of this kept "the stamp my
+last save produced", keyed by uri, and preferred it over `detail` — which read as
+prudent and was a trap: nothing cleared it, so after an agent wrote the file and
+the pane re-read it, editing the text on screen still sent the stamp from this
+pane's own older write. Every save 409'd, "Open theirs, keep mine" led straight
+back to the same 409, and the only exit was to overwrite the text the guard existed
+to protect. There is no window to cover: both pages null `detail` and show
+"Loading…" while they re-read, so there is no Edit button to press until the fresh
+version arrives.
+
+Three honest limits. The stat and the write are not one operation, so a write
+landing between them still wins silently — and the same gap sits after the write,
+where the stamp read a moment later can describe somebody else's version, which
+would let this editor's next save pass the guard and replace them. Closing either
+needs a conditional write OpenViking does not offer. And `modTime` is
+second-resolution —
+measured on the lab cluster, `2026-09-14T06:19:55Z` — so a change inside the same
+second is invisible to it; the size is compared as well precisely for that, which
+leaves only a same-second write that happens to leave the file exactly as long.
+What it reliably catches is the case that actually happens: something wrote the
+file minutes ago.
+
+That the timestamp moves at all was measured rather than assumed, against the lab
+cluster on 14 Sep 2026: a write took one file from `06:19:55Z`/12 bytes to
+`06:19:59Z`/35 bytes. A guard resting on an unverified assumption about someone
+else's server is decoration.
 
 ### Dragging a row moves it; there is nothing to reorder
 
@@ -406,13 +582,34 @@ The server refuses a name the destination already holds. OpenViking's own
 `mkdir` runs with `exist_ok=False` and would refuse too, but with a message
 about a path on disk — the check here is for the sentence somebody reads.
 
-### Search is the vector face alone
+### Saying why a file is worth keeping
 
-`search/find`, the same search `ov search` runs. The page used to offer grep
-and a hybrid of the two, which put a mode decision in front of every query and
-charged twenty seconds for choosing wrong — `search/grep` takes about that per
-term, against under a second for everything else. The server still exposes all
-three modes; nothing in the UI asks for the other two.
+The Add page has a box for it, and it is not a label filed beside the bytes.
+OpenViking takes the resource's `reason` as the parsing instruction when nothing
+else gives one — `effective_instruction = instruction or reason` in
+`utils/resource_processor.py` — so what you type there steers the abstract and
+overview the model writes, and therefore what the file is found by later. "The
+pricing numbers for the Q3 argument" is the difference between a file described
+as what it is and one described as what it is for.
+
+Which is also why it is capped, at 1000 characters: this is a prompt. A page
+pasted in here becomes the instruction that decides how the resource is read. It
+applies to every file in one batch, the same as the destination above it.
+
+### Search waits to be asked
+
+`search/find`, the same search `ov search` runs, and it runs when you press
+**Search** or Enter. It used to fire 300ms after the last keystroke, which meant
+a query was sent on the way to being finished — "kube" searched before
+"kubernetes" was typed — and each one is a real round trip to the vector face,
+about two seconds against the lab cluster. So a half-typed question cost a call
+and put results on screen for something nobody had asked.
+
+The page used to offer grep and a hybrid of the two as well, which put a mode
+decision in front of every query and charged twenty seconds for choosing wrong —
+`search/grep` takes about that per term, against under a second for everything
+else. The server still exposes all three modes; nothing in the UI asks for the
+other two.
 
 An earlier design queried Postgres directly for a keyword half, which would
 have put a tenant filter in hand-written SQL — one mistake away from showing one
@@ -604,6 +801,35 @@ Biome is scoped to TypeScript; Svelte components are type-checked by
 `svelte-check`, since Biome 1.x only half-parses `.svelte` and wants to reformat
 every script block.
 
+### Most tests run in node; a few mount a component
+
+`npm test` is one suite with two kinds of test in it. Most run under `node` and
+drive the Hono app or a plain module directly. A handful mount a Svelte component
+under jsdom, and those ask for it in their own docblock
+(`@vitest-environment jsdom`) rather than switching the whole suite — a DOM the
+other three hundred tests do not need costs them startup, and having it would let
+one come to depend on `window` by accident.
+
+The component tests exist because of what the node ones could not see. `DraftBook`
+was correct in isolation every time it was reviewed; three defects in a row lived
+in how the reading pane *called* it — a book held per component instance, so every
+route change threw the drafts away; a save that dropped the draft for whatever was
+open rather than for the file it saved; and a "changed" flag measured against text
+the person had never seen. All three passed the whole node suite. The wiring
+between a module and a component is where those invariants actually break, so that
+is what `tests/reader-editing.test.ts` covers, and nothing about typography.
+
+Two things about the setup are load-bearing rather than housekeeping, both
+measured. `resolve.conditions: ["browser"]` in `vitest.config.ts` is what loads
+Svelte's client build: Vitest runs in node, node resolution picks the SSR entry,
+and without it all twelve component tests fail with no `mount` and nothing for a
+click to do. And vitest is held at 3.x, because 2.x bundles its own Vite 5 while
+this package builds on Vite 6 — so `vitest/config` typed the plugin list against a
+different copy of Vite than the svelte plugin, and `tsc` rejected it.
+
+Search's button is still unobserved by any test, and worth knowing before you
+touch it: re-adding the debounce passes everything.
+
 ## What scopes a read
 
 Nothing in this dashboard. `viking://` URIs are checked for their scheme and
@@ -652,6 +878,16 @@ alone; the timeout stays at 60s because the server still offers grep.
 an array answers correctly at `limit <= 10` and returns zero above it, while
 either scope alone is fine at any limit. So `find` runs once per scope and the
 results are merged here — see the comment on `OvClient.find`.
+
+**An explicit `to` changes nothing about how an image is read.** Measured on
+13 Sep 2026 by importing one 4600px PNG twice — once with the `to` this dashboard
+derives, once with no target at all, the way `ov add` does. Both took the
+large-image path, both produced a preview, a grid overlay and three tiles, and
+both got the same thorough per-entry description. The only difference is where the
+folder lands and what it is called: `to` puts it exactly there, and with no target
+OpenViking files it under `viking://resources/images/<date>/<stem>_png`. So the
+reason a portal-uploaded image looked undescribed was the reading side, not the
+upload — see "A folder shows its overview" above.
 
 ## The redirect sign-in, measured
 

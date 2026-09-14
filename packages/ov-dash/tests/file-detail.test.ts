@@ -101,6 +101,14 @@ function stubOv(entries: Entry[], overview = OVERVIEW) {
           ...(entry?.size === undefined ? {} : { size: entry.size }),
           modTime: "2026-09-09T10:00:00Z",
         };
+      } else if (path === "/api/v1/fs/ls") {
+        result = entries.map((entry) => ({
+          name: entry.name,
+          uri: `${uri.replace(/\/+$/, "")}/${entry.name}`,
+          isDir: false,
+          size: entry.size ?? 0,
+          modTime: "2026-09-09T10:00:00Z",
+        }));
       } else if (path === "/api/v1/content/read") {
         result = `the text of ${uri.split("/").pop()}`;
       } else if (path === "/api/v1/content/abstract") {
@@ -251,5 +259,130 @@ describe("showing an image in the reading pane", () => {
       bytes: 40 * 1024 * 1024,
     });
     expect(response.status).toBe(413);
+  });
+});
+
+/**
+ * What the reading pane is told about a folder.
+ *
+ * It used to be the abstract and nothing else — one sentence — while the
+ * overview was fetched only to mine one file's section out of and then thrown
+ * away. That is where OpenViking writes a line about every entry inside, so a
+ * folder page was showing the least of what had been written about it.
+ *
+ * It shows worst on an image. Measured against the lab cluster: a PNG over
+ * 4096px is stored as a preview, a grid and a set of tiles, the original is not
+ * kept at all, and the thorough description of what the model saw goes into the
+ * folder's overview. So somebody who uploaded a screenshot opened its folder,
+ * read one vague sentence, and concluded OpenViking had not looked at it.
+ */
+describe("what the pane is told about a folder", () => {
+  const IMAGE_FOLDER_OVERVIEW = `# notes
+
+This folder holds the design notes.
+
+## Detailed Description
+
+### [shot_grid.jpg](${FOLDER}/shot_grid.jpg)
+
+Three geometric shapes on a striped background, in a three-panel grid.
+`;
+
+  /**
+   * Read the folder through one of the two routes that answer for one.
+   *
+   * @param route - `folder` for the tree's own call, `open` for a followed link.
+   * @param overview - What OpenViking has written about it, if anything.
+   */
+  async function folderDetail(
+    route: "folder" | "open" = "folder",
+    overview = IMAGE_FOLDER_OVERVIEW,
+  ) {
+    stubOv([{ name: "shot_grid.jpg" }, { name: "shot_preview.jpg" }], overview);
+    const response = await appFor().request(
+      `/api/${route}?uri=${encodeURIComponent(FOLDER)}`,
+    );
+    expect(response.status).toBe(200);
+    return (await response.json()) as {
+      summary?: string;
+      overview?: string;
+      folder?: { summary: string; overview: string };
+    };
+  }
+
+  it("carries the overview, which is where the real description lives", async () => {
+    const folder = await folderDetail();
+    expect(folder.overview).toContain("Three geometric shapes");
+    // And the abstract still comes, for a folder with no overview yet.
+    expect(folder.summary).toBe(FOLDER_ABSTRACT);
+  });
+
+  it("drops the title, so the pane does not print the name twice", async () => {
+    const folder = await folderDetail();
+    expect(folder.overview?.startsWith("#")).toBe(false);
+  });
+
+  it("carries it through /api/open too, so a link shows what the tree shows", async () => {
+    // The overview landed on /api/folder first, and a folder reached by
+    // following a `viking://` link came back without it — the same folder,
+    // showing less, depending on how you got there.
+    const opened = await folderDetail("open");
+    expect(opened.folder?.overview).toContain("Three geometric shapes");
+  });
+
+  it("is empty for a folder OpenViking has not summarised", async () => {
+    const folder = await folderDetail("folder", "");
+    expect(folder.overview).toBe("");
+  });
+});
+
+/**
+ * A folder listing has to say when it is incomplete.
+ *
+ * Both routes that read a folder used to hardcode `truncated: false` while asking
+ * OpenViking with a node limit, so a folder at the limit came back claiming to be
+ * the whole folder — the one claim a listing must not make falsely. `/api/tree`
+ * has always derived it; a folder read now does too.
+ */
+describe("a folder listing that hit OpenViking's limit", () => {
+  /** Answer `ls` with `count` entries, whatever was asked for. */
+  function crowded(count: number) {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL) => {
+        const url = new URL(typeof input === "string" ? input : input.toString());
+        const uri = url.searchParams.get("uri") ?? "";
+        let result: unknown = "";
+        if (url.pathname === "/api/v1/fs/ls") {
+          result = Array.from({ length: count }, (_unused, index) => ({
+            name: `f${index}.md`,
+            uri: `${uri}/f${index}.md`,
+            isDir: false,
+            size: 1,
+            modTime: "2026-09-09T10:00:00Z",
+          }));
+        }
+        return new Response(JSON.stringify({ status: "ok", result, time: 0.01 }), {
+          headers: { "content-type": "application/json" },
+        });
+      }),
+    );
+  }
+
+  async function truncatedFor(count: number): Promise<boolean> {
+    crowded(count);
+    const response = await appFor().request(
+      `/api/folder?uri=${encodeURIComponent(FOLDER)}`,
+    );
+    expect(response.status).toBe(200);
+    return ((await response.json()) as { truncated: boolean }).truncated;
+  }
+
+  it("says so when the listing came back full", async () => {
+    expect(await truncatedFor(2000)).toBe(true);
+  });
+
+  it("says nothing of the sort for an ordinary folder", async () => {
+    expect(await truncatedFor(3)).toBe(false);
   });
 });
