@@ -19,6 +19,7 @@ it. Credentials come from the usual places — the ``ov`` CLI config, or
 
 from __future__ import annotations
 
+import hashlib
 import os
 import uuid
 from collections.abc import Iterator
@@ -29,7 +30,9 @@ from helpers import write
 
 from ov_sync.client import OvClient
 from ov_sync.config import SyncConfig, load_credentials
-from ov_sync.engine import sync, target_uri
+from ov_sync.engine import plan_sync, sync, target_uri
+from ov_sync.reconcile import reconcile
+from ov_sync.scanner import file_digest
 from ov_sync.state import SyncState
 
 pytestmark = pytest.mark.integration
@@ -171,3 +174,86 @@ def test_binary_content_survives_the_round_trip(
     stored = live_client.stat(target_uri(live_root, "blob.bin"))
     assert stored is not None
     assert stored.size == len(payload)
+
+
+def test_the_tree_listing_carries_paths_relative_to_the_root(
+    folder: Path, live_client: OvClient, live_root: str
+) -> None:
+    """``/fs/tree`` is what reconcile matches local files against.
+
+    The keys have to be paths below the queried root, and the walk has to reach
+    past the three levels ``/fs/ls`` stops at. If either is wrong, every file
+    reads as absent and the whole point of reconciling is lost — silently, with
+    a count that looks like a real answer.
+    """
+    write(folder / "top.md", "top")
+    write(folder / "a" / "b" / "c" / "d" / "deep.md", "deep")
+    config = SyncConfig(root_uri=live_root)
+
+    with SyncState(folder / config.state_file) as state:
+        result = sync(folder, live_root, live_client, config, state)
+    assert result.created == 2, result.errors
+
+    stored = {entry.rel_path: entry for entry in live_client.tree(live_root)}
+
+    assert "top.md" in stored
+    assert "a/b/c/d/deep.md" in stored, sorted(stored)
+    assert stored["top.md"].size == 3
+    assert stored["a/b/c/d/deep.md"].is_dir is False
+
+
+def test_downloaded_bytes_hash_the_same_as_the_file_that_was_sent(
+    folder: Path, live_client: OvClient, live_root: str
+) -> None:
+    """Adoption rests on this: the stored copy must come back verbatim.
+
+    Both kinds, because they take different paths through batch-write — text
+    goes as text, anything that is not valid UTF-8 goes base64-encoded. If
+    either round trip altered a byte, reconcile would adopt nothing and say the
+    server held different content.
+    """
+    text = write(folder / "notes.md", "# heading\n\nbody with ümlauts\n")
+    binary = write(folder / "blob.bin", bytes(range(256)) * 4)
+    config = SyncConfig(root_uri=live_root, include_extensions=[".md", ".bin"])
+
+    with SyncState(folder / config.state_file) as state:
+        result = sync(folder, live_root, live_client, config, state)
+    assert result.created == 2, result.errors
+
+    for path, relative in ((text, "notes.md"), (binary, "blob.bin")):
+        stored = live_client.download(target_uri(live_root, relative))
+        assert stored is not None, relative
+        assert hashlib.sha256(stored).hexdigest() == file_digest(path), relative
+
+
+def test_reconcile_adopts_a_tree_that_is_already_there(
+    folder: Path, live_client: OvClient, live_root: str
+) -> None:
+    """The whole feature, end to end against a real server.
+
+    Sync a folder, throw the state away as a failed run effectively does, and
+    check the next pass adopts every file instead of uploading it again.
+    """
+    write(folder / "one.md", "hello")
+    write(folder / "deep" / "two.md", "nested")
+    config = SyncConfig(root_uri=live_root)
+
+    with SyncState(folder / config.state_file) as state:
+        first = sync(folder, live_root, live_client, config, state)
+    assert first.created == 2, first.errors
+
+    # What a run whose every batch timed out leaves behind: files on the
+    # server, and a state that knows nothing about them.
+    (folder / config.state_file).unlink()
+
+    with SyncState(folder / config.state_file) as state:
+        _, detail = plan_sync(folder, config, state)
+        assert len(detail.to_write) == 2
+        adopted = reconcile(
+            folder, live_root, live_client, config, state, detail.to_write
+        )
+        assert adopted.adopted == 2, adopted.errors
+        assert adopted.still_to_send == 0
+        plan, _ = plan_sync(folder, config, state)
+
+    assert plan.write == []

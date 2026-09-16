@@ -114,14 +114,60 @@ Three filters, cheapest first:
    round-trip, or an editor rewriting a file byte-for-byte costs nothing. This
    matters more here than it would elsewhere: every write makes the server
    re-embed the file.
-3. **Batching.** What is left goes through `content/batch-write`, up to 256
-   files per request, and the server reindexes **once per batch** rather than
+3. **Batching.** What is left goes through `content/batch-write`, 32 files per
+   request by default, and the server reindexes **once per batch** rather than
    once per file. Batches are filled by the bytes actually read, not by the
    sizes the scan recorded, so a file that grows mid-run cannot take the rest
    of its batch down with it.
 
 The state lives in `.ov-sync.db` in the folder root. Delete it and the next run
 re-sends everything, which is harmless.
+
+## When a run times out
+
+With `wait_for_indexing` set, the server embeds the whole batch before it
+answers. If that takes longer than `request_timeout_seconds`, the client gives
+up — but the server does not: it finishes the batch and keeps the files.
+
+`ovsync` cannot know that. A batch-write that fails reports nothing about which
+of its files landed, so the whole batch is left out of the state and stays on
+the list to send. That is the right call once. It is the wrong loop to be stuck
+in: on a server slow enough that batches keep timing out, nothing is ever
+recorded and every run re-uploads the same thousands of files.
+
+`ovsync reconcile` is the way out. It reads back what the server holds and
+compares the bytes:
+
+```console
+$ ovsync reconcile ~/notes
+Checked: 3765
+Adopted: 3043 already in OpenViking, byte for byte
+Different content: 12
+Not in OpenViking: 710
+Still to send: 722
+```
+
+The files that already match are written into the state as sent, because they
+were. The next `ovsync run` has only the real remainder to send.
+
+A file is adopted on a SHA-256 match and nothing weaker. A size or a timestamp
+would be cheaper to check and wrong in the one direction that costs data: a
+state row says "these exact bytes are at this URI", and a row seeded on a guess
+is a file the sync skips from then on. Anything that cannot be checked — a
+failed download, an unreadable file — is left on the list, so a bad check costs
+an upload, never a skip.
+
+Two things follow from the same reasoning:
+
+- **A timed-out batch is not retried.** A refusal (429, 502, 503) means the
+  server never took the batch, so it is sent again. A timeout means it may be
+  part-way through it, and repeating that re-uploads every file and asks for
+  the batch to be indexed a second time — more of the load that ran the clock
+  out. Four attempts turn one slow batch into four and record none of them.
+- **`max_operations_per_batch` defaults to 32, not the server's 256 ceiling.**
+  The ceiling is a limit, not a target. Indexing runs inside the request, so at
+  a few seconds per file a full 256-file batch takes half an hour — past any
+  sane timeout. Measure your server before raising it.
 
 ## Deletes
 
@@ -153,6 +199,7 @@ snapshots are unavailable on your server.
 | `ovsync init <folder>` | Write a starter `ov-sync.toml`. |
 | `ovsync status <folder>` | Show what the next run would do. Touches only the local state, never the server. |
 | `ovsync run <folder>` | Send what changed. `--dry-run`, `--full`, `--delete`, `--no-snapshot`, `--create-root`. |
+| `ovsync reconcile <folder>` | Record files OpenViking already holds, so they are not sent again. `--dry-run`. |
 | `ovsync watch <folder>` | Keep syncing as the folder changes. |
 
 `watch` does not trust events on their own. It syncs the whole folder when it
@@ -173,8 +220,9 @@ variable: `OV_SYNC_` plus the path, with `__` between levels
 [sync]
 root_uri = "viking://resources/notes"
 include_extensions = [".md", ".txt", ".csv", ".json", ".yaml", ".yml", ".toml", ".html", ".pdf"]
-max_operations_per_batch = 256
+max_operations_per_batch = 32     # the server caps it at 256; that is a limit, not a target
 wait_for_indexing = true
+request_timeout_seconds = 600
 
 [sync.exclude]
 base = [".git", ".obsidian", ".trash", ".venv", "__pycache__", "node_modules"]

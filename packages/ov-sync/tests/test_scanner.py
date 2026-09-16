@@ -10,10 +10,13 @@ from helpers import write
 
 from ov_sync.config import ExcludeConfig, SyncConfig
 from ov_sync.scanner import (
+    FileChangedWhileRead,
+    LocalFile,
     file_digest,
     is_excluded,
     is_syncable,
     parse_frontmatter,
+    read_stable,
     scan,
 )
 
@@ -249,3 +252,40 @@ def test_is_syncable_matches_what_the_scan_keeps(
     assert is_syncable(sync_config.state_file, sync_config) is False
     assert is_syncable(f"{sync_config.state_file}-journal", sync_config) is False
     assert is_syncable("photo.heic", sync_config) is False
+
+
+def test_read_stable_describes_the_file_it_actually_read(tmp_path: Path) -> None:
+    """The returned size and mtime belong to the bytes, not to an older stat.
+
+    The state stores a digest next to a size and an mtime and reads the three
+    as one fact. If the mtime is the scan's while the digest is the read's, a
+    file restored to its old bytes *and* its old mtime — what `tar -x` and
+    `cp -p` do — matches on neither and is never sent again.
+    """
+    path = write(tmp_path / "a.md", "hello")
+    stale = LocalFile(path=path, relative_path="a.md", mtime=1.0, size=1)
+
+    data, read = read_stable(stale)
+
+    assert data == b"hello"
+    assert read.size == 5
+    assert read.mtime == path.stat().st_mtime
+    assert read.relative_path == "a.md"
+
+
+def test_read_stable_refuses_a_file_that_moved_under_it(tmp_path: Path) -> None:
+    """Bytes read across an edit are a mix of two versions, and hash as neither."""
+    path = write(tmp_path / "a.md", "hello")
+    entry = LocalFile(path=path, relative_path="a.md", mtime=path.stat().st_mtime, size=5)
+    original = Path.read_bytes
+
+    def rewrite_midway(self: Path) -> bytes:
+        """Return the old bytes, having replaced the file on disk first."""
+        data = original(self)
+        self.write_bytes(b"much longer contents")
+        return data
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(Path, "read_bytes", rewrite_midway)
+        with pytest.raises(FileChangedWhileRead):
+            read_stable(entry)

@@ -26,11 +26,14 @@ from .client import OvClient, OvError
 from .config import (
     CONFIG_FILENAME,
     DEFAULT_CONFIG_TOML,
+    DEFAULT_OPERATIONS_PER_BATCH,
     OvSyncConfig,
+    SyncConfig,
     load_config,
     load_credentials,
 )
 from .engine import (
+    ProgressCallback,
     RenamedFile,
     SkippedFile,
     SyncResult,
@@ -38,6 +41,7 @@ from .engine import (
     plan_sync,
     sync,
 )
+from .reconcile import ReconcileResult, reconcile
 from .state import RootUriMismatch, SyncState
 
 console = Console()
@@ -46,6 +50,11 @@ errors = Console(stderr=True)
 # How many paths a listing prints before it summarizes the rest. Long enough to
 # be useful on a first sync, short enough not to scroll the counts off screen.
 _LIST_LIMIT = 20
+
+# Above this, a batch with indexing inside the request is worth a word. Twice
+# the default: enough headroom that a considered choice passes quietly, low
+# enough to catch the 256 an older config file still carries.
+BATCH_SIZE_WARN_ABOVE = 64
 
 # Rich reads square brackets as style tags, so a file called
 # `[#TDAI-709] plan.pdf` prints as ` plan.pdf` -- the name loses the part that
@@ -167,6 +176,75 @@ def _progress() -> Progress:
         # on every frame.
         TextColumn("{task.fields[detail]}", markup=False),
         console=console,
+    )
+
+
+_PHASE_LABELS = {
+    "scanning": "Scanning",
+    "hashing": "Hashing",
+    "listing": "Listing server",
+    "checking": "Comparing",
+    "writing": "Sending",
+    "deleting": "Deleting",
+    "done": "Done",
+}
+
+
+def _phase_reporter(progress: Progress) -> ProgressCallback:
+    """Return a callback that mirrors a run's phases into ``progress``.
+
+    Parameters
+    ----------
+    progress :
+        The display to drive. Each phase becomes its own row, added the first
+        time that phase reports.
+
+    Returns
+    -------
+    ProgressCallback
+        A callable matching the engine's progress signature.
+    """
+    task_ids: dict[str, TaskID] = {}
+
+    def on_progress(phase: str, done: int, total: int, detail: str) -> None:
+        """Add or update the row for one phase."""
+        if phase not in task_ids:
+            task_ids[phase] = progress.add_task(
+                _PHASE_LABELS.get(phase, phase), total=total or None, detail=detail
+            )
+        progress.update(
+            task_ids[phase], completed=done, total=total or None, detail=detail
+        )
+
+    return on_progress
+
+
+def _warn_about_batch_size(sync_config: SyncConfig) -> None:
+    """Warn when a batch is large enough that indexing will outrun the timeout.
+
+    An ``ov-sync.toml`` written before the default came down still says 256,
+    and an explicit value beats a default. On a server that indexes inside the
+    request, that batch cannot finish in time, every one of them fails, and
+    nothing is ever recorded — so the run repeats itself forever with no hint
+    as to why. The file is the operator's to change, so this says so and
+    carries on.
+
+    Parameters
+    ----------
+    sync_config :
+        The loaded sync settings.
+    """
+    if not sync_config.wait_for_indexing:
+        return
+    if sync_config.max_operations_per_batch <= BATCH_SIZE_WARN_ABOVE:
+        return
+    console.print(
+        f"[yellow]Warning:[/yellow] max_operations_per_batch is "
+        f"{sync_config.max_operations_per_batch} with wait_for_indexing on. The "
+        f"server indexes the whole batch before it answers, so a batch this size "
+        f"can outrun request_timeout_seconds "
+        f"({sync_config.request_timeout_seconds:g}s) and fail every time. "
+        f"{DEFAULT_OPERATIONS_PER_BATCH} is the default for that reason."
     )
 
 
@@ -364,31 +442,16 @@ def run(
     """Send everything that changed since the last run."""
     resolved = _resolve_folder(folder)
     settings = _load(resolved, config)
+    if not dry_run:
+        _warn_about_batch_size(settings.sync)
 
     with SyncState(resolved / settings.sync.state_file) as state, _connect() as client:
         target = _resolve_root_uri(root_uri, settings, state)
         # A dry run reports; it does not make the directory it reports about.
         _check_root(client, target, create=create_root and not dry_run)
 
-        task_ids: dict[str, TaskID] = {}
         progress = _progress()
-
-        def on_progress(phase: str, done: int, total: int, detail: str) -> None:
-            """Mirror the engine's phases into the progress display."""
-            if phase not in task_ids:
-                labels = {
-                    "scanning": "Scanning",
-                    "hashing": "Hashing",
-                    "writing": "Sending",
-                    "deleting": "Deleting",
-                    "done": "Done",
-                }
-                task_ids[phase] = progress.add_task(
-                    labels.get(phase, phase), total=total or None, detail=detail
-                )
-            progress.update(
-                task_ids[phase], completed=done, total=total or None, detail=detail
-            )
+        on_progress = _phase_reporter(progress)
 
         try:
             with progress:
@@ -417,6 +480,84 @@ def run(
         return
 
     _report(result)
+    if result.errors:
+        raise typer.Exit(1)
+
+
+def _report_reconcile(result: ReconcileResult) -> None:
+    """Print what a reconcile pass found."""
+    verb = "Would adopt" if result.dry_run else "Adopted"
+    console.print(f"[bold]Checked:[/bold] {result.checked}")
+    console.print(
+        f"[green]{verb}:[/green] {result.adopted} already in OpenViking, byte for byte"
+    )
+    if result.differs:
+        console.print(f"[yellow]Different content:[/yellow] {result.differs}")
+    if result.absent:
+        console.print(f"[yellow]Not in OpenViking:[/yellow] {result.absent}")
+    console.print(f"[bold]Still to send:[/bold] {result.still_to_send}")
+    for error in result.errors:
+        console.print(f"[red]{escape(error)}[/red]")
+    if result.dry_run:
+        console.print("[dim]Nothing was written. Re-run without --dry-run.[/dim]")
+
+
+@app.command("reconcile")
+def reconcile_state(
+    folder: Path = FolderArgument,
+    config: Path | None = ConfigOption,
+    root_uri: str | None = RootUriOption,
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report what would be adopted, and write nothing."
+    ),
+) -> None:
+    """Record files OpenViking already holds, so they are not sent again.
+
+    Use this after a run whose batches timed out. A batch-write that does not
+    answer may still have been carried through, and the state file cannot know
+    either way, so the files stay on the list to send and the next run uploads
+    them all over again. This reads the stored copy of each one and compares the
+    bytes; where they match, the file is written into the state as sent.
+    """
+    resolved = _resolve_folder(folder)
+    settings = _load(resolved, config)
+
+    with SyncState(resolved / settings.sync.state_file) as state, _connect() as client:
+        target = _resolve_root_uri(root_uri, settings, state)
+        _check_root(client, target)
+
+        progress = _progress()
+        on_progress = _phase_reporter(progress)
+        try:
+            # Before the scan, not inside reconcile: a mismatched root is a
+            # one-line check, and finding out after several thousand files have
+            # been hashed wastes the whole pass to say so.
+            state.check_root(target)
+            with progress:
+                _, detail = plan_sync(
+                    resolved, settings.sync, state, on_progress=on_progress
+                )
+                # A file whose mtime moved but whose bytes did not is worth
+                # recording either way. The plan already paid to find that out,
+                # and dropping it makes the next run hash it all over again.
+                if not dry_run:
+                    state.touch(detail.touched)
+                result = reconcile(
+                    resolved,
+                    target,
+                    client,
+                    settings.sync,
+                    state,
+                    detail.to_write,
+                    dry_run=dry_run,
+                    on_progress=on_progress,
+                )
+        except RootUriMismatch as exc:
+            _fail(str(exc))
+        except OvError as exc:
+            _fail(f"Cannot read what OpenViking holds: {exc}")
+
+    _report_reconcile(result)
     if result.errors:
         raise typer.Exit(1)
 

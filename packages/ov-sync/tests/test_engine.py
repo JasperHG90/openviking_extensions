@@ -971,7 +971,6 @@ def test_batches_are_filled_by_the_bytes_actually_read(
     client: OvClient,
     state: SyncState,
     routes: respx.MockRouter,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Sizing a batch on the scan's numbers packs a request the server refuses.
 
@@ -980,15 +979,29 @@ def test_batches_are_filled_by_the_bytes_actually_read(
     16 MB the server takes. It refuses the whole batch, and since that refusal
     is deterministic it is not retried, so all three files fail because the
     accounting used a stale number.
+
+    The files are grown on disk, between the plan and the first write, rather
+    than by faking ``read_bytes``. A fake that leaves ``stat`` reporting the old
+    size is not the situation being tested: a file that really grew reports the
+    new size both ways, and the read now cross-checks the two.
     """
     config = SyncConfig(root_uri=ROOT, include_extensions=[".bin"])
     for index in range(3):
         write(folder / f"grew{index}.bin", b"small")
 
     grown = b"\x00" * (6 * 1024 * 1024)
-    monkeypatch.setattr(Path, "read_bytes", lambda self: grown)
 
-    result = sync(folder, ROOT, client, config, state)
+    def grow_before_the_first_write(
+        phase: str, done: int, total: int, detail: str
+    ) -> None:
+        """Rewrite every file the moment the sync starts sending."""
+        if phase == "writing" and done == 0:
+            for index in range(3):
+                (folder / f"grew{index}.bin").write_bytes(grown)
+
+    result = sync(
+        folder, ROOT, client, config, state, on_progress=grow_before_the_first_write
+    )
 
     assert [len(body["operations"]) for body in batches(routes)] == [2, 1]
     assert result.created == 3

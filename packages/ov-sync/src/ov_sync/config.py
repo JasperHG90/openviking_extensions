@@ -31,6 +31,17 @@ SERVER_MAX_OPERATIONS = 256
 SERVER_MAX_FILE_BYTES = 8 * 1024 * 1024
 SERVER_MAX_TOTAL_BYTES = 16 * 1024 * 1024
 
+# Files per request, and how long to wait for one. Deliberately well under the
+# server's 256 ceiling: with wait_for_indexing set, the server embeds the whole
+# batch before it answers, and a measured 3 to 7 seconds per file puts a full
+# 256-file batch over half an hour -- far past any sane read timeout. Every
+# batch then fails, and because a failed batch is recorded as nothing, the run
+# re-sends the same files next time and never converges. 32 files fits the
+# timeout with room to spare, and commits progress to the state eight times as
+# often, so an interrupted run keeps most of its work.
+DEFAULT_OPERATIONS_PER_BATCH = 32
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 600.0
+
 DEFAULT_BASE_EXCLUDES = [
     ".git",
     ".obsidian",
@@ -112,11 +123,13 @@ class SyncConfig(BaseModel):
         description="Rules for leaving files out.",
     )
     max_operations_per_batch: int = Field(
-        default=SERVER_MAX_OPERATIONS,
+        default=DEFAULT_OPERATIONS_PER_BATCH,
         ge=1,
         le=SERVER_MAX_OPERATIONS,
-        description="Files per batch-write request. Lower it to see progress "
-        "sooner or to keep each server-side reindex smaller.",
+        description="Files per batch-write request. The server caps it at 256, "
+        "but the cap is a limit, not a target: indexing runs inside the request, "
+        "so the batch has to be one the server can finish before the timeout. "
+        "Raise it only for a server you have measured.",
     )
     wait_for_indexing: bool = Field(
         default=True,
@@ -125,10 +138,12 @@ class SyncConfig(BaseModel):
         "until the server catches up.",
     )
     request_timeout_seconds: float = Field(
-        default=300.0,
+        default=DEFAULT_REQUEST_TIMEOUT_SECONDS,
         gt=0,
         description="Read timeout for a batch-write. Indexing happens inside "
-        "the request when wait_for_indexing is set, so this is not a fast call.",
+        "the request when wait_for_indexing is set, so this is not a fast call. "
+        "A batch that times out is not retried: the server may be part-way "
+        "through it, and `ovsync reconcile` settles what landed.",
     )
 
     @field_validator("include_extensions")
@@ -424,8 +439,15 @@ include_extensions = [
     ".md", ".txt", ".csv", ".json", ".yaml", ".yml", ".toml", ".html", ".pdf",
 ]
 
-# Files per batch-write request. The server caps this at 256.
-max_operations_per_batch = 256
+# Files per batch-write request. The server caps this at 256, but indexing runs
+# inside the request, so the batch must be one the server finishes before
+# request_timeout_seconds. Raise it only for a server you have measured.
+max_operations_per_batch = 32
+
+# How long to wait for one batch-write. A batch that times out is not retried:
+# the server may be part-way through it, and `ovsync reconcile` works out what
+# landed by comparing hashes.
+request_timeout_seconds = 600
 
 # Wait for the server to index each batch before moving on. Turn it off for a
 # faster run that leaves new content unsearchable for a while.

@@ -95,6 +95,62 @@ def file_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
+class FileChangedWhileRead(OSError):
+    """A file was modified while it was being read, so the bytes are a mix."""
+
+
+def read_stable(entry: LocalFile) -> tuple[bytes, LocalFile]:
+    """Read a file's bytes, and describe it by a stat taken after the read.
+
+    The scan's size and mtime are already old by the time a file is sent: a
+    scan of several thousand files, then a queue of batches, can put hours
+    between the two. Recording those alongside a digest of the bytes just read
+    stores a triple that was never true at once, and the next run reads it as
+    gospel — so a file restored to its old contents *and* its old mtime, which
+    is what ``tar -x``, ``rsync -t`` and ``cp -p`` all do, comes back looking
+    unchanged against a digest of something else.
+
+    Stat, read, stat again. Matching stats mean nothing moved underneath the
+    read, and the values that go in the state describe the bytes that went to
+    the server.
+
+    Parameters
+    ----------
+    entry :
+        The file to read, as the scan found it.
+
+    Returns
+    -------
+    tuple[bytes, LocalFile]
+        The contents, and the same file re-described from after the read.
+
+    Raises
+    ------
+    FileChangedWhileRead
+        If the file moved while it was being read. It is left for the next
+        run, which will find it settled.
+    OSError
+        If it cannot be read at all.
+    """
+    before = entry.path.stat()
+    data = entry.path.read_bytes()
+    after = entry.path.stat()
+    if (before.st_mtime, before.st_size) != (after.st_mtime, after.st_size):
+        raise FileChangedWhileRead(
+            f"{entry.relative_path} changed while it was being read"
+        )
+    if after.st_size != len(data):
+        raise FileChangedWhileRead(
+            f"{entry.relative_path} is {after.st_size} bytes but {len(data)} were read"
+        )
+    return data, LocalFile(
+        path=entry.path,
+        relative_path=entry.relative_path,
+        mtime=after.st_mtime,
+        size=after.st_size,
+    )
+
+
 def is_excluded(
     relative_path: str, exclude: ExcludeConfig, *, is_dir: bool = False
 ) -> bool:

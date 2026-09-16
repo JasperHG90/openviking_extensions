@@ -305,3 +305,109 @@ def test_a_dry_run_does_not_create_the_root(folder: Path, configured: None) -> N
 
     assert not mkdir.called
     assert outcome.exit_code == 1
+
+
+def _stat_dir() -> httpx.Response:
+    """A stat answer saying the root exists and is a directory."""
+    return ok({"name": "notes", "size": 0, "isDir": True})
+
+
+@respx.mock
+def test_reconcile_reports_what_it_adopted(folder: Path, configured: None) -> None:
+    """The happy path: a matching file is adopted and nothing is uploaded."""
+    write(folder / "a.md", "hello")
+    respx.get(f"{BASE}/fs/stat").mock(return_value=_stat_dir())
+    respx.get(f"{BASE}/fs/tree").mock(
+        return_value=ok(
+            [{"rel_path": "a.md", "size": 5, "isDir": False, "modTime": None}]
+        )
+    )
+    respx.get(f"{BASE}/content/download").mock(
+        return_value=httpx.Response(200, content=b"hello")
+    )
+    batch = respx.post(f"{BASE}/content/batch-write")
+
+    result = runner.invoke(app, ["reconcile", str(folder), "--root-uri", ROOT])
+
+    assert result.exit_code == 0, result.output
+    assert "Adopted: 1" in result.output
+    assert "Still to send: 0" in result.output
+    assert batch.call_count == 0
+
+
+@respx.mock
+def test_reconcile_dry_run_says_it_wrote_nothing(folder: Path, configured: None) -> None:
+    """It reports the match and tells the operator how to make it stick."""
+    write(folder / "a.md", "hello")
+    respx.get(f"{BASE}/fs/stat").mock(return_value=_stat_dir())
+    respx.get(f"{BASE}/fs/tree").mock(
+        return_value=ok(
+            [{"rel_path": "a.md", "size": 5, "isDir": False, "modTime": None}]
+        )
+    )
+    respx.get(f"{BASE}/content/download").mock(
+        return_value=httpx.Response(200, content=b"hello")
+    )
+
+    result = runner.invoke(
+        app, ["reconcile", str(folder), "--root-uri", ROOT, "--dry-run"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Would adopt: 1" in result.output
+    assert "Nothing was written" in result.output
+
+
+@respx.mock
+def test_reconcile_fails_loudly_when_the_listing_cannot_be_read(
+    folder: Path, configured: None
+) -> None:
+    """Treating an unreadable listing as an empty one would upload everything."""
+    write(folder / "a.md", "hello")
+    respx.get(f"{BASE}/fs/stat").mock(return_value=_stat_dir())
+    respx.get(f"{BASE}/fs/tree").mock(return_value=ok("not a list"))
+
+    result = runner.invoke(app, ["reconcile", str(folder), "--root-uri", ROOT])
+
+    assert result.exit_code == 1
+    assert "Cannot read what OpenViking holds" in result.output
+
+
+@respx.mock
+def test_run_warns_about_a_batch_the_server_cannot_finish(
+    folder: Path, configured: None
+) -> None:
+    """An ov-sync.toml written before the default came down still says 256."""
+    write(folder / "a.md", "hello")
+    (folder / CONFIG_FILENAME).write_text(
+        f'[sync]\nroot_uri = "{ROOT}"\n'
+        "max_operations_per_batch = 256\nwait_for_indexing = true\n",
+        encoding="utf-8",
+    )
+    respx.get(f"{BASE}/fs/stat").mock(return_value=_stat_dir())
+    respx.post(f"{BASE}/content/batch-write").mock(
+        return_value=ok({"root_uri": ROOT, "created": [f"{ROOT}/a.md"], "updated": []})
+    )
+
+    result = runner.invoke(app, ["run", str(folder)])
+
+    assert result.exit_code == 0, result.output
+    assert "max_operations_per_batch is 256" in result.output
+
+
+@respx.mock
+def test_run_stays_quiet_about_a_sensible_batch(folder: Path, configured: None) -> None:
+    """The warning has to be rare enough to mean something."""
+    write(folder / "a.md", "hello")
+    (folder / CONFIG_FILENAME).write_text(
+        f'[sync]\nroot_uri = "{ROOT}"\n', encoding="utf-8"
+    )
+    respx.get(f"{BASE}/fs/stat").mock(return_value=_stat_dir())
+    respx.post(f"{BASE}/content/batch-write").mock(
+        return_value=ok({"root_uri": ROOT, "created": [f"{ROOT}/a.md"], "updated": []})
+    )
+
+    result = runner.invoke(app, ["run", str(folder)])
+
+    assert result.exit_code == 0, result.output
+    assert "max_operations_per_batch" not in result.output
