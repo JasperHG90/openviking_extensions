@@ -16,9 +16,9 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from .client import BatchWriteOperation, OvClient, OvError
+from .client import BatchWriteOperation, OvClient, OvError, TimeoutOvError
 from .config import SERVER_MAX_FILE_BYTES, SERVER_MAX_TOTAL_BYTES, SyncConfig
-from .scanner import LocalFile, file_digest, scan
+from .scanner import FileChangedWhileRead, LocalFile, file_digest, read_stable, scan
 from .state import SyncedFile, SyncState, diff
 from .uri_path import UriPathMap, folder_prefixes, map_uri_paths, safe_relative_path
 
@@ -226,7 +226,9 @@ def target_uri(root_uri: str, relative_path: str) -> str:
     return f"{root_uri.rstrip('/')}/{safe_relative_path(relative_path)}"
 
 
-def build_operation(entry: LocalFile, uri: str) -> tuple[BatchWriteOperation, str, int]:
+def build_operation(
+    entry: LocalFile, uri: str
+) -> tuple[BatchWriteOperation, str, LocalFile]:
     """Read a file and wrap it as a batch-write operation.
 
     Text goes as text so the server stores it verbatim; anything that is not
@@ -235,20 +237,28 @@ def build_operation(entry: LocalFile, uri: str) -> tuple[BatchWriteOperation, st
     Parameters
     ----------
     entry :
-        The file to read.
+        The file to read, as the scan found it.
     uri :
         Where it should land.
 
     Returns
     -------
-    tuple[BatchWriteOperation, str, int]
-        An upsert for that URI, the SHA-256 of the bytes it carries, and how
-        many bytes those are. The digest comes from the bytes actually sent,
-        not from a second read, so the state can never record a hash of
-        content the server never saw; the count is what the batching measures,
-        because the size the scan recorded may already be stale.
+    tuple[BatchWriteOperation, str, LocalFile]
+        An upsert for that URI, the SHA-256 of the bytes it carries, and the
+        file re-described from after the read. All three describe one moment:
+        the digest comes from the bytes actually sent, and the size and mtime
+        beside it are the ones those bytes had, not the ones the scan recorded
+        however long ago. The state stores the three together, so it must
+        never mix a fresh hash with a stale timestamp.
+
+    Raises
+    ------
+    FileChangedWhileRead
+        If the file moved while it was being read.
+    OSError
+        If it cannot be read.
     """
-    data = entry.path.read_bytes()
+    data, read = read_stable(entry)
     digest = hashlib.sha256(data).hexdigest()
     try:
         text = data.decode("utf-8")
@@ -260,9 +270,9 @@ def build_operation(entry: LocalFile, uri: str) -> tuple[BatchWriteOperation, st
                 mode="upsert",
             ),
             digest,
-            len(data),
+            read,
         )
-    return BatchWriteOperation(uri=uri, content=text, mode="upsert"), digest, len(data)
+    return BatchWriteOperation(uri=uri, content=text, mode="upsert"), digest, read
 
 
 def plan_sync(
@@ -674,6 +684,12 @@ def _write_batches(
     may have written some of its files before it stopped: it does not report
     which. Re-sending a file that already landed costs nothing — the write is
     an upsert — so the conservative choice risks a repeat, never a loss.
+
+    A repeat is cheap once; it is not cheap every run. When a server is slow
+    enough that batches keep timing out, nothing is ever recorded and each run
+    uploads the same files again. ``ovsync reconcile`` is what breaks that: it
+    compares the stored copy's hash against the local file and records the ones
+    that already match, so the next run has only the real remainder to send.
     """
     done = 0
     operations: list[BatchWriteOperation] = []
@@ -692,6 +708,15 @@ def _write_batches(
                 wait=sync_config.wait_for_indexing,
                 timeout=sync_config.request_timeout_seconds,
             )
+        except TimeoutOvError as exc:
+            # Named here because a timeout is the one failure where the files
+            # may well be on the server already, and nothing else in the output
+            # tells the operator that re-running will just send them again.
+            result.errors.append(
+                f"batch of {len(operations)} file(s) timed out: {exc}. The server "
+                "may have written them anyway — run `ovsync reconcile` to find out "
+                "before re-running."
+            )
         except OvError as exc:
             result.errors.append(f"batch of {len(operations)} file(s) failed: {exc}")
         else:
@@ -708,7 +733,12 @@ def _write_batches(
         done += 1
         uri = target_uri(root_uri, entry.relative_path)
         try:
-            operation, digest, size = build_operation(entry, uri)
+            operation, digest, read = build_operation(entry, uri)
+        except FileChangedWhileRead as exc:
+            result.skipped.append(
+                SkippedFile(relative_path=entry.relative_path, reason=str(exc))
+            )
+            continue
         except OSError as exc:
             result.skipped.append(
                 SkippedFile(
@@ -717,24 +747,24 @@ def _write_batches(
             )
             continue
 
-        if size > SERVER_MAX_FILE_BYTES:
+        if read.size > SERVER_MAX_FILE_BYTES:
             result.skipped.append(
                 SkippedFile(
                     relative_path=entry.relative_path,
-                    reason=f"grew to {size} bytes while the sync ran, over the "
+                    reason=f"grew to {read.size} bytes while the sync ran, over the "
                     f"server's {SERVER_MAX_FILE_BYTES}-byte limit for a single file",
                 )
             )
             continue
 
         at_limit = len(operations) >= sync_config.max_operations_per_batch
-        would_overflow = batch_bytes + size > SERVER_MAX_TOTAL_BYTES
+        would_overflow = batch_bytes + read.size > SERVER_MAX_TOTAL_BYTES
         if operations and (at_limit or would_overflow):
             flush()
 
         operations.append(operation)
-        pending.append((entry, uri, digest))
-        batch_bytes += size
+        pending.append((read, uri, digest))
+        batch_bytes += read.size
 
     flush()
     if on_progress:

@@ -20,6 +20,7 @@ from ov_sync.client import (
     NotFoundError,
     OvClient,
     OvError,
+    TimeoutOvError,
 )
 from ov_sync.config import Credentials
 
@@ -125,10 +126,15 @@ def instant_retries(monkeypatch: pytest.MonkeyPatch) -> None:
 
     Tenacity captures its wait strategy when the decorator runs, so patching
     the module-level function has no effect; the Retrying object's own sleep
-    is the seam.
+    is the seam. Each decorated method carries its own, so all three are
+    patched rather than the one a test happens to reach first.
     """
-    retrying = OvClient._send_idempotent.retry  # type: ignore[attr-defined]
-    monkeypatch.setattr(retrying, "sleep", lambda _seconds: None)
+    for retrying in (
+        OvClient._send_idempotent.retry,  # type: ignore[attr-defined]
+        OvClient._send_raw_idempotent.retry,  # type: ignore[attr-defined]
+        OvClient._send_write.retry,  # type: ignore[attr-defined]
+    ):
+        monkeypatch.setattr(retrying, "sleep", lambda _seconds: None)
 
 
 @respx.mock
@@ -492,3 +498,250 @@ def test_mkdir_does_not_swallow_a_busy_lock(
 
     with pytest.raises(OvError, match="busy"):
         client.mkdir("viking://resources/notes")
+
+
+@respx.mock
+def test_a_batch_write_timeout_is_not_retried(
+    client: OvClient, instant_retries: None
+) -> None:
+    """A write that stopped answering may have landed, so it is not repeated.
+
+    Repeating it re-uploads every file and asks for the batch to be indexed
+    again, which is more of the load that ran the clock out in the first place.
+    """
+    route = respx.post(f"{BASE}/content/batch-write").mock(
+        side_effect=httpx.ReadTimeout("read timed out")
+    )
+
+    with pytest.raises(TimeoutOvError, match="timed out"):
+        client.batch_write(
+            "viking://resources/notes",
+            [BatchWriteOperation(uri="viking://resources/notes/a.md", content="a")],
+        )
+
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_a_batch_write_refusal_is_still_retried(
+    client: OvClient, instant_retries: None
+) -> None:
+    """A 503 means the server never took the batch, so sending it again is free."""
+    route = respx.post(f"{BASE}/content/batch-write").mock(
+        side_effect=[
+            error(503, "UNAVAILABLE", "overloaded"),
+            ok({"root_uri": "viking://resources/notes", "created": ["a"], "updated": []}),
+        ]
+    )
+
+    written = client.batch_write(
+        "viking://resources/notes",
+        [BatchWriteOperation(uri="viking://resources/notes/a.md", content="a")],
+    )
+
+    assert written.created == ["a"]
+    assert route.call_count == 2
+
+
+@respx.mock
+def test_a_read_timeout_is_still_retried(client: OvClient, instant_retries: None) -> None:
+    """Only writes are held back. Asking again costs the server nothing."""
+    route = respx.get(f"{BASE}/fs/stat").mock(
+        side_effect=[
+            httpx.ReadTimeout("read timed out"),
+            ok({"name": "notes", "size": 0, "isDir": True}),
+        ]
+    )
+
+    assert client.stat("viking://resources/notes") is not None
+    assert route.call_count == 2
+
+
+@respx.mock
+def test_tree_returns_the_files_under_a_root(client: OvClient) -> None:
+    """Directories are dropped; files come back with their path below the root."""
+    respx.get(f"{BASE}/fs/tree").mock(
+        return_value=ok(
+            [
+                {"rel_path": "sub", "size": 0, "isDir": True, "modTime": None},
+                {
+                    "rel_path": "sub/a.md",
+                    "size": 3,
+                    "isDir": False,
+                    "modTime": "2026-09-16T11:46:42Z",
+                },
+            ]
+        )
+    )
+
+    entries = client.tree("viking://resources/notes")
+
+    assert [entry.rel_path for entry in entries] == ["sub/a.md"]
+    assert entries[0].size == 3
+
+
+@respx.mock
+def test_tree_asks_for_hidden_entries(client: OvClient) -> None:
+    """A folder of dotfiles is still a folder of files."""
+    route = respx.get(f"{BASE}/fs/tree").mock(return_value=ok([]))
+
+    client.tree("viking://resources/notes")
+
+    assert route.calls[0].request.url.params["show_all_hidden"] == "true"
+
+
+@respx.mock
+def test_tree_refuses_a_listing_at_the_node_ceiling(client: OvClient) -> None:
+    """A truncated listing looks exactly like a small tree, so it is refused.
+
+    Taking it at face value would report every file past the cut as absent,
+    and a caller would upload the lot.
+    """
+    respx.get(f"{BASE}/fs/tree").mock(
+        return_value=ok(
+            [{"rel_path": f"{i}.md", "size": 1, "isDir": False} for i in range(4)]
+        )
+    )
+
+    with pytest.raises(OvError, match="incomplete"):
+        client.tree("viking://resources/notes", node_limit=4)
+
+
+@respx.mock
+def test_tree_refuses_a_listing_at_the_depth_ceiling(client: OvClient) -> None:
+    """Same reasoning for a walk that stopped going down."""
+    respx.get(f"{BASE}/fs/tree").mock(
+        return_value=ok([{"rel_path": "a/b/c.md", "size": 1, "isDir": False}])
+    )
+
+    with pytest.raises(OvError, match="deeper is missing"):
+        client.tree("viking://resources/notes", level_limit=3)
+
+
+@respx.mock
+def test_download_returns_the_stored_bytes(client: OvClient) -> None:
+    """The body comes back verbatim, which is what makes it worth hashing."""
+    respx.get(f"{BASE}/content/download").mock(
+        return_value=httpx.Response(200, content=b"\x89PNG\r\n\x1a\n raw")
+    )
+
+    assert client.download("viking://resources/notes/a.png") == b"\x89PNG\r\n\x1a\n raw"
+
+
+@respx.mock
+def test_download_returns_none_when_absent(client: OvClient) -> None:
+    """Nothing stored is an answer, not a failure."""
+    respx.get(f"{BASE}/content/download").mock(
+        return_value=error(404, "NOT_FOUND", "File not found")
+    )
+
+    assert client.download("viking://resources/notes/gone.md") is None
+
+
+@respx.mock
+def test_a_gateway_timeout_is_not_resent(client: OvClient, instant_retries: None) -> None:
+    """504 is a read timeout with a status code: the backend took the request.
+
+    It reaches the retry predicate as a TransientOvError like any other 5xx, so
+    without the classification the batch would be uploaded four times.
+    """
+    route = respx.post(f"{BASE}/content/batch-write").mock(
+        return_value=error(504, "TIMEOUT", "gateway timeout")
+    )
+
+    with pytest.raises(TimeoutOvError, match="gateway timeout"):
+        client.batch_write(
+            "viking://resources/notes",
+            [BatchWriteOperation(uri="viking://resources/notes/a.md", content="a")],
+        )
+
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_a_service_unavailable_is_still_resent(
+    client: OvClient, instant_retries: None
+) -> None:
+    """503 is the proxy saying it had no backend to hand the request to."""
+    route = respx.post(f"{BASE}/content/batch-write").mock(
+        side_effect=[
+            error(503, "UNAVAILABLE", "no server is available"),
+            ok({"root_uri": "viking://resources/notes", "created": ["a"], "updated": []}),
+        ]
+    )
+
+    client.batch_write(
+        "viking://resources/notes",
+        [BatchWriteOperation(uri="viking://resources/notes/a.md", content="a")],
+    )
+
+    assert route.call_count == 2
+
+
+@respx.mock
+def test_a_gateway_timeout_on_a_read_is_still_retried(
+    client: OvClient, instant_retries: None
+) -> None:
+    """Only writes are held back; asking again costs the server nothing."""
+    route = respx.get(f"{BASE}/fs/stat").mock(
+        side_effect=[
+            error(504, "TIMEOUT", "gateway timeout"),
+            ok({"name": "notes", "size": 0, "isDir": True}),
+        ]
+    )
+
+    assert client.stat("viking://resources/notes") is not None
+    assert route.call_count == 2
+
+
+@respx.mock
+def test_tree_refuses_an_entry_it_cannot_parse(client: OvClient) -> None:
+    """Dropping them would turn a changed payload into an empty listing.
+
+    An empty listing reads as "the server holds nothing", which a caller
+    answers by uploading everything while reporting a number that looks true.
+    """
+    respx.get(f"{BASE}/fs/tree").mock(return_value=ok(["a.md", "b.md"]))
+
+    with pytest.raises(OvError, match="unexpected payload"):
+        client.tree("viking://resources/notes")
+
+
+@respx.mock
+def test_download_rejects_an_error_hidden_in_a_200(client: OvClient) -> None:
+    """Handing those bytes back would pass an error message off as the file."""
+    respx.get(f"{BASE}/content/download").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "error",
+                "result": None,
+                "error": {"code": "INTERNAL", "message": "read failed", "details": None},
+            },
+        )
+    )
+
+    with pytest.raises(OvError, match="read failed"):
+        client.download("viking://resources/notes/a.md")
+
+
+@respx.mock
+def test_a_long_read_timeout_leaves_connect_short(client: OvClient) -> None:
+    """A batch-write waits ten minutes for an answer, not to reach the server.
+
+    A bare float sets every phase, so an unreachable host would hang for the
+    length of a batch-write instead of failing in seconds.
+    """
+    route = respx.post(f"{BASE}/content/batch-write").mock(
+        return_value=ok({"root_uri": "viking://resources/notes", "created": []})
+    )
+
+    client.batch_write(
+        "viking://resources/notes",
+        [BatchWriteOperation(uri="viking://resources/notes/a.md", content="a")],
+        timeout=600.0,
+    )
+
+    timeout = route.calls[0].request.extensions["timeout"]
+    assert timeout["read"] == 600.0
+    assert timeout["connect"] == 10.0

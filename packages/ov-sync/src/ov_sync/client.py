@@ -23,6 +23,7 @@ from pydantic import (
 from tenacity import (
     RetryCallState,
     retry,
+    retry_if_exception,
     retry_if_exception_type,
     stop_after_attempt,
     wait_exponential_jitter,
@@ -34,6 +35,12 @@ from .config import Credentials
 # you something true about the request, and repeating it changes nothing.
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
+# Statuses that mean the same as a read timeout: a proxy gave up waiting on a
+# backend that is still working. 504 says so outright, and 502 is what the same
+# proxy reports when it drops that connection instead. Repeating a write on
+# either one re-sends a request the server may well be part-way through.
+TIMEOUT_STATUS = frozenset({502, 504})
+
 # OpenViking answers 429 for two unrelated things: a rate limit, which passes,
 # and RESOURCE_EXHAUSTED, which is how it refuses a batch that is too large or
 # too long. The second is a fact about the request, so retrying it just uploads
@@ -41,6 +48,20 @@ RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 PERMANENT_CODES = frozenset({"RESOURCE_EXHAUSTED"})
 
 MAX_ATTEMPTS = 4
+
+# Ceilings for a whole-tree listing, set well above any real tree because
+# nothing in the response says it stopped early. A listing that comes back at
+# either ceiling is refused rather than believed.
+#
+# That catches a listing this client asked to be cut short. It cannot catch one
+# the *server* cut short below what was asked for — `/fs/ls` does exactly that,
+# capping at three levels whatever it is told, which is why this goes through
+# `/fs/tree` instead. If `/fs/tree` ever grows its own cap, the result comes
+# back under both ceilings and reads as a complete listing of a smaller tree.
+# The cost of that is an upload of files already stored, which is where the
+# sync started, so the failure is slow rather than wrong.
+TREE_LEVEL_LIMIT = 64
+TREE_NODE_LIMIT = 200_000
 
 
 def _is_retryable(response: httpx.Response) -> bool:
@@ -153,8 +174,101 @@ class TransientOvError(OvError):
         self.retry_after = retry_after
 
 
+class TimeoutOvError(TransientOvError):
+    """The server did not answer in time.
+
+    Distinct from the rest of :class:`TransientOvError` because it means
+    something different: a refusal says the request did not happen, a timeout
+    says only that the answer did not arrive. The server may well have carried
+    the write through — batch-write does, routinely, when indexing runs longer
+    than the read timeout — so this is the one transient failure a write must
+    not simply repeat.
+    """
+
+
 class NotFoundError(OvError):
     """The requested URI does not exist."""
+
+
+def _read_timeout(seconds: float) -> httpx.Timeout:
+    """Stretch the read timeout for one call, leaving the other phases alone.
+
+    A bare float sets connect, write and pool to the same number. Connect is
+    meant to be short — an unreachable server should fail in seconds, not sit
+    for the length of a batch-write — so only the phase that is actually slow
+    is moved.
+
+    Parameters
+    ----------
+    seconds :
+        How long to wait for the server to answer.
+
+    Returns
+    -------
+    httpx.Timeout
+        The per-phase timeouts for this call.
+    """
+    return httpx.Timeout(seconds, connect=10.0, write=120.0, pool=10.0)
+
+
+def _transient(response: httpx.Response, error: ApiError) -> TransientOvError:
+    """Build the right transient error for a failed response.
+
+    A 502 or 504 is a proxy reporting that it stopped waiting on a backend that
+    had already been handed the request, which is a read timeout by another
+    name. Classifying it as one keeps writes from repeating work the server may
+    still be doing.
+
+    Parameters
+    ----------
+    response :
+        The failed response.
+    error :
+        Its parsed error envelope.
+
+    Returns
+    -------
+    TransientOvError
+        A :class:`TimeoutOvError` for the gateway statuses, else a plain
+        transient error.
+    """
+    kind = TimeoutOvError if response.status_code in TIMEOUT_STATUS else TransientOvError
+    return kind(
+        error.message
+        or f"{response.request.method} {response.request.url.path} failed with "
+        f"{response.status_code}",
+        code=error.code,
+        status_code=response.status_code,
+        details=error.details,
+        retry_after=_retry_after_seconds(response),
+    )
+
+
+def _is_worth_resending(exc: BaseException) -> bool:
+    """Whether a failed write should be sent again.
+
+    A server that refuses a batch — 429, 502, 503 — has not taken it, so
+    sending it again is free of consequence and usually works. A server that
+    stops answering has taken the request and may still be working through it;
+    repeating that one re-uploads every file and asks for the whole batch to be
+    indexed a second time, which is more of exactly the load that ran the clock
+    out. Three further attempts turn one slow batch into four, and the state
+    file ends up recording none of them.
+
+    What landed is worked out afterwards by ``ovsync reconcile``, which reads
+    the server's copy instead of guessing from a request that never answered.
+
+    Parameters
+    ----------
+    exc :
+        The exception the attempt raised.
+
+    Returns
+    -------
+    bool
+        True when the write is worth another attempt.
+    """
+    return isinstance(exc, TransientOvError) and not isinstance(exc, TimeoutOvError)
 
 
 class ApiError(BaseModel):
@@ -199,6 +313,19 @@ class StatResult(BaseModel):
     is_dir: bool = Field(
         alias="isDir", description="Whether the resource is a directory."
     )
+    mod_time: str | None = Field(
+        default=None, alias="modTime", description="Last modification, ISO 8601."
+    )
+
+
+class ServerFile(BaseModel):
+    """One entry in a whole-tree listing, as returned by ``/fs/tree``."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    rel_path: str = Field(description="Path below the listed root, forward-slashed.")
+    size: int = Field(description="Size in bytes; 0 for a directory.")
+    is_dir: bool = Field(alias="isDir", description="Whether the entry is a directory.")
     mod_time: str | None = Field(
         default=None, alias="modTime", description="Last modification, ISO 8601."
     )
@@ -390,28 +517,21 @@ class OvClient:
             On any other error response, or an unreadable body.
         """
         request_timeout = (
-            httpx.USE_CLIENT_DEFAULT if timeout is None else httpx.Timeout(timeout)
+            httpx.USE_CLIENT_DEFAULT if timeout is None else _read_timeout(timeout)
         )
         try:
             response = self._client.request(
                 method, path, params=params, json=json, timeout=request_timeout
             )
         except httpx.TimeoutException as exc:
-            raise TransientOvError(f"{method} {path} timed out: {exc}") from exc
+            raise TimeoutOvError(f"{method} {path} timed out: {exc}") from exc
         except httpx.TransportError as exc:
             raise TransientOvError(
                 f"Cannot reach {self._credentials.url}: {exc}"
             ) from exc
 
         if response.status_code >= 400 and _is_retryable(response):
-            error = _parse_error(response)
-            raise TransientOvError(
-                error.message or f"{method} {path} failed with {response.status_code}",
-                code=error.code,
-                status_code=response.status_code,
-                details=error.details,
-                retry_after=_retry_after_seconds(response),
-            )
+            raise _transient(response, _parse_error(response))
         if response.status_code >= 400:
             error = _parse_error(response)
             message = (
@@ -440,6 +560,132 @@ class OvClient:
                 details=error.details,
             )
         return envelope.result
+
+    def _send_raw(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> bytes:
+        """Make one request and return the body as bytes, unwrapping no envelope.
+
+        For the endpoints that answer with the file itself rather than with
+        JSON around it. Errors still arrive as JSON, so a failure is classified
+        exactly as :meth:`_send` classifies one.
+
+        Parameters
+        ----------
+        method :
+            HTTP method.
+        path :
+            Path below ``/api/v1``.
+        params :
+            Query parameters.
+        timeout :
+            Read timeout override, in seconds, for this call alone.
+
+        Returns
+        -------
+        bytes
+            The response body, verbatim.
+
+        Raises
+        ------
+        TimeoutOvError
+            If the server did not answer in time.
+        TransientOvError
+            On a rate limit, a 5xx, or a connection failure.
+        NotFoundError
+            On a 404.
+        OvError
+            On any other error response.
+        """
+        request_timeout = (
+            httpx.USE_CLIENT_DEFAULT if timeout is None else _read_timeout(timeout)
+        )
+        try:
+            response = self._client.request(
+                method, path, params=params, timeout=request_timeout
+            )
+        except httpx.TimeoutException as exc:
+            raise TimeoutOvError(f"{method} {path} timed out: {exc}") from exc
+        except httpx.TransportError as exc:
+            raise TransientOvError(
+                f"Cannot reach {self._credentials.url}: {exc}"
+            ) from exc
+
+        if response.status_code < 400:
+            # A 200 is not proof of success here: OpenViking reports some
+            # failures inside a 200 envelope, and handing those bytes back as
+            # file content would pass an error message off as the file. A
+            # stored file comes back as octet-stream, so only a JSON answer is
+            # worth unwrapping -- and a file that genuinely is JSON is served
+            # as octet-stream too, so nothing real is caught by this.
+            if response.headers.get("content-type", "").startswith("application/json"):
+                envelope = ApiResponse.model_validate_json(response.text)
+                if envelope.status != "ok":
+                    failure = envelope.error or ApiError()
+                    raise OvError(
+                        failure.message or f"{method} {path} failed",
+                        code=failure.code,
+                        details=failure.details,
+                    )
+            return response.content
+
+        error = _parse_error(response)
+        message = error.message or f"{method} {path} failed with {response.status_code}"
+        if _is_retryable(response):
+            raise _transient(response, error)
+        if response.status_code == 404:
+            raise NotFoundError(
+                message, code=error.code, status_code=404, details=error.details
+            )
+        raise OvError(
+            message,
+            code=error.code,
+            status_code=response.status_code,
+            details=error.details,
+        )
+
+    @retry(
+        retry=retry_if_exception_type(TransientOvError),
+        stop=stop_after_attempt(MAX_ATTEMPTS),
+        wait=_retry_wait,
+        reraise=True,
+    )
+    def _send_raw_idempotent(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> bytes:
+        """Send a read that returns bytes, retrying transient failures."""
+        return self._send_raw(method, path, params=params, timeout=timeout)
+
+    @retry(
+        retry=retry_if_exception(_is_worth_resending),
+        stop=stop_after_attempt(MAX_ATTEMPTS),
+        wait=_retry_wait,
+        reraise=True,
+    )
+    def _send_write(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> object:
+        """Send a write, retrying a refusal but never a timeout.
+
+        See :func:`_is_worth_resending` for why the two are treated apart.
+        """
+        return self._send(method, path, params=params, json=json, timeout=timeout)
 
     @retry(
         retry=retry_if_exception_type(TransientOvError),
@@ -552,10 +798,107 @@ class OvClient:
             "operations": [op.model_dump(exclude_none=True) for op in operations],
             "wait": wait,
         }
-        result = self._send_idempotent(
+        result = self._send_write(
             "POST", "/content/batch-write", json=body, timeout=timeout
         )
         return _parse_result(BatchWriteResult, result, "/content/batch-write")
+
+    def tree(
+        self,
+        root_uri: str,
+        *,
+        level_limit: int = TREE_LEVEL_LIMIT,
+        node_limit: int = TREE_NODE_LIMIT,
+        timeout: float | None = None,
+    ) -> list[ServerFile]:
+        """List every file under a directory, however deep, in one request.
+
+        ``/fs/ls`` stops three levels down whatever limits it is given, so this
+        goes through ``/fs/tree``, which honors ``level_limit``. Hidden entries
+        are included: a folder of dotfiles is still a folder of files, and
+        leaving them out would have the caller conclude they were never sent.
+
+        Parameters
+        ----------
+        root_uri :
+            Directory to list.
+        level_limit :
+            How many levels down to walk.
+        node_limit :
+            Ceiling on entries returned.
+        timeout :
+            Read timeout for this request, in seconds.
+
+        Returns
+        -------
+        list[ServerFile]
+            Every non-directory entry below ``root_uri``.
+
+        Raises
+        ------
+        OvError
+            If the listing fails, or comes back at one of the limits — a
+            response that stopped early looks exactly like a small tree, and a
+            caller that took it at face value would call the missing half
+            unsent.
+        """
+        result = self._send_idempotent(
+            "GET",
+            "/fs/tree",
+            params={
+                "uri": root_uri,
+                "level_limit": level_limit,
+                "node_limit": node_limit,
+                "show_all_hidden": True,
+            },
+            timeout=timeout,
+        )
+        if not isinstance(result, list):
+            raise OvError(f"/fs/tree returned {type(result).__name__}, not a list")
+        if len(result) >= node_limit:
+            raise OvError(
+                f"/fs/tree returned {len(result)} entries, at the {node_limit} "
+                "ceiling, so the listing is incomplete."
+            )
+        # Every entry is parsed, none skipped. Dropping the ones that do not
+        # fit would turn a changed payload into an empty listing, and an empty
+        # listing reads as "the server holds nothing" — which a caller answers
+        # by uploading everything, while reporting a number that looks true.
+        entries = [_parse_result(ServerFile, entry, "/fs/tree") for entry in result]
+        deepest = max((e.rel_path.count("/") + 1 for e in entries), default=0)
+        if deepest >= level_limit:
+            raise OvError(
+                f"/fs/tree reached its {level_limit}-level depth, so anything "
+                "deeper is missing from the listing."
+            )
+        return [entry for entry in entries if not entry.is_dir]
+
+    def download(self, uri: str, *, timeout: float | None = None) -> bytes | None:
+        """Return a file's stored bytes, or None when nothing is there.
+
+        The bytes come back exactly as they were written, which is what makes
+        them worth hashing. ``/content/read`` is the wrong endpoint for that:
+        it wraps the file in JSON and prepends what the server knows about it,
+        so its digest never matches the file on disk.
+
+        Parameters
+        ----------
+        uri :
+            The viking:// URI to read.
+        timeout :
+            Read timeout for this request, in seconds.
+
+        Returns
+        -------
+        bytes or None
+            The stored content, or None if the URI holds nothing.
+        """
+        try:
+            return self._send_raw_idempotent(
+                "GET", "/content/download", params={"uri": uri}, timeout=timeout
+            )
+        except NotFoundError:
+            return None
 
     def rm(self, uri: str, *, recursive: bool = False, wait: bool = False) -> bool:
         """Remove a resource.
