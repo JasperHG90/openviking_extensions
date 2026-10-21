@@ -94,6 +94,69 @@ def test_extensions_are_normalized(folder: Path) -> None:
     assert load_config(folder).sync.include_extensions == [".md", ".txt"]
 
 
+def test_include_folders_are_normalized(folder: Path) -> None:
+    """A leading ./, a trailing slash or a backslash still matches the scanner."""
+    (folder / CONFIG_FILENAME).write_text(
+        '[sync]\ninclude_folders = ["./projects/", "areas\\\\work", "a//b"]\n',
+        encoding="utf-8",
+    )
+
+    assert load_config(folder).sync.include_folders == ["projects", "areas/work", "a/b"]
+
+
+def test_include_folders_are_trimmed_as_a_whole(folder: Path) -> None:
+    """Stray spaces around an entry go; spaces inside it may be the real name."""
+    (folder / CONFIG_FILENAME).write_text(
+        '[sync]\ninclude_folders = [" projects ", "a/ b /c"]\n', encoding="utf-8"
+    )
+
+    assert load_config(folder).sync.include_folders == ["projects", "a/ b /c"]
+
+
+def test_a_folder_name_may_start_with_a_tilde(folder: Path) -> None:
+    """Only a home-directory path is refused, not a name like ~drafts."""
+    (folder / CONFIG_FILENAME).write_text(
+        '[sync]\ninclude_folders = ["~drafts"]\n', encoding="utf-8"
+    )
+
+    assert load_config(folder).sync.include_folders == ["~drafts"]
+
+
+@pytest.mark.parametrize("entry", ["Notes [2024]", "what?", "a*b"])
+def test_include_folders_take_names_that_look_like_globs(
+    folder: Path, entry: str
+) -> None:
+    """Brackets and question marks are ordinary in folder names, so they pass."""
+    (folder / CONFIG_FILENAME).write_text(
+        f'[sync]\ninclude_folders = ["{entry}"]\n', encoding="utf-8"
+    )
+
+    assert load_config(folder).sync.include_folders == [entry]
+
+
+def test_include_folders_from_the_environment(
+    folder: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A list setting is passed as a JSON array, as the README says."""
+    monkeypatch.setenv("OV_SYNC_SYNC__INCLUDE_FOLDERS", '["projects", "areas/work"]')
+
+    assert load_config(folder).sync.include_folders == ["projects", "areas/work"]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    ["/abs/path", "~", "~/notes", "../sibling", "a/../b", "", ".", "  ", "C:\\\\notes"],
+)
+def test_include_folders_must_stay_inside_the_folder(folder: Path, entry: str) -> None:
+    """A path outside the folder, or naming none, could only ever match nothing."""
+    (folder / CONFIG_FILENAME).write_text(
+        f'[sync]\ninclude_folders = ["{entry}"]\n', encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="include_folders"):
+        load_config(folder)
+
+
 def test_credentials_come_from_the_ov_cli_config(tmp_path: Path) -> None:
     """Ovsync reuses whatever `ov config` already wrote."""
     config_file = tmp_path / "ovcli.conf"

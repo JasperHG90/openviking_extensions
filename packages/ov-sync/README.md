@@ -18,7 +18,7 @@ $ ovsync watch ~/notes                     # keeps sending as you edit
 ## Install
 
 ```bash
-uv tool install ov-sync --from "git+https://github.com/JasperHG90/openviking_extensions@ov-sync-v0.2.0#subdirectory=packages/ov-sync"
+uv tool install ov-sync --from "git+https://github.com/JasperHG90/openviking_extensions@ov-sync-v0.3.0#subdirectory=packages/ov-sync"
 ```
 
 Or from a checkout:
@@ -167,12 +167,14 @@ fifty.
 `ov-sync.toml` in the folder root, or `~/.config/ov-sync/ov-sync.toml` for
 folders that carry none. Every setting can be overridden by an environment
 variable: `OV_SYNC_` plus the path, with `__` between levels
-(`OV_SYNC_SYNC__ROOT_URI`, `OV_SYNC_WATCH__MODE`).
+(`OV_SYNC_SYNC__ROOT_URI`, `OV_SYNC_WATCH__MODE`). A list takes a JSON
+array: `OV_SYNC_SYNC__INCLUDE_FOLDERS='["projects", "areas/work"]'`.
 
 ```toml
 [sync]
 root_uri = "viking://resources/notes"
 include_extensions = [".md", ".txt", ".csv", ".json", ".yaml", ".yml", ".toml", ".html", ".pdf"]
+include_folders = []          # e.g. ["projects", "areas/work"]; empty means everything
 max_operations_per_batch = 256
 wait_for_indexing = true
 
@@ -189,6 +191,25 @@ debounce_seconds = 5              # quiet period before syncing a burst of edits
 poll_interval_seconds = 300       # poll mode: seconds between scans
 reconcile_interval_seconds = 900  # event mode: seconds between full rescans
 ```
+
+To sync only part of a folder, list the folders to keep, as paths relative
+to it:
+
+```toml
+[sync]
+include_folders = ["projects", "areas/work"]
+```
+
+That sends `projects/**` and `areas/work/**` and nothing else, not even the
+files sitting directly in `areas/`. The exclude rules still apply inside them,
+so `projects/.git` stays out. Entries are folder paths, not globs, and must
+match the disk's spelling and case; a symlinked folder is not followed.
+
+Narrowing the list later treats what falls outside it like deleted files: the
+next run reports them, and only `--delete` removes them from OpenViking. An
+entry that matches no folder is an error, and while one does, `--delete`
+removes nothing — a typo would otherwise make the whole folder it meant look
+deleted.
 
 A Markdown file can keep itself out of the sync:
 

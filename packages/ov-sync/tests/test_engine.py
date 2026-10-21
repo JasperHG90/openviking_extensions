@@ -747,6 +747,52 @@ def test_deletions_are_reported_but_not_applied_by_default(
     assert set(state.all_files()) == {"note.md"}
 
 
+def test_narrowing_include_folders_reports_what_falls_outside(
+    folder: Path,
+    client: OvClient,
+    sync_config: SyncConfig,
+    state: SyncState,
+    routes: respx.MockRouter,
+) -> None:
+    """A file left out by a narrower include is gone, like a deleted one.
+
+    It is reported, not removed, so a config edit alone never deletes
+    anything from OpenViking.
+    """
+    write(folder / "projects" / "a.md", "x")
+    write(folder / "inbox" / "b.md", "x")
+    sync(folder, ROOT, client, sync_config, state)
+    narrowed = sync_config.model_copy(update={"include_folders": ["projects"]})
+
+    result = sync(folder, ROOT, client, narrowed, state)
+
+    assert result.deleted_detected == [f"{ROOT}/inbox/b.md"]
+    assert result.deleted_applied == 0
+    assert routes["rm"].call_count == 0
+
+
+def test_an_include_that_matches_nothing_blocks_deletes(
+    folder: Path,
+    client: OvClient,
+    sync_config: SyncConfig,
+    state: SyncState,
+    routes: respx.MockRouter,
+) -> None:
+    """A wrong-case entry makes every file look gone; --delete must not act on it."""
+    write(folder / "Projects" / "a.md", "x")
+    sync(folder, ROOT, client, sync_config, state)
+    typo = sync_config.model_copy(update={"include_folders": ["projects"]})
+
+    result = sync(folder, ROOT, client, typo, state, apply_deletes=True)
+
+    assert result.plan.missing_folders == ["projects"]
+    assert result.deleted_detected == [f"{ROOT}/Projects/a.md"]
+    assert result.deleted_applied == 0
+    assert routes["rm"].call_count == 0
+    assert routes["snapshot"].call_count == 0
+    assert result.deletes_blocked is True
+
+
 def test_deletions_are_applied_behind_a_snapshot(
     folder: Path,
     client: OvClient,

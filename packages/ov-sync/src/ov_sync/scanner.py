@@ -131,6 +131,90 @@ def is_excluded(
     return False
 
 
+def is_included(
+    relative_path: str, sync_config: SyncConfig, *, is_dir: bool = False
+) -> bool:
+    """Whether a relative path falls under the configured ``include_folders``.
+
+    Parameters
+    ----------
+    relative_path :
+        Path relative to the synced folder, forward-slashed.
+    sync_config :
+        Supplies ``include_folders``. An empty list includes everything.
+    is_dir :
+        Whether the path names a directory. A directory also counts when it
+        is an ancestor of an included folder: the walk has to pass through
+        ``areas`` to reach ``areas/work``, though no file directly in
+        ``areas`` is sent.
+
+    Returns
+    -------
+    bool
+        True when the path is inside an included folder, or is a directory on
+        the way to one.
+    """
+    folders = sync_config.include_folders
+    if not folders:
+        return True
+    # The synced folder itself, which a watch event can name. It is where
+    # every included folder lives.
+    if is_dir and relative_path in ("", "."):
+        return True
+    for folder in folders:
+        if relative_path.startswith(f"{folder}/"):
+            return True
+        if is_dir and (relative_path == folder or folder.startswith(f"{relative_path}/")):
+            return True
+    return False
+
+
+def missing_include_folders(folder: Path, sync_config: SyncConfig) -> list[str]:
+    """Return the ``include_folders`` entries that name no folder on disk.
+
+    An entry that matches nothing is not a harmless no-op: every file synced
+    from that folder earlier now looks deleted. The match is held to what the
+    scan sees — exact names, as ``os.walk`` lists them, and no directory
+    symlinks, which the walk does not follow. On macOS a ``projects`` entry
+    passes ``Path.is_dir()`` against a ``Projects`` folder, and still matches
+    no file the scan finds.
+
+    Parameters
+    ----------
+    folder :
+        Root of the synced folder.
+    sync_config :
+        Supplies ``include_folders``.
+
+    Returns
+    -------
+    list[str]
+        The unmatched entries, in configured order. Empty when every entry
+        names a real folder, or when there are no entries.
+    """
+    missing: list[str] = []
+    for include in sync_config.include_folders:
+        here = folder
+        for part in include.split("/"):
+            try:
+                with os.scandir(here) as entries:
+                    match = next(
+                        (
+                            entry
+                            for entry in entries
+                            if entry.name == part and entry.is_dir(follow_symlinks=False)
+                        ),
+                        None,
+                    )
+            except OSError:
+                match = None
+            if match is None:
+                missing.append(include)
+                break
+            here = here / part
+    return missing
+
+
 def own_files(sync_config: SyncConfig) -> frozenset[str]:
     """Return the files ov-sync keeps in the folder and must never sync.
 
@@ -174,7 +258,7 @@ def is_syncable(relative_path: str, sync_config: SyncConfig) -> bool:
     relative_path :
         Path relative to the synced folder, forward-slashed.
     sync_config :
-        Extension filter and exclusion rules.
+        Folder and extension filters, and exclusion rules.
 
     Returns
     -------
@@ -182,6 +266,8 @@ def is_syncable(relative_path: str, sync_config: SyncConfig) -> bool:
         True when the path is in scope.
     """
     if relative_path in own_files(sync_config):
+        return False
+    if not is_included(relative_path, sync_config):
         return False
     extensions = sync_config.include_extensions
     if extensions and Path(relative_path).suffix.lower() not in extensions:
@@ -214,7 +300,7 @@ def scan(folder: Path, sync_config: SyncConfig) -> list[LocalFile]:
     folder :
         Root of the synced folder.
     sync_config :
-        Supplies the extension filter and the exclusion rules. The state
+        Supplies the folder and extension filters and the exclusion rules. The state
         database and the config file are always skipped, whatever it says —
         syncing ov-sync's own bookkeeping back into OpenViking helps nobody.
 
@@ -245,7 +331,8 @@ def scan(folder: Path, sync_config: SyncConfig) -> list[LocalFile]:
         dirnames[:] = [
             name
             for name in dirnames
-            if not is_excluded(f"{prefix}{name}", sync_config.exclude, is_dir=True)
+            if is_included(f"{prefix}{name}", sync_config, is_dir=True)
+            and not is_excluded(f"{prefix}{name}", sync_config.exclude, is_dir=True)
         ]
 
         for name in filenames:

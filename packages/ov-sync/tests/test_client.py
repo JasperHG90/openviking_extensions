@@ -127,7 +127,7 @@ def instant_retries(monkeypatch: pytest.MonkeyPatch) -> None:
     the module-level function has no effect; the Retrying object's own sleep
     is the seam.
     """
-    retrying = OvClient._send_idempotent.retry  # type: ignore[attr-defined]
+    retrying = OvClient._send_idempotent.retry
     monkeypatch.setattr(retrying, "sleep", lambda _seconds: None)
 
 
@@ -178,7 +178,7 @@ def test_retry_honors_retry_after(
 ) -> None:
     """A 429 with Retry-After waits the time the server asked for."""
     slept: list[float] = []
-    retrying = OvClient._send_idempotent.retry  # type: ignore[attr-defined]
+    retrying = OvClient._send_idempotent.retry
     monkeypatch.setattr(retrying, "sleep", slept.append)
     respx.get(f"{BASE}/fs/stat").mock(
         side_effect=[
