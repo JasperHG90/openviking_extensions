@@ -188,6 +188,12 @@ def _report(result: SyncResult) -> None:
             console.print(
                 f"  Undo with: ov snapshot restore {escape(result.snapshot_id)}"
             )
+    elif result.deleted_detected and result.deletes_blocked:
+        console.print(
+            f"[yellow]Gone from the folder:[/yellow] {len(result.deleted_detected)} "
+            "still in OpenViking. Not deleted: an include_folders entry matches "
+            "nothing, so they may only look gone because of it."
+        )
     elif result.deleted_detected:
         console.print(
             f"[yellow]Gone from the folder:[/yellow] {len(result.deleted_detected)} "
@@ -196,6 +202,7 @@ def _report(result: SyncResult) -> None:
     _report_renames(result.plan.renamed)
     _report_takeovers(result.plan.taken_over)
     _report_skips(result.skipped)
+    _report_missing_folders(result.plan.missing_folders)
     for error in result.errors:
         console.print(f"[red]{escape(error)}[/red]")
     if is_settled(result):
@@ -264,10 +271,21 @@ def _report_skips(skipped: Sequence[SkippedFile]) -> None:
         )
 
 
+def _report_missing_folders(missing: Sequence[str]) -> None:
+    """Warn about ``include_folders`` entries that name no folder on disk."""
+    for entry in missing:
+        console.print(
+            f"[red]include_folders entry {escape(repr(entry))} matches no "
+            "folder.[/red] Entries are folder paths, not globs, and must match "
+            "the disk's spelling and case."
+        )
+
+
 def is_settled(result: SyncResult) -> bool:
     """Whether the two sides now match, with nothing left outstanding.
 
-    A pending deletion or a skipped file counts as outstanding: saying
+    A pending deletion, a skipped file or an include_folders entry that
+    matches nothing counts as outstanding: saying
     "everything is up to date" one line after reporting a file that is gone
     locally but still in OpenViking would contradict itself.
     """
@@ -277,6 +295,7 @@ def is_settled(result: SyncResult) -> bool:
         or result.deleted_detected
         or result.skipped
         or result.errors
+        or result.plan.missing_folders
     )
 
 
@@ -329,6 +348,7 @@ def status(
         _report_renames(plan.renamed)
         _report_takeovers(plan.taken_over, prospective=True)
         _report_skips(plan.skipped)
+        _report_missing_folders(plan.missing_folders)
 
 
 @app.command()
@@ -414,10 +434,13 @@ def run(
         _report_renames(result.plan.renamed)
         _report_takeovers(result.plan.taken_over, prospective=True)
         _report_skips(result.plan.skipped)
+        _report_missing_folders(result.plan.missing_folders)
+        if result.plan.missing_folders:
+            raise typer.Exit(1)
         return
 
     _report(result)
-    if result.errors:
+    if result.errors or result.plan.missing_folders:
         raise typer.Exit(1)
 
 
@@ -499,6 +522,7 @@ class WatchReporter:
         outstanding = (
             *result.deleted_detected,
             *(skipped.relative_path for skipped in result.skipped),
+            *(f"missing include {entry}" for entry in result.plan.missing_folders),
         )
         acted = bool(result.written or result.deleted_applied or result.errors)
         if not acted and outstanding == self.last_outstanding:

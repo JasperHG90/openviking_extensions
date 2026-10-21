@@ -12,9 +12,9 @@ import respx
 from helpers import write
 from typer.testing import CliRunner
 
-from ov_sync.cli import app, is_settled
+from ov_sync.cli import WatchReporter, app, is_settled
 from ov_sync.config import CONFIG_FILENAME
-from ov_sync.engine import SkippedFile, SyncResult
+from ov_sync.engine import SkippedFile, SyncPlan, SyncResult
 
 BASE = "https://openviking.example/api/v1"
 ROOT = "viking://resources/notes"
@@ -122,6 +122,77 @@ def test_dry_run_lists_the_work_without_doing_it(folder: Path, configured: None)
     assert "note.md" in outcome.output
     assert stat.called
     assert not batch.called
+
+
+@respx.mock
+def test_dry_run_fails_on_an_include_that_matches_nothing(
+    folder: Path, configured: None
+) -> None:
+    """The check a dry run exists for: a typo'd folder is caught before a real run."""
+    write(folder / "Projects" / "note.md", "hello")
+    (folder / CONFIG_FILENAME).write_text(
+        '[sync]\ninclude_folders = ["projects"]\n', encoding="utf-8"
+    )
+    respx.get(f"{BASE}/fs/stat").mock(
+        return_value=ok({"name": "notes", "size": 0, "isDir": True})
+    )
+
+    outcome = runner.invoke(app, ["run", str(folder), "--root-uri", ROOT, "--dry-run"])
+
+    assert outcome.exit_code == 1
+    assert "'projects' matches no folder" in outcome.output
+
+
+def test_status_warns_about_an_include_that_matches_nothing(folder: Path) -> None:
+    """Status never contacts the server, so it is the cheapest place to see it."""
+    (folder / CONFIG_FILENAME).write_text(
+        '[sync]\ninclude_folders = ["projects"]\n', encoding="utf-8"
+    )
+
+    outcome = runner.invoke(app, ["status", str(folder), "--root-uri", ROOT])
+
+    assert outcome.exit_code == 0
+    assert "'projects' matches no folder" in outcome.output
+
+
+def test_a_missing_include_is_not_up_to_date() -> None:
+    """Nothing under the folder it meant is being synced."""
+    result = SyncResult(plan=SyncPlan(missing_folders=["projects"]))
+
+    assert is_settled(result) is False
+
+
+def test_watch_reports_a_missing_include_once(capsys: pytest.CaptureFixture[str]) -> None:
+    """A standing problem is news when it appears, not on every save after."""
+    reporter = WatchReporter()
+
+    def standing() -> SyncResult:
+        """A pass that changed nothing while an include matches no folder."""
+        return SyncResult(
+            deleted_detected=[f"{ROOT}/Projects/a.md"],
+            deletes_blocked=True,
+            plan=SyncPlan(missing_folders=["projects"]),
+        )
+
+    reporter(standing())
+    first = capsys.readouterr().out
+    reporter(standing())
+
+    assert "'projects' matches no" in first
+    assert "Not deleted" in first
+    assert "Re-run with --delete" not in first
+    assert capsys.readouterr().out == ""
+
+
+def test_watch_reports_a_missing_include_with_nothing_else_outstanding(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A missing include is a standing problem in its own right."""
+    reporter = WatchReporter()
+
+    reporter(SyncResult(plan=SyncPlan(missing_folders=["projects"])))
+
+    assert "'projects' matches no" in capsys.readouterr().out
 
 
 def test_a_bracketed_name_survives_the_report(folder: Path) -> None:

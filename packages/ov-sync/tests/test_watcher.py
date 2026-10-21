@@ -30,6 +30,7 @@ import pytest
 import respx
 from helpers import write
 from watchdog.events import (
+    DirDeletedEvent,
     DirMovedEvent,
     FileCreatedEvent,
     FileDeletedEvent,
@@ -194,6 +195,36 @@ def test_a_directory_move_forces_a_full_rescan(
     handler, wakeup = collector(folder, config)
 
     handler.on_moved(DirMovedEvent(str(here / "a"), str(here / "b")))
+
+    assert wakeup.is_set()
+    assert handler.drain() is None
+
+
+def test_a_file_outside_the_included_folders_never_wakes_the_watcher(
+    folder: Path,
+) -> None:
+    """An edit the sync would not send is not worth waking for."""
+    config = OvSyncConfig(sync=SyncConfig(root_uri=ROOT, include_folders=["projects"]))
+    here = folder.resolve()
+    handler, wakeup = collector(folder, config)
+
+    handler.on_modified(FileModifiedEvent(str(here / "other" / "note.md")))
+    handler.on_deleted(DirDeletedEvent(str(here / "other")))
+
+    assert not wakeup.is_set()
+
+
+def test_a_folder_moved_into_an_included_folder_forces_a_rescan(
+    folder: Path,
+) -> None:
+    """The source is outside the sync, so only the destination says it matters."""
+    config = OvSyncConfig(sync=SyncConfig(root_uri=ROOT, include_folders=["projects"]))
+    here = folder.resolve()
+    handler, wakeup = collector(folder, config)
+
+    handler.on_moved(
+        DirMovedEvent(str(here / "inbox" / "x"), str(here / "projects" / "x"))
+    )
 
     assert wakeup.is_set()
     assert handler.drain() is None

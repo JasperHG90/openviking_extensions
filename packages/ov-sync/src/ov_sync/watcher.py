@@ -29,7 +29,7 @@ from watchdog.observers import Observer
 from .client import OvClient
 from .config import OvSyncConfig
 from .engine import SyncResult, sync
-from .scanner import is_excluded, is_syncable
+from .scanner import is_excluded, is_included, is_syncable
 from .state import SyncState
 
 SyncReporter = Callable[[SyncResult], None]
@@ -153,7 +153,7 @@ class _ChangeCollector(FileSystemEventHandler):
     def _request_rescan(self, raw_path: str | bytes, *, is_dir: bool = False) -> None:
         """Ask for a whole-folder sync, unless the path is one to ignore.
 
-        A directory is judged on the exclusion rules alone. The extension
+        A directory is judged on the folder rules alone. The extension
         filter cannot apply to it — a folder has no extension, and running it
         through the file test would silently drop every directory event,
         including the moves and deletions only a rescan can resolve.
@@ -162,7 +162,10 @@ class _ChangeCollector(FileSystemEventHandler):
         if relative_path is None:
             return
         if is_dir:
-            if is_excluded(relative_path, self._config.sync.exclude, is_dir=True):
+            sync_config = self._config.sync
+            if not is_included(relative_path, sync_config, is_dir=True) or is_excluded(
+                relative_path, sync_config.exclude, is_dir=True
+            ):
                 return
         elif not is_syncable(relative_path, self._config.sync):
             return
@@ -200,10 +203,15 @@ class _ChangeCollector(FileSystemEventHandler):
         """Record where a rename landed, and rescan for where it left.
 
         A directory move relocates every file under it at once, and the event
-        names only the directory, so only a rescan finds them.
+        names only the directory, so only a rescan finds them. Both ends are
+        checked: a folder moved from outside the sync into it matters only at
+        its destination.
         """
         if event.is_directory:
             self._request_rescan(event.src_path, is_dir=True)
+            dest_path = getattr(event, "dest_path", "")
+            if dest_path:
+                self._request_rescan(dest_path, is_dir=True)
             return
         self._record(getattr(event, "dest_path", "") or event.src_path)
         self._request_rescan(event.src_path)

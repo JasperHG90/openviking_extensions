@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 
 from .client import BatchWriteOperation, OvClient, OvError
 from .config import SERVER_MAX_FILE_BYTES, SERVER_MAX_TOTAL_BYTES, SyncConfig
-from .scanner import LocalFile, file_digest, scan
+from .scanner import LocalFile, file_digest, missing_include_folders, scan
 from .state import SyncedFile, SyncState, diff
 from .uri_path import UriPathMap, folder_prefixes, map_uri_paths, safe_relative_path
 
@@ -83,6 +83,11 @@ class SyncPlan(BaseModel):
     taken_over : list[TakenOverFile]
         Copies in OpenViking that this run replaces with another file's
         contents, because a rewrite had the two share a URI.
+    missing_folders : list[str]
+        ``include_folders`` entries that name no folder on disk. While any
+        is listed, deletions are reported but never applied: a typo'd or
+        wrong-case entry would otherwise make every file under the folder it
+        meant look deleted.
     """
 
     write: list[str] = Field(default_factory=list)
@@ -93,6 +98,7 @@ class SyncPlan(BaseModel):
     skipped: list[SkippedFile] = Field(default_factory=list)
     renamed: list[RenamedFile] = Field(default_factory=list)
     taken_over: list[TakenOverFile] = Field(default_factory=list)
+    missing_folders: list[str] = Field(default_factory=list)
 
     @property
     def is_empty(self) -> bool:
@@ -124,6 +130,10 @@ class SyncResult(BaseModel):
         How many of those were actually removed.
     snapshot_id : str or None
         The snapshot committed before deleting, when one was taken.
+    deletes_blocked : bool
+        Whether ``--delete`` was asked for and refused, because an
+        ``include_folders`` entry matches no folder. The entries themselves
+        are in ``plan.missing_folders``.
     skipped : list[SkippedFile]
         Files left out, with the reason.
     errors : list[str]
@@ -144,6 +154,7 @@ class SyncResult(BaseModel):
     deleted_detected: list[str] = Field(default_factory=list)
     deleted_applied: int = 0
     snapshot_id: str | None = None
+    deletes_blocked: bool = False
     skipped: list[SkippedFile] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
     plan: SyncPlan = Field(default_factory=SyncPlan)
@@ -411,6 +422,7 @@ def plan_sync(
             for item in superseded
             if item.taken_by in {entry.relative_path for entry in to_write}
         ],
+        missing_folders=missing_include_folders(folder, sync_config),
     )
     detail = PlanDetail(
         to_write=to_write,
@@ -570,7 +582,9 @@ def sync(
         Work out the plan and return it without sending anything.
     apply_deletes :
         Remove resources whose local file is gone. Off by default, so a
-        deletion is reported before it is acted on.
+        deletion is reported before it is acted on. Not applied while an
+        ``include_folders`` entry matches no folder; ``deletes_blocked`` on
+        the result then says so.
     snapshot_before_delete :
         Commit a snapshot before removing anything, so the removal can be
         undone with ``ov snapshot restore``. When the snapshot fails, the
@@ -638,7 +652,11 @@ def sync(
         [item.row.relative_path for item in detail.superseded if item.taken_by in landed]
     )
 
-    if detail.deleted and apply_deletes:
+    # A missing include makes every file under the folder it meant look gone,
+    # so no deletion is trusted until it is fixed.
+    if detail.deleted and apply_deletes and plan.missing_folders:
+        result.deletes_blocked = True
+    elif detail.deleted and apply_deletes:
         _apply_deletes(
             client,
             root_uri,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -12,7 +13,9 @@ from ov_sync.config import ExcludeConfig, SyncConfig
 from ov_sync.scanner import (
     file_digest,
     is_excluded,
+    is_included,
     is_syncable,
+    missing_include_folders,
     parse_frontmatter,
     scan,
 )
@@ -249,3 +252,151 @@ def test_is_syncable_matches_what_the_scan_keeps(
     assert is_syncable(sync_config.state_file, sync_config) is False
     assert is_syncable(f"{sync_config.state_file}-journal", sync_config) is False
     assert is_syncable("photo.heic", sync_config) is False
+
+
+def test_include_folders_limits_the_scan(folder: Path) -> None:
+    """Only files under an included folder are found, at any depth below it."""
+    config = SyncConfig(
+        root_uri="viking://resources/notes",
+        include_folders=["projects", "areas/work"],
+    )
+    write(folder / "top.md", "x")
+    write(folder / "projects" / "a.md", "x")
+    write(folder / "projects" / "deep" / "b.md", "x")
+    write(folder / "areas" / "home.md", "x")
+    write(folder / "areas" / "work" / "c.md", "x")
+    write(folder / "areas" / "personal" / "d.md", "x")
+    write(folder / "projects-old" / "e.md", "x")
+
+    found = [entry.relative_path for entry in scan(folder, config)]
+
+    assert found == ["areas/work/c.md", "projects/a.md", "projects/deep/b.md"]
+
+
+def test_excludes_still_apply_inside_an_included_folder(folder: Path) -> None:
+    """Including a folder does not bring back what the exclude rules leave out."""
+    config = SyncConfig(
+        root_uri="viking://resources/notes",
+        include_folders=["projects"],
+        exclude=ExcludeConfig(ignore_folders=["private"]),
+    )
+    write(folder / "projects" / "keep.md", "x")
+    write(folder / "projects" / "private" / "secret.md", "x")
+    write(folder / "projects" / ".git" / "config.md", "x")
+
+    found = [entry.relative_path for entry in scan(folder, config)]
+
+    assert found == ["projects/keep.md"]
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "is_dir", "expected"),
+    [
+        ("areas", True, True),  # on the way to areas/work
+        ("areas/work", True, True),
+        ("areas/work/sub", True, True),
+        ("areas/personal", True, False),
+        ("areas/home.md", False, False),  # a file directly in an ancestor
+        ("areas/work/c.md", False, True),
+        ("areas/work", False, False),  # a file named like the folder
+        ("areas/workshop", True, False),  # a prefix of the name is not a match
+    ],
+)
+def test_is_included(relative_path: str, is_dir: bool, expected: bool) -> None:
+    """Ancestors let the walk through; only paths below a folder are sent."""
+    config = SyncConfig(
+        root_uri="viking://resources/notes", include_folders=["areas/work"]
+    )
+
+    assert is_included(relative_path, config, is_dir=is_dir) is expected
+
+
+def test_no_include_folders_means_everything() -> None:
+    """The default is the whole folder, as before the option existed."""
+    config = SyncConfig(root_uri="viking://resources/notes")
+
+    assert is_included("anything.md", config) is True
+    assert is_syncable("top.md", config) is True
+
+
+def test_is_syncable_honors_include_folders() -> None:
+    """The watcher filters with is_syncable, so it must agree with the scan."""
+    config = SyncConfig(root_uri="viking://resources/notes", include_folders=["projects"])
+
+    assert is_syncable("projects/a.md", config) is True
+    assert is_syncable("top.md", config) is False
+    assert is_syncable("other/a.md", config) is False
+
+
+def test_the_synced_folder_itself_is_included() -> None:
+    """A watch event on the root must not be dropped as out of scope."""
+    config = SyncConfig(root_uri="viking://resources/notes", include_folders=["projects"])
+
+    assert is_included(".", config, is_dir=True) is True
+    assert is_included("", config, is_dir=True) is True
+
+
+def test_the_walk_never_enters_a_folder_outside_the_includes(
+    folder: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pruning is the point: a large tree outside the includes is not walked."""
+    config = SyncConfig(root_uri="viking://resources/notes", include_folders=["projects"])
+    write(folder / "projects" / "a.md", "x")
+    write(folder / "archive" / "deep" / "b.md", "x")
+    seen: list[str] = []
+    real_walk = os.walk
+
+    def spy(
+        top: Path, followlinks: bool = False
+    ) -> Iterator[tuple[str, list[str], list[str]]]:
+        """Record each directory the walk visits."""
+        for dirpath, dirnames, filenames in real_walk(top, followlinks=followlinks):
+            seen.append(Path(dirpath).relative_to(folder.resolve()).as_posix())
+            yield dirpath, dirnames, filenames
+
+    monkeypatch.setattr("ov_sync.scanner.os.walk", spy)
+
+    scan(folder, config)
+
+    assert "archive" not in seen
+    assert "projects" in seen
+
+
+def test_missing_include_folders_names_what_is_not_there(folder: Path) -> None:
+    """Every entry has to be a real folder, spelled as the disk spells it."""
+    (folder / "Projects").mkdir()
+    (folder / "areas" / "work").mkdir(parents=True)
+    write(folder / "notes.md", "x")
+    (folder / "linked").symlink_to(folder / "areas", target_is_directory=True)
+    config = SyncConfig(
+        root_uri="viking://resources/notes",
+        include_folders=["projects", "areas/work", "areas/home", "notes.md", "linked"],
+    )
+
+    # "projects" is the wrong case, "notes.md" is a file, and the walk does
+    # not follow the "linked" symlink, so none of the three can sync a thing.
+    assert missing_include_folders(folder, config) == [
+        "projects",
+        "areas/home",
+        "notes.md",
+        "linked",
+    ]
+
+
+def test_no_include_folders_means_none_missing(folder: Path) -> None:
+    """The whole folder is always there."""
+    assert missing_include_folders(folder, SyncConfig(root_uri="viking://r/n")) == []
+
+
+def test_an_include_with_glob_characters_matches_literally(folder: Path) -> None:
+    """A folder called "Notes [2024]" is a name, not a pattern."""
+    config = SyncConfig(
+        root_uri="viking://resources/notes", include_folders=["Notes [2024]"]
+    )
+    write(folder / "Notes [2024]" / "a.md", "x")
+    write(folder / "Notes 2" / "b.md", "x")
+
+    found = [entry.relative_path for entry in scan(folder, config)]
+
+    assert found == ["Notes [2024]/a.md"]
+    assert missing_include_folders(folder, config) == []

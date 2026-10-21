@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,9 @@ DEFAULT_STATE_FILE = ".ov-sync.db"
 SERVER_MAX_OPERATIONS = 256
 SERVER_MAX_FILE_BYTES = 8 * 1024 * 1024
 SERVER_MAX_TOTAL_BYTES = 16 * 1024 * 1024
+
+# A Windows drive, as in "C:\\notes". The folder rules take relative paths only.
+_DRIVE_RE = re.compile(r"^[A-Za-z]:")
 
 DEFAULT_BASE_EXCLUDES = [
     ".git",
@@ -107,6 +111,13 @@ class SyncConfig(BaseModel):
         description="File extensions to sync. Anything else is ignored. "
         "An empty list means every file, subject to the exclude rules.",
     )
+    include_folders: list[str] = Field(
+        default_factory=list,
+        description="Folders to sync, as paths relative to the synced folder, "
+        'e.g. ["projects", "areas/work"]. Only files under one of them are '
+        "sent, and the exclude rules still apply inside them. An empty list "
+        "means the whole folder.",
+    )
     exclude: ExcludeConfig = Field(
         default_factory=ExcludeConfig,
         description="Rules for leaving files out.",
@@ -139,6 +150,44 @@ class SyncConfig(BaseModel):
             ext if ext.startswith(".") else f".{ext}"
             for ext in (e.lower() for e in value)
         ]
+
+    @field_validator("include_folders")
+    @classmethod
+    def _normalize_folders(cls, value: list[str]) -> list[str]:
+        """Forward-slash each folder and trim it, refusing paths outside the folder.
+
+        The scanner compares these against relative paths as plain strings, so
+        ``./projects/`` has to become ``projects`` or it would match nothing.
+        Only the whole entry is trimmed: a folder can really be called
+        `` b `` on disk. Anything else that names no folder, a glob included,
+        is caught when the sync runs and reported then.
+        """
+        folders: list[str] = []
+        for raw in value:
+            stripped = raw.strip()
+            parts = [
+                part
+                for part in stripped.replace("\\", "/").split("/")
+                if part not in ("", ".")
+            ]
+            if (
+                stripped.startswith(("/", "\\"))
+                or stripped == "~"
+                or stripped.startswith(("~/", "~\\"))
+                or _DRIVE_RE.match(stripped)
+                or ".." in parts
+            ):
+                raise ValueError(
+                    f"include_folders entry {raw!r} must be a path inside the "
+                    'synced folder, e.g. "projects" or "areas/work".'
+                )
+            if not parts:
+                raise ValueError(
+                    f"include_folders entry {raw!r} names no folder. Leave the "
+                    "list empty to sync the whole folder."
+                )
+            folders.append("/".join(parts))
+        return folders
 
 
 class WatchConfig(BaseModel):
@@ -423,6 +472,10 @@ root_uri = ""
 include_extensions = [
     ".md", ".txt", ".csv", ".json", ".yaml", ".yml", ".toml", ".html", ".pdf",
 ]
+
+# Folders to sync, relative to this one, e.g. ["projects", "areas/work"].
+# Empty means everything here. The exclude rules still apply inside them.
+include_folders = []
 
 # Files per batch-write request. The server caps this at 256.
 max_operations_per_batch = 256
