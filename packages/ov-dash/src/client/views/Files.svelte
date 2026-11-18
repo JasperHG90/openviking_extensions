@@ -2,10 +2,10 @@
   /**
    * Files: a tree on the left, the file you picked on the right.
    *
-   * One recursive listing builds the whole hierarchy, so a folder opens in
-   * place at any depth and never navigates. Picking a file loads it into the
-   * pane beside the tree, so the tree keeps its shape and its scroll position
-   * and there is nothing to go "back" from.
+   * The top level loads first and each folder loads when it is opened, so a
+   * folder opens in place at any depth and never navigates. Picking a file
+   * loads it into the pane beside the tree, so the tree keeps its shape and its
+   * scroll position and there is nothing to go "back" from.
    */
   import { MAX_SEGMENT, folderNameProblem, safeSegment } from "../../shared/names";
   import { api, type FileDetail, type Tree } from "../lib/api";
@@ -15,7 +15,13 @@
   import Reader from "../lib/Reader.svelte";
   import { toast } from "../lib/state.svelte";
   import { formatSize, parentUri } from "../lib/tree";
-  import { allFolderUris, buildTree, visibleRows, type TreeNode } from "../lib/tree";
+  import {
+    allFolderUris,
+    buildTree,
+    type TreeNode,
+    unfetchedFolders,
+    visibleRows,
+  } from "../lib/tree";
 
   let tree = $state<Tree | null>(null);
   let failure = $state("");
@@ -25,14 +31,20 @@
   let filter = $state("");
 
   /**
-   * Children fetched on demand, keyed by folder uri.
-   *
-   * OpenViking's recursive listing stops at depth 2 even when deeper content
-   * exists — measured against the cluster — so one call cannot fill the tree.
-   * Expanding a folder we have no children for fetches them and merges them in.
+   * Each folder's listing, keyed by folder uri, fetched when it is opened and
+   * merged into the tree. An empty or unreadable folder is kept as `[]`, so it
+   * is not fetched again on every open.
    */
   let extra = $state<Map<string, import("../../shared/schemas").Node[]>>(new Map());
   let loadingDirs = $state<Set<string>>(new Set());
+  // The fetch for each folder still loading, so a second caller waits for it
+  // instead of moving on as if the folder were done.
+  const pending = new Map<string, Promise<void>>();
+  // Bumped by every refresh, so a fetch started before a move cannot write the
+  // old paths back into the tree.
+  let generation = 0;
+  /** Whether any folder listing hit OpenViking's limit and came back cut off. */
+  let cutOff = $state(false);
 
   let selected = $state<string>("");
   let detail = $state<FileDetail | null>(null);
@@ -94,7 +106,7 @@
   const COLUMNS = "minmax(0,1fr) 78px 40px";
 
   /**
-   * Read the whole listing.
+   * Read the top level.
    *
    * Everything starts shut. Seeding the first two levels open was meant to show
    * the shape of the workspace, and on a real tree it opened hundreds of rows —
@@ -120,18 +132,16 @@
    *
    * The fetched children are keyed by folder uri, and a move has just changed
    * which uris exist, so they go. Then they are fetched back for the folders
-   * still open: the recursive listing stops at depth 2, so anything expanded
-   * below that would otherwise sit there open and empty, looking like a folder
-   * whose contents the move had eaten.
+   * still open, or those would sit there open and empty, looking like a
+   * folder whose contents the move had eaten.
    */
   async function refreshTree(): Promise<void> {
+    generation += 1;
+    pending.clear();
     extra = new Map();
+    cutOff = false;
     await loadTree();
-    for (let round = 0; round < 6; round++) {
-      const missing = findUnfetched(roots).filter((node) => open.has(node.uri));
-      if (missing.length === 0) break;
-      await Promise.all(missing.slice(0, 40).map((node) => fill(node)));
-    }
+    await fillAll((node) => open.has(node.uri));
   }
 
   function toggle(node: TreeNode): void {
@@ -146,26 +156,34 @@
 
   /**
    * Fetch a folder's children the first time it is opened.
-   *
-   * Skipped when the initial listing already brought them, so the common case
-   * costs nothing. An empty folder is remembered as empty so it is not
-   * re-fetched on every open.
    */
-  async function fill(node: TreeNode): Promise<void> {
-    if (!node.isDir || extra.has(node.uri) || node.children.length > 0) return;
-    if (loadingDirs.has(node.uri)) return;
+  function fill(node: TreeNode): Promise<void> {
+    if (!node.isDir || extra.has(node.uri)) return Promise.resolve();
+    const running = pending.get(node.uri);
+    if (running) return running;
+    const started = fetchFolder(node.uri).finally(() => {
+      if (pending.get(node.uri) === started) pending.delete(node.uri);
+    });
+    pending.set(node.uri, started);
+    return started;
+  }
 
-    loadingDirs = new Set(loadingDirs).add(node.uri);
+  async function fetchFolder(uri: string): Promise<void> {
+    const startedIn = generation;
+    loadingDirs = new Set(loadingDirs).add(uri);
     try {
-      const listing = await api.folder(node.uri);
-      extra = new Map(extra).set(node.uri, listing.nodes);
+      const listing = await api.listing(uri);
+      if (startedIn !== generation) return;
+      extra = new Map(extra).set(uri, listing.nodes);
+      if (listing.truncated) cutOff = true;
     } catch {
+      if (startedIn !== generation) return;
       // Remember the attempt, so a folder that cannot be read does not retry
       // on every click.
-      extra = new Map(extra).set(node.uri, []);
+      extra = new Map(extra).set(uri, []);
     } finally {
       const next = new Set(loadingDirs);
-      next.delete(node.uri);
+      next.delete(uri);
       loadingDirs = next;
     }
   }
@@ -256,24 +274,39 @@
 
   let expanding = $state(false);
 
-  /**
-   * Open everything, fetching levels the recursive listing did not reach.
-   *
-   * Loops because each round can reveal folders that were not known before.
-   * Bounded so a deep or cyclic tree cannot spin here forever.
-   */
+  /** Open everything, fetching each folder that has not been fetched yet. */
   async function expandAll(): Promise<void> {
     expanding = true;
     try {
-      for (let round = 0; round < 6; round++) {
-        const folders = allFolderUris(roots);
-        open = new Set(folders);
-        const missing = roots.length ? findUnfetched(roots) : [];
-        if (missing.length === 0) break;
-        await Promise.all(missing.slice(0, 40).map((node) => fill(node)));
-      }
+      await fillAll(() => true, () => {
+        open = new Set(allFolderUris(roots));
+      });
     } finally {
       expanding = false;
+    }
+  }
+
+  /** Folders fetched at once, so a big Expand all does not flood the server. */
+  const FETCH_AT_ONCE = 8;
+  /** Levels walked before giving up, so a cyclic tree cannot spin forever. */
+  const MAX_DEPTH = 16;
+
+  /**
+   * Fetch every unfetched folder that `wanted` picks, level by level.
+   *
+   * Loops because each level's listings reveal the folders of the next one.
+   */
+  async function fillAll(
+    wanted: (node: TreeNode) => boolean,
+    eachLevel: () => void = () => {},
+  ): Promise<void> {
+    for (let level = 0; level < MAX_DEPTH; level++) {
+      eachLevel();
+      const missing = unfetchedFolders(roots, new Set(extra.keys())).filter(wanted);
+      if (missing.length === 0) return;
+      for (let i = 0; i < missing.length; i += FETCH_AT_ONCE) {
+        await Promise.all(missing.slice(i, i + FETCH_AT_ONCE).map((node) => fill(node)));
+      }
     }
   }
 
@@ -455,10 +488,11 @@
     moving = held.uri;
     try {
       const landed = await api.move(held.uri, node.uri);
+      // Opened before the refresh, which fetches only open folders, so the row
+      // it landed in is loaded and visible rather than folded away.
+      open = new Set(open).add(node.uri);
       await refreshTree();
       follow(held.uri, landed);
-      // Opened, so the row it landed in is visible rather than folded away.
-      open = new Set(open).add(node.uri);
       toast(`Moved ${held.name} into ${node.name}`);
     } catch (error) {
       toast((error as Error).message);
@@ -508,21 +542,6 @@
     await refreshTree();
   }
 
-  /** Folders whose children have never been fetched. */
-  function findUnfetched(list: TreeNode[]): TreeNode[] {
-    const out: TreeNode[] = [];
-    const walk = (nodes: TreeNode[]): void => {
-      for (const node of nodes) {
-        if (node.isDir && node.children.length === 0 && !extra.has(node.uri)) {
-          out.push(node);
-        }
-        walk(node.children);
-      }
-    };
-    walk(list);
-    return out;
-  }
-
 </script>
 
 <PageHead eyebrow="Files" title="Files" desc="Everything OpenViking holds for you." />
@@ -537,7 +556,7 @@
       <div class="toolbar">
         <div class="sbox">
           <Icon name="search" size={13} />
-          <input placeholder="Filter by name" bind:value={filter} />
+          <input placeholder="Filter what is loaded" bind:value={filter} />
           {#if filter}
             <button class="clr" onclick={() => (filter = "")} aria-label="Clear filter">
               <Icon name="close" size={12} />
@@ -628,7 +647,7 @@
         </form>
       {/if}
 
-      {#if tree.truncated}
+      {#if tree.truncated || cutOff}
         <div class="callout c-sheet" style="margin:10px 0">
           <span class="ci"><Icon name="files" /></span>
           <p>This listing hit OpenViking's limit, so it may be incomplete.</p>

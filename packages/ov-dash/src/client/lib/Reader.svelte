@@ -1312,6 +1312,19 @@
     overflow-x: auto;
     margin: 0 0 1em;
   }
+  .md :global(details.frontmatter) {
+    margin: 0 0 1em;
+    color: var(--ink-3);
+    font-size: 12.5px;
+  }
+  .md :global(details.frontmatter summary) {
+    cursor: pointer;
+  }
+  .md :global(details.frontmatter pre) {
+    margin: 6px 0 0;
+    font-family: var(--fm);
+    white-space: pre-wrap;
+  }
   .md :global(pre code) {
     background: none;
     padding: 0;

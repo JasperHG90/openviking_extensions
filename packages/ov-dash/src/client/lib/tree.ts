@@ -1,10 +1,9 @@
 /**
  * Turning OpenViking's flat listing into the hierarchy the Files page draws.
  *
- * The server asks for a recursive listing and passes the entries straight
- * through, so the shape of the tree is decided here from each entry's path.
- * Doing it client-side means expanding a folder costs nothing — the children
- * are already loaded.
+ * The page fetches the top level, then each folder as it is opened, and merges
+ * the listings into one flat list. The shape of the tree is decided here from
+ * each entry's path.
  */
 
 import type { Node } from "../../shared/schemas";
@@ -15,7 +14,7 @@ export interface TreeNode extends Node {
 }
 
 /**
- * Build a hierarchy from a flat, recursive listing.
+ * Build a hierarchy from the merged listings.
  *
  * Entries whose parent is missing from the listing are attached at the root
  * rather than dropped: a truncated listing should still show what it did
@@ -74,6 +73,30 @@ export function parentUri(uri: string): string {
   if (trimmed.length < SCHEME.length) return uri;
   const cut = trimmed.lastIndexOf("/");
   return cut < SCHEME.length ? trimmed : trimmed.slice(0, cut);
+}
+
+/**
+ * Folders in the tree whose own listing has not been fetched yet.
+ *
+ * Children already in the tree do not count as fetched: they may be part of
+ * a listing that was cut off, and the rest of the folder would never load.
+ *
+ * @param nodes - The tree.
+ * @param fetched - Uris of folders whose listing has been fetched.
+ */
+export function unfetchedFolders(
+  nodes: TreeNode[],
+  fetched: ReadonlySet<string>,
+): TreeNode[] {
+  const out: TreeNode[] = [];
+  const walk = (list: TreeNode[]): void => {
+    for (const node of list) {
+      if (node.isDir && !fetched.has(node.uri)) out.push(node);
+      walk(node.children);
+    }
+  };
+  walk(nodes);
+  return out;
 }
 
 /** Every directory path in a tree, for Expand all. */
