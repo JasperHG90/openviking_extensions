@@ -261,7 +261,7 @@ afterwards, which this mode never gets.
 | Page | Where the data comes from |
 |---|---|
 | Home | recursive `fs/ls`, plus memory and session counts |
-| Files | one recursive `fs/ls`, hierarchy built client-side |
+| Files | `fs/ls` of the top level, then of each folder as it is opened; hierarchy built client-side |
 | Folder / File | `fs/ls`, `fs/stat`, `content/read`, `content/abstract`, `content/overview` |
 | Search | `search/find`, on a button press |
 | Memories | files under `<scope>/memories`, grouped by category |

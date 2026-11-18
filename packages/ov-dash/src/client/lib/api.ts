@@ -163,6 +163,12 @@ export const api = {
       call(`/api/folder?uri=${encodeURIComponent(uri)}`, treeSchema),
     ),
 
+  /** One folder's entries without its summary, for the tree. */
+  listing: (uri: string) =>
+    cached(`listing:${uri}`, () =>
+      call(`/api/list?uri=${encodeURIComponent(uri)}`, treeSchema),
+    ),
+
   file: (uri: string) =>
     cached(`file:${uri}`, () =>
       call(`/api/file?uri=${encodeURIComponent(uri)}`, fileDetailSchema),

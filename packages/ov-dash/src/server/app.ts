@@ -574,17 +574,39 @@ export function createApp(services: Services) {
 
   app.get("/api/tree", async (c) => {
     const ov = c.get("ov");
-    const nodes = await ov.list(ov.root, true, TREE_NODE_LIMIT);
+    // Top level only. The page fetches each folder as it is opened: one
+    // recursive listing of the scope stops at 2000 entries and three levels,
+    // and on a full store that hid whole branches.
+    const nodes = await ov.list(ov.root, false, TREE_NODE_LIMIT);
     const tree: Tree = {
       root: ov.root,
       nodes: nodes.sort((a, b) => a.relPath.localeCompare(b.relPath)),
       truncated: nodes.length >= TREE_NODE_LIMIT,
       summary: "",
-      // The whole-tree listing describes no single folder, so there is nothing
-      // to read here. The pane only asks for one folder at a time.
+      // The top level is no folder anybody picked, so there is nothing to
+      // read here. The pane only asks for one folder at a time.
       overview: "",
     };
     return c.json(tree);
+  });
+
+  /*
+   * One folder's entries, for the tree. `/api/folder` also reads the abstract
+   * and overview, two more OpenViking calls the tree never shows, and Expand
+   * all would pay them for every folder.
+   */
+  app.get("/api/list", async (c) => {
+    const ov = c.get("ov");
+    const uri = requireUri(c);
+    const nodes = await ov.list(uri, false, TREE_NODE_LIMIT);
+    const listing: Tree = {
+      root: uri,
+      nodes: nodes.sort(directoriesFirst),
+      truncated: nodes.length >= TREE_NODE_LIMIT,
+      summary: "",
+      overview: "",
+    };
+    return c.json(listing);
   });
 
   app.get("/api/folder", async (c) => {
