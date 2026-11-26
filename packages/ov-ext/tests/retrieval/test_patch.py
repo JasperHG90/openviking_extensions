@@ -120,7 +120,7 @@ def test_install_accepts_this_openvikings_scope_builder() -> None:
             level=None,
             *,
             acl_enabled,
-            tier: None,  # noqa: E501
+            tier: None,
             "requires: tier",
         ),
         (
@@ -129,7 +129,7 @@ def test_install_accepts_this_openvikings_scope_builder() -> None:
             context_type,
             target_directories,
             extra_filter,
-            level=None: None,  # noqa: E501
+            level=None: None,
             "does not take: acl_enabled",
         ),
     ],
