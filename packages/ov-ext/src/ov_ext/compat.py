@@ -34,15 +34,25 @@ OPENVIKING_BELOW: tuple[int, ...] = (0, 6)
 ALLOW_UNTESTED_ENV = "OV_EXT_ALLOW_UNTESTED_OPENVIKING"
 
 _RELEASE = re.compile(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?")
+# PEP 440 pre- and dev-release markers. Such a version sorts below its release,
+# so 0.5.6rc1 does not satisfy >=0.5.6, as pip agrees.
+_PRE_RELEASE = re.compile(r"(?:a|b|c|rc|alpha|beta|pre|preview|dev)\d*", re.IGNORECASE)
 _FLAG: TypeAdapter[bool] = TypeAdapter(bool)
 
 
 def _release(text: str) -> tuple[int, ...] | None:
-    """Return the leading ``major.minor.patch`` of a version string, if any."""
+    """Return a sort key for a version string, or ``None`` if it has none.
+
+    The key is ``major.minor.patch`` followed by 0 for a pre- or dev-release
+    and 1 otherwise, so ``0.5.6rc1`` sorts below ``0.5.6`` and a post or local
+    release does not.
+    """
     match = _RELEASE.match(text)
     if match is None:
         return None
-    return tuple(int(part or 0) for part in match.groups())
+    rest = text[match.end() :].split("+", 1)[0]
+    final = 0 if _PRE_RELEASE.search(rest) else 1
+    return (*(int(part or 0) for part in match.groups()), final)
 
 
 def _dotted(parts: tuple[int, ...]) -> str:
@@ -69,7 +79,11 @@ def check_openviking_version() -> None:
     except PackageNotFoundError:
         installed = "unknown"
     release = _release(installed)
-    if release is not None and OPENVIKING_MIN <= release < OPENVIKING_BELOW:
+    if (
+        release is not None
+        and (*OPENVIKING_MIN, 1) <= release
+        and release[:3] < OPENVIKING_BELOW
+    ):
         return
     message = (
         f"ov-ext is tested against openviking {tested}, but openviking "
