@@ -99,3 +99,65 @@ def test_a_non_class_upstream_is_refused() -> None:
 
     with pytest.raises(RuntimeError, match="not a class"):
         install()
+
+
+def test_install_accepts_this_openvikings_scope_builder() -> None:
+    """Against the OpenViking the suite runs on, the contract check passes."""
+    install()
+    assert issubclass(current(), HybridRetriever)
+    uninstall()
+
+
+@pytest.mark.parametrize(
+    "replacement,complaint",
+    [
+        (
+            lambda self,
+            ctx,
+            context_type,
+            target_directories,
+            extra_filter,
+            level=None,
+            *,
+            acl_enabled,
+            tier: None,  # noqa: E501
+            "requires: tier",
+        ),
+        (
+            lambda self,
+            ctx,
+            context_type,
+            target_directories,
+            extra_filter,
+            level=None: None,  # noqa: E501
+            "does not take: acl_enabled",
+        ),
+    ],
+)
+def test_a_scope_builder_ov_ext_cannot_call_refuses_startup(
+    monkeypatch: pytest.MonkeyPatch, replacement: object, complaint: str
+) -> None:
+    """A changed ``_build_scope_filter`` stops startup, and patches nothing.
+
+    At query time the keyword leg would catch the TypeError and fall back to
+    vector-only on every search, which is how ov-ext 0.7 lost its keyword leg
+    on OpenViking 0.5 without anyone noticing.
+    """
+    from openviking.storage.viking_vector_index_backend import VikingVectorIndexBackend
+
+    original = current()
+    monkeypatch.setattr(VikingVectorIndexBackend, "_build_scope_filter", replacement)
+    with pytest.raises(RuntimeError, match=complaint):
+        install()
+    assert current() is original
+
+
+def test_a_backend_without_acl_state_refuses_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_acl_enabled`` is where the keyword leg's ACL flag comes from."""
+    from openviking.storage.viking_vector_index_backend import VikingVectorIndexBackend
+
+    monkeypatch.delattr(VikingVectorIndexBackend, "_acl_enabled")
+    with pytest.raises(RuntimeError, match="_acl_enabled"):
+        install()

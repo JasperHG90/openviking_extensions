@@ -1,9 +1,8 @@
-"""Coverage for connection pooling and the per-retrieval rerank ceiling.
+"""Coverage for connection pooling and the per-search rerank document cap.
 
-Both exist for the same reason: OpenViking reranks once per directory the
-hierarchical descent visits, serially, with no cap on either count. A single
-search was observed making hundreds of calls, each paying a fresh TCP and TLS
-handshake -- which cost more than the inference it wrapped.
+OpenViking's rerank client opens a fresh connection per call, and since 0.4.23
+its one rerank per search scores the whole recalled pool -- which ov-ext
+widens. Pooling cuts the handshake; the cap bounds what that call sends.
 """
 
 from __future__ import annotations
@@ -15,8 +14,7 @@ from typing import Any
 import pytest
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from openviking.retrieve.hierarchical_retriever import HierarchicalRetriever
-from openviking_cli.retrieve.types import QueryResult
-from .test_retriever import FakeQuery
+from openviking.retrieve.rerank_scoring import RerankScores
 
 from ov_ext.retrieval.config import HybridSettings
 from ov_ext.observability import _tracer
@@ -25,7 +23,7 @@ from ov_ext.retrieval.rerank import (
     install_pooled_rerank,
     uninstall_pooled_rerank,
 )
-from ov_ext.retrieval.retriever import HybridRetriever, _rerank_budget
+from ov_ext.retrieval.retriever import HybridRetriever
 
 _OPENAI_RERANK = "openviking.models.rerank.openai_rerank"
 
@@ -312,180 +310,6 @@ def test_install_honours_pooling_being_switched_off(
         uninstall()
 
 
-@pytest.mark.asyncio
-async def test_the_default_setting_leaves_reranking_uncapped(
-    monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
-) -> None:
-    """``rerank_max_calls=0`` must mean no ceiling, not a ceiling of zero.
-
-    Zero is the shipped default, so reading it literally would stop every
-    deployment reranking at all -- silently, since candidates would simply keep
-    their vector scores. Asserted through ``retrieve``, because the translation
-    happens there.
-    """
-    seen: list[int | None] = []
-
-    async def base_retrieve(
-        self: Any, query: Any, request_ctx: Any, limit: int = 5, **kwargs: Any
-    ) -> Any:
-        seen.append(_rerank_budget.get())
-        return QueryResult(query=query, matched_contexts=[], searched_directories=[])
-
-    monkeypatch.setattr(HierarchicalRetriever, "retrieve", base_retrieve)
-
-    class _Stubbed(HybridRetriever):
-        def __init__(self) -> None:
-            self._settings = HybridSettings()
-            self.vector_store = None
-
-    assert _Stubbed()._settings.rerank_max_calls == 0, "the default under test"
-    await _Stubbed().retrieve(FakeQuery(), ctx=None, limit=2)
-
-    assert seen == [None], "the default must not cap reranking"
-
-
-@pytest.mark.asyncio
-async def test_a_batch_of_blank_documents_costs_no_budget(
-    monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
-) -> None:
-    """The base class refuses these without calling the service.
-
-    A subtree of directories with no abstract yet -- ordinary mid-backfill --
-    would otherwise spend the whole ceiling before one real rerank happened.
-    """
-    retriever, reached = make_budgeted_retriever(monkeypatch, rerank_max_calls=2)
-    token = _rerank_budget.set(2)
-    try:
-        blank = await retriever._rerank_scores("q", ["", "   "], [1.0, 2.0])
-        assert _rerank_budget.get() == 2, "a refused batch must not be charged"
-        await retriever._rerank_scores("q", ["real"], [3.0])
-        assert _rerank_budget.get() == 1
-    finally:
-        _rerank_budget.reset(token)
-
-    assert blank == [1.0, 2.0]
-    assert reached == [1], "only the batch with real text may reach the service"
-
-
-def make_budgeted_retriever(
-    monkeypatch: pytest.MonkeyPatch, **overrides: Any
-) -> tuple[HybridRetriever, list[int]]:
-    """Return a retriever whose base rerank records its calls.
-
-    Returns
-    -------
-    tuple
-        The retriever, and a list receiving the document count of each call
-        that reached the base implementation.
-    """
-    reached: list[int] = []
-
-    async def base_rerank(
-        self: Any, query: str, documents: list[str], fallback_scores: list[float]
-    ) -> list[float]:
-        reached.append(len(documents))
-        return [9.0] * len(documents)
-
-    monkeypatch.setattr(HierarchicalRetriever, "_rerank_scores", base_rerank)
-
-    class _Stubbed(HybridRetriever):
-        def __init__(self) -> None:
-            self._settings = HybridSettings(**overrides)
-
-    return _Stubbed(), reached
-
-
-@pytest.mark.asyncio
-async def test_the_budget_stops_reranking_and_keeps_vector_scores(
-    monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
-) -> None:
-    """Past the ceiling, candidates keep the ordering they already had.
-
-    That is the same degradation OpenViking applies when rerank fails, so the
-    worst case is a ranking it already considers acceptable.
-    """
-    retriever, reached = make_budgeted_retriever(monkeypatch, rerank_max_calls=2)
-    token = _rerank_budget.set(2)
-    try:
-        first = await retriever._rerank_scores("q", ["a"], [1.0])
-        second = await retriever._rerank_scores("q", ["b"], [2.0])
-        third = await retriever._rerank_scores("q", ["c"], [3.0])
-    finally:
-        _rerank_budget.reset(token)
-
-    assert first == [9.0] and second == [9.0]
-    assert third == [3.0], "past the budget the vector score must survive"
-    assert len(reached) == 2, "the third call must not reach the rerank service"
-
-
-@pytest.mark.asyncio
-async def test_the_exhausted_budget_is_recorded_not_silent(
-    monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
-) -> None:
-    """A search that quietly stopped reranking looks like one with no reranker."""
-    retriever, _ = make_budgeted_retriever(monkeypatch, rerank_max_calls=1)
-    token = _rerank_budget.set(0)
-    try:
-        await retriever._rerank_scores("q", ["a"], [1.0])
-    finally:
-        _rerank_budget.reset(token)
-
-    span = next(
-        s for s in spans.get_finished_spans() if s.name == "ov_ext.retrieval.rerank"
-    )
-    assert span.attributes is not None
-    assert span.attributes["ov_ext.retrieval.outcome"] == "rerank_budget_spent"
-
-
-@pytest.mark.asyncio
-async def test_no_budget_means_no_ceiling(
-    monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
-) -> None:
-    """The default must not change behaviour for anyone not asking for it."""
-    retriever, reached = make_budgeted_retriever(monkeypatch, rerank_max_calls=0)
-
-    assert _rerank_budget.get() is None
-    for _ in range(5):
-        await retriever._rerank_scores("q", ["a"], [1.0])
-
-    assert len(reached) == 5
-
-
-@pytest.mark.asyncio
-async def test_retrieve_sets_the_budget_before_the_descent_and_clears_it_after(
-    monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
-) -> None:
-    """The setting only bites if it is in place while the descent runs.
-
-    The descent lives inside ``super().retrieve``, so the budget has to be set
-    before that call and gone after it. Asserting only the "after" half would
-    pass just as well if the budget were never set at all.
-
-    Clearing matters because one retriever serves every request and the loop
-    reuses tasks: a counter left set would make the next search skip reranking
-    for reasons this one caused.
-    """
-    seen: list[int | None] = []
-
-    async def base_retrieve(
-        self: Any, query: Any, request_ctx: Any, limit: int = 5, **kwargs: Any
-    ) -> Any:
-        seen.append(_rerank_budget.get())
-        return QueryResult(query=query, matched_contexts=[], searched_directories=[])
-
-    monkeypatch.setattr(HierarchicalRetriever, "retrieve", base_retrieve)
-
-    class _Stubbed(HybridRetriever):
-        def __init__(self) -> None:
-            self._settings = HybridSettings(rerank_max_calls=7)
-            self.vector_store = None
-
-    await _Stubbed().retrieve(FakeQuery(), ctx=None, limit=2)
-
-    assert seen == [7], "the descent must run with the configured ceiling in place"
-    assert _rerank_budget.get() is None
-
-
 def make_recording_retriever(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -494,16 +318,16 @@ def make_recording_retriever(
 ) -> tuple[HybridRetriever, list[tuple[list[str], list[float]]]]:
     """Return a retriever whose base rerank records what it was handed.
 
-    ``make_budgeted_retriever`` records only how many documents arrived, which
-    cannot tell a cap that sent the strongest candidates from one that sent the
-    first few.
+    The stub answers the way OpenViking's own ``rerank_scores`` does: a model
+    score for every document carrying text, the fallback for a blank, and a
+    ``reranked`` flag saying which is which.
 
     Parameters
     ----------
     scores :
-        Returned to the caller, truncated to the batch. Defaults to a constant,
-        which is enough when the test is about what was sent rather than what
-        came back.
+        Model scores, consumed in order by the documents that carry text.
+        Defaults to a constant, which is enough when the test is about what
+        was sent rather than what came back.
 
     Returns
     -------
@@ -515,9 +339,14 @@ def make_recording_retriever(
 
     async def base_rerank(
         self: Any, query: str, documents: list[str], fallback_scores: list[float]
-    ) -> list[float]:
+    ) -> RerankScores:
         seen.append((list(documents), list(fallback_scores)))
-        return list(scores[: len(documents)]) if scores else [9.0] * len(documents)
+        answers = iter(scores or [9.0] * len(documents))
+        out = [
+            next(answers) if text.strip() else fallback
+            for text, fallback in zip(documents, fallback_scores, strict=True)
+        ]
+        return RerankScores(out, [bool(text.strip()) for text in documents])
 
     monkeypatch.setattr(HierarchicalRetriever, "_rerank_scores", base_rerank)
 
@@ -526,6 +355,23 @@ def make_recording_retriever(
             self._settings = HybridSettings(**overrides)
 
     return _Stubbed(), seen
+
+
+@pytest.mark.asyncio
+async def test_the_override_returns_what_the_base_retrieve_reads(
+    monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
+) -> None:
+    """OpenViking 0.5.3+ reads ``.scores`` and ``.reranked`` off the result.
+
+    ov-ext 0.7 returned a plain list here, which made the base ``retrieve``
+    raise ``AttributeError`` on every reranked search.
+    """
+    cases: list[dict[str, Any]] = [{}, {"rerank_max_documents": 1}]
+    for overrides in cases:
+        retriever, _ = make_recording_retriever(monkeypatch, **overrides)
+        result = await retriever._rerank_scores("q", ["a", "b"], [0.1, 0.2])
+        assert isinstance(result, RerankScores), overrides
+        assert len(result.scores) == len(result.reranked) == 2
 
 
 @pytest.mark.asyncio
@@ -553,12 +399,12 @@ async def test_the_document_cap_sends_the_strongest_candidates_in_batch_order(
 async def test_candidates_past_the_document_cap_keep_their_vector_scores(
     monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
 ) -> None:
-    """The operator's decision: hold them back from the reranker, not from the pool.
+    """Held back from the reranker, not from the pool, and marked as such.
 
     Dropping them, or flooring them below the reranked band, would push them
     under the retrieval threshold and out of the answer entirely. Keeping the
-    vector score is the merge the base class already performs for documents it
-    skips.
+    vector score, flagged as not reranked, is the base class's own treatment
+    of a document the model skipped -- so the rerank threshold leaves them be.
     """
     retriever, _ = make_recording_retriever(
         monkeypatch, scores=[5.0, 6.0], rerank_max_documents=2
@@ -568,9 +414,10 @@ async def test_candidates_past_the_document_cap_keep_their_vector_scores(
         "q", ["a", "b", "c", "d"], [0.1, 0.7, 0.3, 0.9]
     )
 
-    assert result == [0.1, 5.0, 0.3, 6.0], (
+    assert result.scores == [0.1, 5.0, 0.3, 6.0], (
         "reranked scores land on the chosen indexes; the rest keep theirs"
     )
+    assert result.reranked == [False, True, False, True]
 
 
 @pytest.mark.asyncio
@@ -586,9 +433,10 @@ async def test_the_default_document_cap_sends_every_document(
     retriever, seen = make_recording_retriever(monkeypatch)
 
     assert retriever._settings.rerank_max_documents == 0, "the default under test"
-    await retriever._rerank_scores("q", ["a", "b", "c"], [0.1, 0.2, 0.3])
+    result = await retriever._rerank_scores("q", ["a", "b", "c"], [0.1, 0.2, 0.3])
 
     assert seen[0][0] == ["a", "b", "c"], "the default must send everything"
+    assert result.reranked == [True, True, True]
 
 
 @pytest.mark.asyncio
@@ -598,19 +446,17 @@ async def test_the_cap_spends_its_allowance_on_documents_that_carry_text(
     """Blanks are dropped before the cap applies, not after.
 
     Capping first fills the allowance by vector score, which here is both
-    blanks -- so the request goes out empty while the ceiling has already been
-    charged for it. Found by adversarial review.
+    blanks -- the base class never sends a blank, so the call would go out
+    empty. Found by adversarial review.
     """
     retriever, seen = make_recording_retriever(monkeypatch, rerank_max_documents=2)
 
-    token = _rerank_budget.set(5)
-    try:
-        await retriever._rerank_scores("q", ["real text", "", "   "], [0.1, 0.9, 0.8])
-        remaining = _rerank_budget.get()
-    finally:
-        _rerank_budget.reset(token)
+    result = await retriever._rerank_scores(
+        "q", ["real text", "", "   "], [0.1, 0.9, 0.8]
+    )
 
     assert seen[0][0] == ["real text"], (
         "the allowance must go to text the service can read"
     )
-    assert remaining == 4, "and the call it was charged for must have carried something"
+    assert result.scores == [9.0, 0.9, 0.8]
+    assert result.reranked == [True, False, False]

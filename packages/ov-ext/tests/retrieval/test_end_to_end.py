@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import pytest
@@ -121,7 +121,9 @@ def postgres_dsn() -> Iterator[str]:
 
 
 @pytest.fixture
-def backend(postgres_dsn: str) -> Iterator[Any]:
+def backend(
+    postgres_dsn: str, attach_vector_config: Callable[[Any, int], Any]
+) -> Iterator[Any]:
     """A real OpenViking vector backend on a real PostgreSQL, per test."""
     from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
 
@@ -142,7 +144,7 @@ def backend(postgres_dsn: str) -> Iterator[Any]:
         },
     )
     store = VikingVectorIndexBackend(config)
-    yield store
+    yield attach_vector_config(store, DIM)
 
 
 def request_context() -> Any:
@@ -249,7 +251,7 @@ async def test_the_keyword_leg_promotes_a_document_the_vector_leg_ranks_last(
 async def test_hybrid_ranking_survives_a_downstream_re_sort_by_score(
     backend: Any,
 ) -> None:
-    """`/skills/search` re-sorts by `.score`, which must agree with the order.
+    """Consumers re-sort by `.score`, which must agree with the order.
 
     A ranking that lives only in list order is discarded by any consumer that
     sorts, which is how the fusion was being silently undone.
@@ -383,4 +385,84 @@ async def test_diversity_reaches_level_0_results(backend: Any) -> None:
     ], "without MMR the twins hold both top slots"
     assert diverse[1].uri.endswith("other/.abstract.md"), "MMR must fire for L0 too"
 
+    await backend.close()
+
+
+class _AclOn:
+    """An ACL manager reporting ACL as enabled for every account."""
+
+    async def is_enabled(self, account_id: str) -> bool:
+        return True
+
+
+async def test_the_keyword_leg_hides_a_restricted_resource_when_acl_is_on(
+    backend: Any,
+) -> None:
+    """With ACL on, the keyword leg finds what the user may read and nothing else.
+
+    The two documents match the query equally; one is restricted to another
+    user. Two layers keep it out: the scope ov-ext builds with OpenViking's
+    ``_build_scope_filter``, and the tenant filter OpenViking's own
+    ``search_by_keywords`` adds for ``ctx``. This proves the leg runs end to
+    end on OpenViking 0.5 and does not leak; ov-ext 0.7 raised on the missing
+    ``acl_enabled`` and the leg returned nothing at all. The scope's own ACL
+    filter is checked by ``test_the_keyword_leg_runs_against_openvikings_scope_builder``.
+    """
+    from openviking.storage.acl import EMPTY_ACL_GRANT, AclAction, acl_grant_tokens
+    from openviking.storage.collection_schemas import CollectionSchemas
+
+    from ov_ext.retrieval.config import HybridSettings
+    from ov_ext.retrieval.retriever import HybridRetriever
+
+    ctx = request_context()
+    assert await backend.create_collection(
+        COLLECTION, CollectionSchemas.context_collection(COLLECTION, DIM)
+    )
+    common = {
+        "account_id": "acct",
+        "context_type": "resource",
+        "level": 2,
+        "abstract": "intermediate certificate rotation",
+        "acl_inherited_grants": [EMPTY_ACL_GRANT],
+    }
+    # Written through the adapter: OpenViking's own write path resets the ACL
+    # fields, which only its ACL manager may set.
+    backend._shared_adapter.upsert(
+        [
+            {
+                **common,
+                "id": "open",
+                "uri": "viking://resources/open.md",
+                "vector": NEAR_A,
+                "acl_mode": "none",
+                "acl_direct_grants": [EMPTY_ACL_GRANT],
+            },
+            {
+                **common,
+                "id": "secret",
+                "uri": "viking://resources/secret.md",
+                "vector": NEAR_B,
+                "acl_mode": "restricted",
+                "acl_direct_grants": acl_grant_tokens(
+                    ["user:someone-else"], AclAction.READ
+                )[:1],
+            },
+        ]
+    )
+    backend.acl_manager = _AclOn()
+    retriever = HybridRetriever(
+        settings=HybridSettings(), storage=backend, embedder=StubEmbedder(NEAR_A)
+    )
+
+    found = await retriever._keyword_uris(
+        text="intermediate certificate",
+        ctx=ctx,
+        pool=10,
+        scope_dsl=None,
+        level=None,
+        context_type=None,
+        target_directories=None,
+    )
+
+    assert found == ["viking://resources/open.md"]
     await backend.close()
