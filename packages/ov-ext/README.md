@@ -35,10 +35,16 @@ redundancy. Both algorithms are ported from
 [memex](https://github.com/JasperHG90/memex), whose retrieval engine already
 runs them.
 
-There is a third gap, and it is one of cost rather than quality: OpenViking
-reranks once per directory it descends into, with no bound on either the calls
-or the documents they carry, which is most of what a slow search is spending.
+There is a third gap, and it is one of cost rather than quality: OpenViking's
+one rerank call per search scores every candidate it recalled, which this
+package widens, and opens a fresh connection to do it.
 [Rerank cost](#rerank-cost) covers what this package does about that.
+
+All of it applies to `find` and `search`, including searches for skills. It
+does not apply to the Skills API's package search (`/skills/search`), which
+OpenViking runs through its own `SkillPackageRetriever`: that pages the vector
+search and groups files into packages, never reranks, and calls none of the
+methods this package overrides, so there is nothing to patch.
 
 ## Why RRF rather than a weighted sum
 
@@ -113,6 +119,21 @@ ov-ext-server --config /etc/ov.conf          # every subsystem installed
 Arguments pass through untouched, subcommands included. The wrapper installs
 the patch, logs what it enabled, and hands over.
 
+### Which OpenViking
+
+ov-ext 0.8 needs OpenViking `>=0.5.6,<0.6`, and `install()` checks the
+installed version before patching anything. Installing with `pip install
+--no-deps` into a prebuilt OpenViking image skips the version requirement in
+`pyproject.toml`, so the check is what stops an untested combination: on any
+other version the server refuses to start and names both versions. Run
+`pip check` after such an install to see the same thing earlier. For a
+deliberate trial, `OV_EXT_ALLOW_UNTESTED_OPENVIKING=1` turns the refusal into a
+warning.
+
+`install()` also checks the private backend methods the keyword leg calls,
+`_build_scope_filter` and `_acl_enabled`, and refuses to start if their
+signatures no longer fit the call it makes.
+
 ### More than one worker
 
 `install()` patches the process it runs in, which is the process serving
@@ -166,12 +187,17 @@ OV_RETRIEVAL_MMR_LAMBDA=0.5 ov-ext-server --config /etc/ov.conf
 | `OV_RETRIEVAL_MMR_EMBEDDING_WEIGHT` | `0.6` | Weight of embedding cosine in the similarity blend |
 | `OV_RETRIEVAL_MMR_ENTITY_WEIGHT` | `0.4` | Weight of tag overlap in the same blend |
 | `OV_RETRIEVAL_RERANK_POOLING` | `true` | Route rerank calls through one pooled connection |
-| `OV_RETRIEVAL_RERANK_MAX_CALLS` | `0` (no limit) | Cap rerank calls during the descent |
-| `OV_RETRIEVAL_RERANK_MAX_DOCUMENTS` | `0` (no limit) | Cap documents sent in any one call |
-| `OV_RETRIEVAL_RERANK_FINAL` | `true` | Rerank the pool once after fusion, before diversifying |
+| `OV_RETRIEVAL_RERANK_MAX_DOCUMENTS` | `0` (no limit) | Cap documents sent in the search's one rerank call |
 
-The four rerank settings are the ones worth understanding before touching, and
-[Rerank cost](#rerank-cost) explains what each trades away.
+[Rerank cost](#rerank-cost) explains what the two rerank settings trade away.
+
+A variable with the prefix that names no setting stops startup with the list of
+valid names. Two settings were removed in 0.8.0 and stop startup with the
+reason if still set: `OV_RETRIEVAL_RERANK_MAX_CALLS` (OpenViking 0.4.23 and
+later rerank once per search, so there is no call count left to cap) and
+`OV_RETRIEVAL_RERANK_FINAL` (the native rerank already scores the whole pool,
+and a second pass after fusion would re-score the same texts and undo the
+fusion). Delete them from the environment.
 
 A misspelled variable is **refused at startup**, naming the settings that do
 exist. Silently ignoring it would leave you tuning a knob connected to nothing.
@@ -218,118 +244,63 @@ so `result_count` reads high by up to this factor.
 ### Turning it off without uninstalling
 
 ```bash
-OV_RETRIEVAL_KEYWORD_ENABLED=false OV_RETRIEVAL_MMR_ENABLED=false \
-OV_RETRIEVAL_RERANK_FINAL=false
+OV_RETRIEVAL_KEYWORD_ENABLED=false OV_RETRIEVAL_MMR_ENABLED=false
 ```
 
-All three off makes the package a genuine no-op for *results*: no keyword query
-is issued, no similarity matrix is computed, no extra rerank call goes out, and
-no over-fetch happens — retrieval returns exactly what it would without this
-installed. Useful while a collection is still backfilling its bodies, or to A/B
-a ranking complaint.
+Both off makes the package a genuine no-op for *results*: no keyword query is
+issued, no similarity matrix is computed, and no over-fetch happens — retrieval
+returns exactly what it would without this installed. Useful while a collection
+is still backfilling its bodies, or to A/B a ranking complaint.
 
-`RERANK_FINAL` has to be in that list. It defaults on and costs one rerank call
-per search, so leaving it out gives you a quieter package rather than an absent
-one.
-
-Two settings are deliberately not in it. `RERANK_MAX_CALLS` and
-`RERANK_MAX_DOCUMENTS` default to no limit, so they already change nothing.
-`RERANK_POOLING` stays on: it swaps the transport underneath OpenViking's
+Two settings are deliberately not in it. `RERANK_MAX_DOCUMENTS` defaults to no
+limit, so it already changes nothing. `RERANK_POOLING` stays on: it swaps the
+transport underneath OpenViking's
 rerank client without touching what that client sends or how its answers are
 read, so it cannot move a result. Set it to `false` too if you want the process
 untouched as well as the ranking.
 
 ## Rerank cost
 
-OpenViking reranks **once per directory** its hierarchical descent visits, not
-once per query. The calls run one after another, and nothing caps how many
-directories a search explores — only a convergence heuristic. On a wide tree a
-single search made hundreds of rerank calls.
+Since 0.4.23 OpenViking runs one global vector search and reranks what it
+recalled once, rather than once per directory of a descent. The recall is twice
+the `limit` it is asked for, and while the keyword leg or the diversity pass is
+on this package asks for `POOL_FACTOR` times the answer: at the defaults, 10
+results means 80 documents in that one rerank call.
 
-Worse, each went out through a module-level `requests.post` with no session, so
-every call paid a fresh TCP and TLS handshake. Against a LAN rerank service,
-calls it answered in about 5 ms came back in 15–30 ms: the handshake cost more
-than the inference.
+Each call also went out through a module-level `requests.post` with no session,
+so every search paid a fresh TCP and TLS handshake. Against a LAN rerank
+service, calls it answered in about 5 ms came back in 15–30 ms: the handshake
+cost more than the inference.
 
-Four settings address that:
+Two settings address that:
 
 | Setting | Default | Does |
 |---|---|---|
 | `OV_RETRIEVAL_RERANK_POOLING` | `true` | Routes rerank calls through one pooled connection and adds a `traceparent` header |
-| `OV_RETRIEVAL_RERANK_MAX_CALLS` | `0` (no limit) | Caps rerank calls during the descent |
-| `OV_RETRIEVAL_RERANK_MAX_DOCUMENTS` | `0` (no limit) | Caps documents sent in any one call |
-| `OV_RETRIEVAL_RERANK_FINAL` | `true` | Reranks the pool once after fusion, before diversifying |
+| `OV_RETRIEVAL_RERANK_MAX_DOCUMENTS` | `0` (no limit) | Caps the documents the search's one rerank call sends |
 
-Past either cap, candidates keep their vector scores — the same degradation
-OpenViking already applies when reranking fails, so the worst case is a ranking
-it considers acceptable rather than an error. The `ov_ext.retrieval.rerank` span
-records `rerank_budget_spent` when the call ceiling bites, because a search that
-quietly stopped reranking half way looks exactly like one that never had a
-reranker. Two more attributes record the documents rather than the calls:
-`reranked_documents` counts those that came back with a score, and
-`held_back_documents` those never sent — because a cap excluded them, or
-because they carried no text. Neither implies a cap is set.
+A reranker charges by the document — it scores a few query-document pairs per
+pass through the model — so what a search spends is very nearly how many
+documents it sends. The cap sends the strongest candidates by vector score, in
+the batch's own order. The rest keep their vector scores, marked as not
+reranked, which is how OpenViking treats a document its model skipped: they
+stay in the running, and the rerank threshold leaves them alone. The honest
+caveat is that the result then mixes two scales, and a strong vector score can
+outrank a weak rerank score. Upstream already mixes them for documents it
+skips, so this widens an existing looseness rather than introducing one.
 
-### Which cap to reach for
+Blanks are dropped **before** the cap applies. OpenViking never sends a blank
+abstract, so capping first could fill the whole allowance with documents the
+service would never see.
 
-Prefer `RERANK_MAX_DOCUMENTS` to a low `RERANK_MAX_CALLS`. A reranker charges
-by the document — it scores a few query-document pairs per pass through the
-model — so what a search spends is very nearly how many documents it sends, and
-the two caps buy that budget differently. A low call ceiling reranks the first
-few directories properly and the rest not at all. The same budget spread as a
-per-call document cap reranks *at every level of the descent*, which is where
-OpenViking intends the cross-encoder to earn its keep: a wrong prune high in the
-tree is one nothing downstream can undo.
+The `ov_ext.retrieval.rerank` span records `documents`, and with a cap set,
+`reranked_documents` (those that came back with a model score) and
+`held_back_documents` (those the cap kept back).
 
-Candidates that miss the cut keep their vector scores and stay in the running.
-The honest caveat is that the result then mixes two scales, and a strong vector
-score can outrank a weak rerank score. Upstream already mixes them for documents
-it skips, so this widens an existing looseness rather than introducing one.
-
-Blanks are dropped **before** the cap applies. Capping first would let a
-backfilling subtree fill the whole allowance with documents the service ignores,
-sending an empty request that the call ceiling has already been charged for.
-
-### The final pass
-
-`RERANK_FINAL` adds one call after fusion. It exists because the descent judges
-a directory of siblings at a time and never sees the pool it ends up with, so
-the candidates the keyword leg promoted, and any left on vector scores by a
-spent call ceiling, reach the answer unjudged.
-
-**`RERANK_MAX_DOCUMENTS` applies to this pass too**, and the interaction is the
-most important thing to know about either setting. The cap selects by vector
-score, so what it holds back is precisely what the keyword leg promoted — its
-whole job is lifting documents the embedding ranked low. So the pass reorders
-**only the candidates it actually scored, among the positions they already
-held**; anything it did not see keeps its place.
-
-That restriction is not fussiness. Sorting the whole pool by the merged scores
-compares a rerank score against a cosine, two numbers that share a range and
-nothing else. Measured on a four-candidate pool with `MAX_DOCUMENTS=2`, it took
-a keyword-promoted document from first to last and lifted a document nothing had
-ever judged from last to first — an answer that was neither the fused order nor
-the vector order, and strictly worse than leaving the pass off.
-
-The same applies when abstracts are missing. A pool mixing blank and real
-abstracts gets only its real ones scored, and the blanks would otherwise be
-ranked against them on cosine alone.
-
-It runs before the diversity pass, and that order is load-bearing —
-`mmr_select` reads relevance from a candidate's position rather than its score,
-so reranking afterwards would undo the diversification without saying so.
-
-It is deliberately **not** charged against `RERANK_MAX_CALLS`: that ceiling
-bounds a descent whose length nobody chose, while this is one call the caller
-asked for. Charging both to one budget would let a tight ceiling silently drop
-the pass that makes the ceiling affordable.
-
-It also never widens the pool on its own. A larger `limit` does not merely
-truncate later upstream — it widens every child search and makes the descent's
-convergence check harder to satisfy, so the walk visits more directories and
-reranks in more of them. A pass added to cut rerank cost must not pay for itself
-by lengthening the descent. With the keyword or diversity pass on, the pool is
-already wide and the final rerank reads it for free.
+Nothing here reranks a second time. Up to 0.7, ov-ext ran a final rerank after
+fusion, because the per-directory descent never scored the pool as a whole.
+The native pass now does, and a second pass over the same abstracts would
+mostly restore the order fusion had just changed.
 
 Two details of the pooling worth knowing:
 
@@ -349,20 +320,6 @@ Two details of the pooling worth knowing:
   are sent and answered, they just fall back to a connection each. A test pins
   this with a pool of 2 and four rounds of eight concurrent calls.
 
-What this does **not** fix: the calls are still one per directory and still
-serial, and nothing here bounds how many directories the descent visits.
-Changing either means overriding `_recursive_search` and copying the descent
-logic this package exists to avoid reimplementing, so both belong upstream.
-
-Worth knowing before reaching for concurrency there: issuing a round's calls in
-parallel is not the win it looks like when the rerank service is one you host.
-It re-batches whatever arrives into its own small groups — embark's
-`rerank_batch_size` is 4 — so four concurrent calls and four serial ones queue
-the same number of passes through the same model, and the concurrent version
-adds contention. Merging a round into one request is the better shape, and it
-buys round-trips rather than inference. The number that moves is the document
-count, which is what `RERANK_MAX_DOCUMENTS` exists to control.
-
 ## Tracing
 
 Each pass emits an OpenTelemetry span, so a trace shows where retrieval spent
@@ -371,11 +328,11 @@ its time and — more usefully — which passes declined to run.
 | Span | Says |
 |---|---|
 | `ov_ext.retrieval.retrieve` | `limit`, `pool`, which passes are enabled, candidates in, results out |
-| `ov_ext.retrieval.keyword_search` | the outcome: `ok`, `not_implemented`, `backend_lacks_keyword_search`, `keyword_search_failed` |
+| `ov_ext.retrieval.keyword_search` | the outcome: `ok`, `not_implemented`, `backend_lacks_keyword_search`; errors `keyword_scope_failed` or `keyword_search_failed` |
 | `ov_ext.retrieval.fuse_keywords` | vector candidates, keyword hits, fused count |
 | `ov_ext.retrieval.diversify` | candidates, embedding pairs, tag pairs, selected |
 | `ov_ext.retrieval.embedding_similarity` | URIs asked about, pairs returned |
-| `ov_ext.retrieval.rerank` | documents scored, or `rerank_budget_spent` |
+| `ov_ext.retrieval.rerank` | documents in the call; with a cap, how many were reranked and held back |
 | `ov_ext.retrieval.rerank_call` | one HTTP call to the rerank service; batch size when the body is JSON |
 
 There is nothing to configure. OpenViking's server installs the global tracer

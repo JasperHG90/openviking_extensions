@@ -19,7 +19,7 @@ OpenViking ships five vector backends — `local`, `cuvs`, `http`, `volcengine`,
 
 ## Quick start
 
-You need a PostgreSQL 13+ database with [pgvector](https://github.com/pgvector/pgvector) available, and OpenViking 0.4.16 or newer.
+You need a PostgreSQL 13+ database with [pgvector](https://github.com/pgvector/pgvector) available, and OpenViking 0.5.6 or a later 0.5 release.
 
 Install into the environment that runs OpenViking:
 
@@ -78,7 +78,7 @@ Your vectors are now in Postgres.
 | Requirement | Notes |
 |---|---|
 | PostgreSQL 13+ | With the `vector` extension available |
-| OpenViking 0.4.16+ | Ships the dotted-class-path extension point |
+| OpenViking `>=0.5.6,<0.6` | Checked at startup; see below |
 | Python 3.10+ | |
 
 Check pgvector is present before you start:
@@ -123,6 +123,13 @@ are tagged `ov-postgres-v<version>` and need one:
 ```bash
 uv add "ov-postgres @ git+https://github.com/JasperHG90/openviking_extensions@ov-postgres-v0.3.0#subdirectory=packages/ov-postgres"
 ```
+
+Installing with `pip install --no-deps`, as an image built on a prebuilt
+OpenViking usually does, skips the `openviking>=0.5.6,<0.6` requirement. The
+adapter checks the installed OpenViking when the server builds it and refuses
+to start on any other version, naming both. Run `pip check` after such an
+install to see the same thing earlier. For a deliberate trial,
+`OV_POSTGRES_ALLOW_UNTESTED_OPENVIKING=1` turns the refusal into a warning.
 
 Confirm it landed where OpenViking will find it:
 
@@ -505,7 +512,7 @@ Two registry tables, `ov_collections` and `ov_indexes`, hold collection and inde
 
 ### Path scoping
 
-`viking://` URIs are stored path-style (`/user/default/notes`) and decoded on read. The `-d=N` depth parameter is an `IMMUTABLE` SQL function, `ov_path_matches`, ported from `_path_matches` in OpenViking's `cuvs_index.py`.
+`viking://` URIs are stored path-style (`/user/default/notes`) and decoded on read. The `-d=N` depth parameter is an `IMMUTABLE` SQL function, `ov_path_matches`, ported from `_path_matches` in OpenViking 0.4's `cuvs_index.py`.
 
 The prefix test uses plain equality, never `LIKE`. A scoped path is caller data, and `_` or `%` in it would otherwise act as wildcards and pull in sibling subtrees — `/user/default/my_notes` would match `/user/default/myXnotes/…`. Underscores are common in `viking://` URIs, so this is a containment property rather than a nicety.
 
@@ -522,7 +529,9 @@ pgvector's `vector` type stores **float4**, so components are rounded on write: 
 - **A `bool`, `vector`, `sparse_vector` or `geo_point` primary key is refused** when the collection is defined. A `bool` key cannot work at all: OpenViking's own wrapper replaces a falsy id with a generated one, so `False` never reaches the database.
 - **A primary key of the wrong type is refused on write**, matching the built-in backend: `{"id": 3}` against a `string` key raises rather than storing `"3"`. An `int64` key accepts what the engine's validator accepts, so `"7"` and `True` become `7` and `1`. Reads are lenient, again matching: the engine keys rows on a hash of `str(key)`, so `fetch_data([3])` finds the record stored under `"3"` — and `[7.0]` finds nothing on an `int64` key, because `"7.0"` is not `"7"`. A key no stored row can equal is reported as not found rather than raising.
 - **`search_by_keywords` takes at most 16384 distinct terms.** Each binds two parameters against PostgreSQL's limit of 65535, and planning costs roughly a millisecond per term. Repeated terms are collapsed before any of that.
-- **Server-side grep** never routes here. OpenViking's `_resolve_grep_engine` hard-codes `("volcengine", "vikingdb")`, so grep always falls back to the filesystem — even with `store_content` on. Grep is also the only OpenViking code path that calls `search_by_keywords`, so no stock deployment issues a keyword query against this backend; reaching one means calling `search_by_keywords` yourself.
+- **Server-side grep and `search_type="keywords"`** never route here. OpenViking gates both to `volcengine`, `vikingdb` and `opengauss`, so grep falls back to the filesystem — even with `store_content` on. A keyword query reaches this backend only from [ov-ext](../ov-ext/)'s keyword leg, or from code that calls `search_by_keywords` itself.
+- **`search_by_keywords` ranks with `keyword_rank`, whatever it is asked.** It accepts OpenViking's `mode="bm25"` and searches the configured `keyword_fields` regardless of `fields`, which is what the full-text index covers. `bm25_k1`, `bm25_b`, any other `mode`, and every `advance` option raise rather than being ignored.
+- **Event time decay** (`events_time_decay_protection` on `find` and `search`) is refused with `NotImplementedError: Time decay is not supported by ov_postgres`. The adapter reports its mode as `ov_postgres` rather than `pgvector`, because since 0.5.5 `pgvector` names OpenViking's own PostgreSQL backend and OpenViking treats that name specially.
 
 **`search_by_keywords` is implemented** using PostgreSQL full-text search, so lexical search needs no embedding model.
 
@@ -547,6 +556,17 @@ SELECT id FROM openviking.ov_context WHERE vector IS NULL;
 Re-index those URIs through OpenViking to give them embeddings, or delete them.
 
 ## Upgrading an existing database
+
+New fields arrive by themselves. OpenViking passes its full schema to the
+backend on every boot, and when the collection already exists this backend adds
+any field the table lacks: in one transaction it adds the column, sets the
+field's default on existing rows, moves any value already stashed in `extra`
+under that name into the column, records the field in the registry, and then
+creates the missing scalar indexes. That is how a table from before OpenViking
+0.4.18 gains `md5` and the ACL fields. Without them an ACL filter treats every
+row as unrestricted. Columns are only ever added, never dropped or retyped, and
+a stashed value that does not fit the new column stays in `extra` with a
+warning. The server log records each field added.
 
 Two repairs apply after upgrading this package. Both are idempotent, and both
 run from the same adapter:
