@@ -566,7 +566,10 @@ creates the missing scalar indexes. That is how a table from before OpenViking
 0.4.18 gains `md5` and the ACL fields. Without them an ACL filter treats every
 row as unrestricted. Columns are only ever added, never dropped or retyped, and
 a stashed value that does not fit the new column stays in `extra` with a
-warning. The server log records each field added.
+warning. The server log records each field added. A server that loaded the old
+schema before another one reconciled picks up the new one on its own boot, but
+an older ov-postgres still running during a rolling upgrade keeps writing the
+new fields to `extra`, so stop old servers before starting new ones.
 
 Two repairs apply after upgrading this package. Both are idempotent, and both
 run from the same adapter:

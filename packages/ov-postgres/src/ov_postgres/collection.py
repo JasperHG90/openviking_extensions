@@ -2511,7 +2511,15 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                     }
                 )
                 if not added and not indexed:
-                    return None
+                    # Another server may have reconciled after this one loaded
+                    # the registry, so the table is current while this
+                    # process's view is not. Writing through a stale view would
+                    # send the new fields to `extra` and leave their columns
+                    # NULL, which an ACL filter reads as unrestricted.
+                    stale = any(
+                        self._schema.by_name(spec.name) is None for spec in current.fields
+                    ) or not set(current.scalar_index) <= set(self._schema.scalar_index)
+                    return stored if stale else None
 
                 for spec in added:
                     self._add_column(cur, spec)

@@ -215,8 +215,42 @@ def test_acl_filter_hides_a_restricted_resource(
         adapter.upsert(resource("open"))
         tenant = VikingVectorIndexBackend._tenant_filter(None, BOB, acl_enabled=True)
         seen = {
-            r["uri"] for r in adapter.query(filter=tenant, limit=10, output_fields=["uri"])
+            r["uri"]
+            for r in adapter.query(filter=tenant, limit=10, output_fields=["uri"])
         }
         assert seen == {"viking://resources/team/open.md"}
     finally:
         adapter.close()
+
+
+def test_a_server_that_loaded_before_another_reconciled_sees_the_new_fields(
+    dsn: str, test_schema: str
+) -> None:
+    """Two servers boot together; the one that did not reconcile still catches up.
+
+    B loads the old schema, A reconciles, then B's own reconcile finds the
+    table current. B must rebuild its view anyway, or its writes put the ACL
+    fields in ``extra`` and a restricted resource becomes visible to everyone.
+    """
+    first = make_adapter(dsn, test_schema)
+    create(first, OLD)
+    first.close()
+
+    late = make_adapter(dsn, test_schema)
+    try:
+        assert late.collection_exists()
+        reopen(dsn, test_schema, NEW).close()
+        assert create(late, NEW) is False
+
+        grants = acl_grant_tokens(["user:alice"], AclAction.READ)
+        late.upsert(
+            resource("secret", acl_mode="restricted", acl_direct_grants=grants[:1])
+        )
+        late.upsert(resource("open"))
+        tenant = VikingVectorIndexBackend._tenant_filter(None, BOB, acl_enabled=True)
+        seen = {
+            r["uri"] for r in late.query(filter=tenant, limit=10, output_fields=["uri"])
+        }
+        assert seen == {"viking://resources/team/open.md"}
+    finally:
+        late.close()
