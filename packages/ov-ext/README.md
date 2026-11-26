@@ -282,12 +282,14 @@ Two settings address that:
 A reranker charges by the document — it scores a few query-document pairs per
 pass through the model — so what a search spends is very nearly how many
 documents it sends. The cap sends the strongest candidates by vector score, in
-the batch's own order. The rest keep their vector scores, marked as not
-reranked, which is how OpenViking treats a document its model skipped: they
-stay in the running, and the rerank threshold leaves them alone. The honest
-caveat is that the result then mixes two scales, and a strong vector score can
-outrank a weak rerank score. Upstream already mixes them for documents it
-skips, so this widens an existing looseness rather than introducing one.
+the batch's own order. The rest stay in the running, marked as not reranked,
+but always rank **below every reranked document**. OpenViking sorts the whole
+list by score, and left on their cosines the weakest candidates could outrank
+documents the model judged, since a cosine and a rerank score share a range and
+nothing else. So their scores are replaced with values between zero and the
+lowest rerank score, in their own vector order. They stay above OpenViking's
+default threshold of zero, and the rerank threshold leaves them alone. A
+document the model was sent but returned no score for is ranked the same way.
 
 Blanks are dropped **before** the cap applies. OpenViking never sends a blank
 abstract, so capping first could fill the whole allowance with documents the
@@ -301,6 +303,12 @@ Nothing here reranks a second time. Up to 0.7, ov-ext ran a final rerank after
 fusion, because the per-directory descent never scored the pool as a whole.
 The native pass now does, and a second pass over the same abstracts would
 mostly restore the order fusion had just changed.
+
+OpenViking can rerank a second time itself. With `retrieval.apply_rerank_to_context`
+set in `ov.conf` (off by default), `search(mode="context")` reranks the merged
+candidates again before allocating them. That pass runs after this package has
+finished, so it undoes the keyword fusion and the diversity pass for context
+mode. Leave it off if you want them.
 
 Two details of the pooling worth knowing:
 

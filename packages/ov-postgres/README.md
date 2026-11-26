@@ -4,7 +4,14 @@ Store OpenViking's vectors in PostgreSQL instead of on the local disk — withou
 
 ## Why this exists
 
-OpenViking ships five vector backends — `local`, `cuvs`, `http`, `volcengine`, and `vikingdb` — and none of them is PostgreSQL. If you already run Postgres, your agent's memory ends up somewhere else: a separate index on one machine's disk, with its own backup story, its own failure modes, and no way to query it alongside your relational data.
+If you already run Postgres, you want your agent's memory there rather than in a separate index on one machine's disk, with its own backup story, its own failure modes, and no way to query it alongside your relational data.
+
+Since 0.5.5 OpenViking ships a `pgvector` backend of its own (alongside `opengauss`, which needs openGauss rather than PostgreSQL). It stores vectors in Postgres too, but it has no keyword search: it drops the schema's full-text index, because PostgreSQL has no BM25 access method, and its `search_by_keywords` then refuses. `ov_postgres` adds what the native backend lacks:
+
+- **Keyword search over PostgreSQL full-text search**, which is what [ov-ext](../ov-ext/)'s hybrid keyword leg runs on.
+- **`pairwise_similarity`**, computed in the database, which ov-ext's diversity pass uses so embeddings never leave Postgres.
+- **A schema reconcile at boot**, so a table created by an older OpenViking gains new fields such as the ACL columns.
+- **Filter semantics checked against OpenViking's own engine** (see [Testing](#testing)), and the configuration surface below: ANN method, iterative scan, schema and table prefix, managed-database support.
 
 `ov_postgres` puts those vectors in Postgres. It installs as an ordinary package and plugs into OpenViking's documented extension point: the adapter factory imports any backend string containing a dot as a Python class path. **Nothing inside OpenViking changes**, so the integration survives upgrades that a patch or a fork would not.
 
@@ -14,7 +21,7 @@ OpenViking ships five vector backends — `local`, `cuvs`, `http`, `volcengine`,
 - **Every field becomes a real typed column**, so filters compile to ordinary SQL over ordinary indexes — and you can inspect your agent's memory with `psql`.
 - **Exact search by default.** Switch to HNSW or IVFFlat when volume demands it, with version-gated iterative scan so a selective filter never silently returns a short page.
 - **Lexical keyword search** over your text columns, via PostgreSQL full-text search — no embedding model needed.
-- **Filter behaviour is checked against OpenViking's own filter evaluator** by 1,665 differential cases in the integration suite, covering every filterable field type.
+- **Filter behaviour is checked against OpenViking's own native engine** by 1,145 differential cases in the integration suite, and pinned to OpenViking 0.4's evaluator for the few filters that engine cannot parse.
 - **Runs on managed PostgreSQL** where your role cannot `CREATE EXTENSION`.
 
 ## Quick start
@@ -566,7 +573,17 @@ creates the missing scalar indexes. That is how a table from before OpenViking
 0.4.18 gains `md5` and the ACL fields. Without them an ACL filter treats every
 row as unrestricted. Columns are only ever added, never dropped or retyped, and
 a stashed value that does not fit the new column stays in `extra` with a
-warning. The server log records each field added. A server that loaded the old
+warning — except for an ACL field, where a value that cannot be moved fails the
+reconcile rather than leave the row unrestricted. The server log records each
+field added.
+
+The reconcile runs as one transaction holding an `ACCESS EXCLUSIVE` lock on the
+table, and builds its indexes without `CONCURRENTLY`, so every query on the
+table waits until it finishes. It gives up after waiting 10 seconds for a lock.
+A failed reconcile does not stop OpenViking from starting — OpenViking catches
+the error — so the adapter fails closed instead: every query and write raises,
+naming the cause, and each one retries the reconcile until it succeeds.
+Without the new fields an ACL filter would let restricted rows through. A server that loaded the old
 schema before another one reconciled picks up the new one on its own boot, but
 an older ov-postgres still running during a rolling upgrade keeps writing the
 new fields to `extra`, so stop old servers before starting new ones.
@@ -657,9 +674,11 @@ uv run --directory packages/ov-postgres pytest -m integration
 
 Point it at a server you already have with `OV_POSTGRES_TEST_DSN` instead. Each test runs in a throwaway schema that is dropped afterwards.
 
-The suite's centrepiece is `test_filter_semantics_match_reference` — part of the **integration** suite, so the default run alone does not exercise it. Across two schemas it generates random records and **1,665 filter expressions**, evaluates each one both in PostgreSQL and in Python via OpenViking's own `matches_filter`, and asserts the two agree on every row. The reference is `matches_filter` in `cuvs_index.py` -- OpenViking's pure-Python filter evaluator, and the clearest statement of what the DSL means. The `local` backend evaluates the same DSL in a compiled engine, so agreement there is strongly implied but not directly proven.
+The suite's centrepiece is `test_filter_semantics_match_reference` — part of the **integration** suite, so the default run alone does not exercise it. Across two schemas it generates random records and **1,145 filter expressions**, evaluates each one both in PostgreSQL and in OpenViking's own `local` backend, and asserts the two agree on every row. OpenViking 0.4 shipped a pure-Python evaluator (`matches_filter`) that the suite used to compare against; 0.5 removed it, so the reference is now the compiled engine every built-in backend uses.
 
-Between them the two schemas cover every filterable field type: `string`, `text`, `path`, `int64`, `float32`, `bool`, `list<string>` and `list<int64>`. The three that are absent cannot be compared -- the reference evaluator refuses `date_time` and `geo_point` outright, and `sparse_vector` is not filterable.
+That engine drops a filter it cannot parse and returns every row. `tests/reference.py` detects that, so only filters the engine really evaluates are compared. The ones it cannot evaluate — a `None` operand, an empty operand list, a `{"filter": ...}` wrapper, equality on `float32` — are listed in `tests/test_integration.py` and pinned to OpenViking 0.4's answer. Three filters the engine evaluates differently from 0.4 are pinned there too, each with its reason; OpenViking never builds any of them.
+
+Between them the two schemas cover every filterable field type: `string`, `text`, `path`, `int64`, `float32`, `bool`, `list<string>` and `list<int64>`.
 
 ## Contributing
 
