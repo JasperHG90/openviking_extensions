@@ -580,10 +580,16 @@ field added.
 The reconcile runs as one transaction holding an `ACCESS EXCLUSIVE` lock on the
 table, and builds its indexes without `CONCURRENTLY`, so every query on the
 table waits until it finishes. It gives up after waiting 10 seconds for a lock.
-A failed reconcile does not stop OpenViking from starting — OpenViking catches
-the error — so the adapter fails closed instead: every query and write raises,
-naming the cause, and each one retries the reconcile until it succeeds.
-Without the new fields an ACL filter would let restricted rows through. A server that loaded the old
+
+A failed reconcile stops the server starting. OpenViking catches the error from
+`create_collection`, but reads the collection's metadata straight afterwards,
+and the adapter refuses that read: it fails closed, because without the new
+fields an ACL filter would let restricted rows through. So a reconcile that
+loses a lock wait behind another server's — or lacks the privilege to alter the
+table — is a failed boot, and a restart tries again. In a process already
+serving, every query and write raises naming the cause, and the reconcile is
+retried at most once every 5 seconds until it succeeds; requests in between are
+refused at once rather than queued. A server that loaded the old
 schema before another one reconciled picks up the new one on its own boot, but
 an older ov-postgres still running during a rolling upgrade keeps writing the
 new fields to `extra`, so stop old servers before starting new ones.

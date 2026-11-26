@@ -20,6 +20,7 @@ import json
 import logging
 import re
 import threading
+import time
 from collections.abc import Sequence
 from typing import Any
 
@@ -90,6 +91,12 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
     # it. Kept so this backend's own methods stay reachable.
     _pg_collection: PgVectorCollection | None
 
+    # Least time between two attempts at a failed schema reconcile. In between,
+    # requests are refused at once instead of each waiting out a fresh attempt
+    # -- which can take the reconcile's whole lock timeout -- under the
+    # adapter's lock.
+    _RECONCILE_RETRY_SECONDS: float = 5.0
+
     # PostgreSQL has no per-statement row cap; batching uses executemany.
     _DATA_BATCH_SIZE: int | None = None
 
@@ -149,6 +156,7 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
         # The schema of a reconcile that failed, kept for the retry in
         # `get_collection`; see `_reconcile`.
         self._pending_reconcile: dict[str, Any] | None = None
+        self._last_reconcile_attempt = 0.0
 
     @classmethod
     def from_config(cls, config: VectorDBConfigLike) -> PgVectorCollectionAdapter:
@@ -434,11 +442,17 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
     def _reconcile(self, schema: dict[str, Any]) -> None:
         """Reconcile the table against ``schema``, failing closed on any error.
 
-        OpenViking's own ``create_collection`` catches every exception, logs it
-        and lets the server start. A table left without the ACL columns reads
-        every row as unrestricted, so a failure is remembered here instead, and
+        OpenViking's own ``create_collection`` catches every exception and
+        logs it. A table left without the ACL columns reads every row as
+        unrestricted, so a failure is remembered here instead, and
         :meth:`get_collection` -- the way every query and write reaches the
         table -- refuses to serve until a retry succeeds.
+
+        The reconcile counts as done only once this process's view of the
+        table has been rebuilt from the new schema. Rebuilding queries the
+        database again after the reconcile's transaction has committed; if
+        that fails, the old view, with no ACL fields, must not serve. A retry
+        then finds the table current and the view stale, and rebuilds.
 
         Parameters
         ----------
@@ -456,8 +470,16 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
                 return
             try:
                 reconciled = inner.reconcile_schema(schema)
+                if reconciled is not None:
+                    # Rebuilt rather than patched: the filter compiler, the
+                    # projection and the keyword fields all derive from it.
+                    self._collection = self._build_collection(
+                        CollectionSchema.from_meta(reconciled), inner.table_name
+                    )
+                    inner.close()
             except Exception as exc:
                 self._pending_reconcile = schema
+                self._last_reconcile_attempt = time.monotonic()
                 logger.error(
                     "ov_postgres: schema reconcile of %s failed (%s: %s); the "
                     "collection refuses queries until a retry succeeds",
@@ -467,14 +489,6 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
                 )
                 raise
             self._pending_reconcile = None
-            if reconciled is None:
-                return
-            # Rebuilt rather than patched: the filter compiler, the projection
-            # and the keyword fields are all derived from the schema.
-            self._collection = self._build_collection(
-                CollectionSchema.from_meta(reconciled), inner.table_name
-            )
-            inner.close()
 
     def get_collection(self) -> Collection:
         """Return the collection, retrying a failed reconcile first.
@@ -491,10 +505,23 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
         Raises
         ------
         RuntimeError
-            If an earlier reconcile failed and the retry fails too.
+            If an earlier reconcile failed and has not since succeeded. A retry
+            is made at most once every ``_RECONCILE_RETRY_SECONDS``; in between
+            the call is refused at once.
         """
         pending = self._pending_reconcile
         if pending is not None:
+            wait = (
+                self._last_reconcile_attempt
+                + self._RECONCILE_RETRY_SECONDS
+                - time.monotonic()
+            )
+            if wait > 0:
+                raise RuntimeError(
+                    f"collection {self._collection_name!r} is not served: its schema "
+                    f"reconcile failed and is retried in {wait:.1f}s. Without the "
+                    "fields it adds, ACL filters would let restricted rows through."
+                )
             try:
                 self._reconcile(pending)
             except Exception as exc:

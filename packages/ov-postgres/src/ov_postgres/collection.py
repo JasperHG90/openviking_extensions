@@ -2551,15 +2551,24 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                     self._add_column(cur, spec)
                 moved = self._move_extra_into_columns(cur, added)
 
-                raw_by_name = {
-                    str(field.get("FieldName")): field for field in meta.get("Fields", [])
-                }
-                stored["Fields"] = [
-                    *stored.get("Fields", []),
-                    *(raw_by_name[spec.name] for spec in added),
-                ]
-                stored["ScalarIndex"] = [*stored.get("ScalarIndex", []), *indexed]
-                cur.execute(
+            raw_by_name = {
+                str(field.get("FieldName")): field for field in meta.get("Fields", [])
+            }
+            stored["Fields"] = [
+                *stored.get("Fields", []),
+                *(raw_by_name[spec.name] for spec in added),
+            ]
+            stored["ScalarIndex"] = [*stored.get("ScalarIndex", []), *indexed]
+            with conn.cursor() as plain:
+                built = self._create_new_indexes(
+                    plain, before=current, after=CollectionSchema.from_meta(stored)
+                )
+                # The registry is written last. Readers see none of this until
+                # the commit either way; going last means no row lock taken
+                # here can serialise two reconciles in place of the advisory
+                # lock, so tests/test_schema_reconcile.py can tell whether that
+                # lock is doing its job.
+                plain.execute(
                     sql.SQL("UPDATE {} SET meta = %s WHERE name = %s").format(
                         self._registry(ddl.REGISTRY_COLLECTIONS)
                     ),
@@ -2567,17 +2576,13 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 )
                 # The index bundle keeps its own scalar-index list, as the
                 # local backend's does; extend it the same way.
-                cur.execute(
+                plain.execute(
                     sql.SQL(
                         "UPDATE {} SET meta = jsonb_set(meta, '{{ScalarIndex}}', "
                         "coalesce(meta->'ScalarIndex', '[]'::jsonb) || %s::jsonb) "
                         "WHERE collection = %s"
                     ).format(self._registry(ddl.REGISTRY_INDEXES)),
                     (json.dumps(indexed), self._name),
-                )
-            with conn.cursor() as plain:
-                built = self._create_new_indexes(
-                    plain, before=current, after=CollectionSchema.from_meta(stored)
                 )
         annotate(
             {

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -227,7 +228,9 @@ def test_a_failed_reconcile_fails_closed_until_one_succeeds(
     def denied(self: object, cur: object, spec: object) -> None:
         raise psycopg.errors.InsufficientPrivilege("must be owner of table ov_context")
 
+    original = PgVectorCollection._add_column
     monkeypatch.setattr(PgVectorCollection, "_add_column", denied)
+    monkeypatch.setattr(PgVectorCollectionAdapter, "_RECONCILE_RETRY_SECONDS", 0.0)
     backend = VikingVectorIndexBackend(
         VectorDBBackendConfig(
             backend="ov_postgres.adapter.PgVectorCollectionAdapter",
@@ -248,7 +251,7 @@ def test_a_failed_reconcile_fails_closed_until_one_succeeds(
             with pytest.raises(RuntimeError, match="reconcile"):
                 adapter.upsert(resource("late"))
 
-            monkeypatch.undo()
+            monkeypatch.setattr(PgVectorCollection, "_add_column", original)
             assert visible_to_bob(adapter) == {"open"}
         finally:
             await backend.close()
@@ -281,11 +284,38 @@ def test_an_acl_value_that_cannot_be_moved_fails_the_reconcile(
         adapter.close()
 
 
-def test_two_servers_reconciling_at_once_both_end_current(
-    dsn: str, test_schema: str
+def test_two_servers_reconciling_at_once_serialise_on_the_lock(
+    dsn: str, test_schema: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Concurrent boots serialise on the advisory lock; neither fails or leaks."""
-    restricted_and_open_on_an_old_table(dsn, test_schema)
+    """Concurrent boots take turns; unserialised, they race to build one index.
+
+    The table already has every column and lacks only the ACL scalar indexes,
+    so neither reconcile takes the ``ACCESS EXCLUSIVE`` lock an ``ALTER TABLE``
+    would. Both are held at the index step together for up to two seconds: with
+    the advisory lock the second never gets there until the first commits, and
+    without it both see the indexes missing and both build them, and
+    PostgreSQL refuses the second ``CREATE INDEX``.
+    """
+    indexes_only = copy.deepcopy(NEW)
+    indexes_only["ScalarIndex"] = [
+        f for f in NEW["ScalarIndex"] if f not in ACL_CONTEXT_FIELDS
+    ]
+    first = make_adapter(dsn, test_schema)
+    create(first, indexes_only)
+    first.close()
+
+    together = threading.Barrier(2)
+    build = PgVectorCollection._create_new_indexes
+
+    def held_at_the_index_step(self: Any, cur: Any, **schemas: Any) -> list[str]:
+        try:
+            together.wait(timeout=2)
+        except threading.BrokenBarrierError:
+            pass
+        built: list[str] = build(self, cur, **schemas)
+        return built
+
+    monkeypatch.setattr(PgVectorCollection, "_create_new_indexes", held_at_the_index_step)
     adapters = [make_adapter(dsn, test_schema) for _ in range(2)]
     try:
         for adapter in adapters:
@@ -293,11 +323,124 @@ def test_two_servers_reconciling_at_once_both_end_current(
         with ThreadPoolExecutor(max_workers=2) as pool:
             results = list(pool.map(lambda a: create(a, NEW), adapters))
         assert results == [False, False]
-        for adapter in adapters:
-            assert visible_to_bob(adapter) == {"open"}
+        meta = adapters[0].get_collection().get_meta_data()
+        names = [f["FieldName"] for f in meta["Fields"]]
+        assert len(names) == len(set(names))
+        assert len(meta["ScalarIndex"]) == len(set(meta["ScalarIndex"]))
+        assert ACL_CONTEXT_FIELDS <= set(meta["ScalarIndex"])
     finally:
         for adapter in adapters:
             adapter.close()
+
+
+def test_a_rebuild_that_fails_after_the_commit_still_fails_closed(
+    dsn: str, test_schema: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The view must be rebuilt before the reconcile counts as done.
+
+    The reconcile's transaction commits, then rebuilding the adapter's view
+    queries the database again. If that query fails, the old view -- with no
+    ACL fields -- must not go on serving as though nothing were pending.
+    """
+    restricted_and_open_on_an_old_table(dsn, test_schema)
+    monkeypatch.setattr(PgVectorCollectionAdapter, "_RECONCILE_RETRY_SECONDS", 0.0)
+    adapter = make_adapter(dsn, test_schema)
+    try:
+        assert adapter.collection_exists()
+        lookup = PgVectorCollectionAdapter._stored_index_distance
+        failures = iter([psycopg.OperationalError("connection dropped")])
+
+        def flaky(self: PgVectorCollectionAdapter) -> str | None:
+            failure = next(failures, None)
+            if failure is not None:
+                raise failure
+            return lookup(self)
+
+        monkeypatch.setattr(PgVectorCollectionAdapter, "_stored_index_distance", flaky)
+        with pytest.raises(psycopg.OperationalError):
+            create(adapter, NEW)
+        assert visible_to_bob(adapter) == {"open"}, "the retry must rebuild the view"
+    finally:
+        adapter.close()
+
+
+def test_a_pending_reconcile_is_retried_at_most_once_per_interval(
+    dsn: str, test_schema: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Between retries, requests are refused at once rather than queued.
+
+    Each attempt can wait out the lock timeout under the adapter's lock, so
+    retrying on every request would stall them all behind one another.
+    """
+    restricted_and_open_on_an_old_table(dsn, test_schema)
+    attempts: list[int] = []
+    reconcile = PgVectorCollection.reconcile_schema
+
+    def counted(self: PgVectorCollection, meta: dict[str, Any]) -> Any:
+        attempts.append(1)
+        return reconcile(self, meta)
+
+    def denied(self: object, cur: object, spec: object) -> None:
+        raise psycopg.errors.InsufficientPrivilege("must be owner of table ov_context")
+
+    monkeypatch.setattr(PgVectorCollection, "reconcile_schema", counted)
+    monkeypatch.setattr(PgVectorCollection, "_add_column", denied)
+    monkeypatch.setattr(PgVectorCollectionAdapter, "_RECONCILE_RETRY_SECONDS", 3600.0)
+    adapter = make_adapter(dsn, test_schema)
+    try:
+        assert adapter.collection_exists()
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            create(adapter, NEW)
+        for _ in range(3):
+            with pytest.raises(RuntimeError, match="reconcile"):
+                adapter.query(limit=10)
+        assert len(attempts) == 1, "no retry before the interval has passed"
+
+        monkeypatch.setattr(PgVectorCollectionAdapter, "_RECONCILE_RETRY_SECONDS", 0.0)
+        with pytest.raises(RuntimeError, match="reconcile"):
+            adapter.query(limit=10)
+        assert len(attempts) == 2, "a retry once the interval has passed"
+    finally:
+        adapter.close()
+
+
+def test_a_failed_reconcile_stops_openviking_from_booting(
+    dsn: str, test_schema: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OpenViking's own boot path reads the collection meta right after creating it.
+
+    ``init_context_collection`` calls ``create_collection``, which swallows
+    the error, and then ``get_collection_meta``, which does not -- so a
+    reconcile that fails at boot stops the server starting.
+    """
+    from openviking.storage.collection_schemas import init_context_collection
+    from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
+
+    restricted_and_open_on_an_old_table(dsn, test_schema)
+
+    def denied(self: object, cur: object, spec: object) -> None:
+        raise psycopg.errors.InsufficientPrivilege("must be owner of table ov_context")
+
+    monkeypatch.setattr(PgVectorCollection, "_add_column", denied)
+    backend = VikingVectorIndexBackend(
+        VectorDBBackendConfig(
+            backend="ov_postgres.adapter.PgVectorCollectionAdapter",
+            name="context",
+            index_name="default",
+            dimension=DIM,
+            distance_metric="cosine",
+            custom_params={"dsn": dsn, "schema": test_schema},
+        )
+    )
+
+    async def boot() -> None:
+        try:
+            with pytest.raises(RuntimeError, match="reconcile"):
+                await init_context_collection(backend)
+        finally:
+            await backend.close()
+
+    asyncio.run(boot())
 
 
 @pytest.mark.parametrize("meta", [OLD, NEW], ids=["table-from-0.4", "fresh-table"])
