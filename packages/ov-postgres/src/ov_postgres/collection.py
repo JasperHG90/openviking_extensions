@@ -11,6 +11,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Literal, overload
 
 from opentelemetry.util.types import AttributeValue
+from openviking.storage.acl import ACL_CONTEXT_FIELDS
 from openviking.storage.vectordb.collection.collection import ICollection
 from openviking.storage.vectordb.collection.result import (
     AggregateResult,
@@ -31,16 +32,29 @@ from . import ddl
 from .filters import FilterCompiler, parse_datetime_to_epoch_ms
 from .observability import DB_SYSTEM, annotate, traced
 from .schema import (
+    CHECKED_TYPES,
     GEO_LAT_SUFFIX,
     GEO_LON_SUFFIX,
     CollectionSchema,
     FieldSpec,
     default_for,
+    fits,
     fulltext_candidates,
 )
 
 # Rows read per page while moving values out of `extra` during a reconcile.
 _EXTRA_MOVE_PAGE = 1000
+
+# How long a reconcile waits for a lock before giving up. It runs as one
+# transaction holding ACCESS EXCLUSIVE on the table, so while it waits every
+# other query on the table queues behind it. A failed reconcile is retried on
+# the next use of the collection, which refuses queries until then.
+_RECONCILE_LOCK_TIMEOUT = "10s"
+
+# Fields whose value decides who may read a row. A stashed value that cannot be
+# moved into its column must fail the reconcile: leaving it in `extra` would
+# give the row the column default, `none`, which means unrestricted.
+_FAIL_CLOSED_FIELDS = frozenset(ACL_CONTEXT_FIELDS)
 
 # What psycopg's execute()/executemany() actually accept.
 Statement = sql.SQL | sql.Composed
@@ -1885,6 +1899,13 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         # The primary key breaks ties. Without it a page boundary that lands
         # inside a run of equal sort values returns rows twice and skips others
         # entirely, because PostgreSQL may order the run differently per query.
+        #
+        # NULLS LAST in both directions. OpenViking's inventory scan walks
+        # `updated_at` ascending and probes for a NULL tail only on its native
+        # pgvector backend; its local engine leaves NULL rows out of ordered
+        # queries altogether, so last is no worse. Every Context OpenViking
+        # writes defaults `updated_at` to its creation time, so NULLs come only
+        # from writes that bypass it.
         statement = sql.SQL(
             "SELECT {cols} FROM {table} WHERE {pred} "
             "ORDER BY {sort} {dir} NULLS LAST, {pk} LIMIT %s OFFSET %s"
@@ -2474,6 +2495,11 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         with self._lock, self._pool.connection() as conn, conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
+                    sql.SQL("SET LOCAL lock_timeout = {}").format(
+                        sql.Literal(_RECONCILE_LOCK_TIMEOUT)
+                    )
+                )
+                cur.execute(
                     "SELECT pg_advisory_xact_lock(%s)",
                     (ddl.advisory_lock_key(self._db_schema),),
                 )
@@ -2674,9 +2700,20 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 for name in keys:
                     if name not in extra:
                         continue
+                    spec = movable[name]
                     try:
-                        values.append(self._adapt_value(movable[name], extra[name]))
-                    except (TypeError, ValueError, OverflowError):
+                        if spec.ov_type in CHECKED_TYPES and not fits(spec, extra[name]):
+                            raise TypeError(f"{extra[name]!r} is not a {spec.ov_type}")
+                        values.append(self._adapt_value(spec, extra[name]))
+                    except (TypeError, ValueError, OverflowError) as exc:
+                        if name in _FAIL_CLOSED_FIELDS:
+                            raise ValueError(
+                                f"cannot move {name!r} out of extra for row "
+                                f"{row['pk']!r} of {self._db_schema}.{self._table}: "
+                                f"{exc}. Fix or remove that value; until then the "
+                                "collection refuses queries rather than read the "
+                                "row as unrestricted."
+                            ) from exc
                         logger.warning(
                             "ov_postgres: left %r in extra for row %r of %s.%s; "
                             "the value does not fit the new %s column",

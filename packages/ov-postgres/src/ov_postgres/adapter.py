@@ -146,6 +146,9 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
         self._bootstrapped = False
         self._pgvector_version: tuple[int, ...] = ()
         self._lock = threading.RLock()
+        # The schema of a reconcile that failed, kept for the retry in
+        # `get_collection`; see `_reconcile`.
+        self._pending_reconcile: dict[str, Any] | None = None
 
     @classmethod
     def from_config(cls, config: VectorDBConfigLike) -> PgVectorCollectionAdapter:
@@ -424,20 +427,84 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
                 index_name=index_name,
             )
             return created
-        inner = self._pg_collection
-        if inner is None:
-            return False
-        reconciled = inner.reconcile_schema(dict(schema))
-        if reconciled is None:
-            return False
+        self._reconcile(dict(schema))
+        return False
+
+    @traced("ov_postgres.reconcile")
+    def _reconcile(self, schema: dict[str, Any]) -> None:
+        """Reconcile the table against ``schema``, failing closed on any error.
+
+        OpenViking's own ``create_collection`` catches every exception, logs it
+        and lets the server start. A table left without the ACL columns reads
+        every row as unrestricted, so a failure is remembered here instead, and
+        :meth:`get_collection` -- the way every query and write reaches the
+        table -- refuses to serve until a retry succeeds.
+
+        Parameters
+        ----------
+        schema :
+            The collection schema OpenViking passed to ``create_collection``.
+
+        Raises
+        ------
+        Exception
+            Whatever the reconcile raised, after recording it.
+        """
         with self._lock:
+            inner = self._pg_collection
+            if inner is None:
+                return
+            try:
+                reconciled = inner.reconcile_schema(schema)
+            except Exception as exc:
+                self._pending_reconcile = schema
+                logger.error(
+                    "ov_postgres: schema reconcile of %s failed (%s: %s); the "
+                    "collection refuses queries until a retry succeeds",
+                    self._collection_name,
+                    type(exc).__name__,
+                    exc,
+                )
+                raise
+            self._pending_reconcile = None
+            if reconciled is None:
+                return
             # Rebuilt rather than patched: the filter compiler, the projection
             # and the keyword fields are all derived from the schema.
             self._collection = self._build_collection(
                 CollectionSchema.from_meta(reconciled), inner.table_name
             )
             inner.close()
-        return False
+
+    def get_collection(self) -> Collection:
+        """Return the collection, retrying a failed reconcile first.
+
+        Every query and write in OpenViking's ``CollectionAdapter`` goes
+        through here, so this is where a table the reconcile could not bring up
+        to date is kept from serving.
+
+        Returns
+        -------
+        Collection
+            The collection handle.
+
+        Raises
+        ------
+        RuntimeError
+            If an earlier reconcile failed and the retry fails too.
+        """
+        pending = self._pending_reconcile
+        if pending is not None:
+            try:
+                self._reconcile(pending)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"collection {self._collection_name!r} is not served: its schema "
+                    f"reconcile failed ({type(exc).__name__}: {exc}). Without the "
+                    "fields it adds, ACL filters would let restricted rows through."
+                ) from exc
+        collection: Collection = super().get_collection()
+        return collection
 
     def _table_exists(self, table_name: str) -> bool:
         """Return whether the named table is present in the configured schema."""
@@ -501,6 +568,9 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
             has no open collection, so a caller can treat "cannot" and
             "nothing similar" alike and skip the diversity pass.
         """
+        if self._pending_reconcile is not None:
+            # Retried, and if it fails again refused, like every other read.
+            self.get_collection()
         inner = self._pg_collection
         if inner is None:
             return {}

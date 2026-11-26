@@ -8,7 +8,9 @@ collection. It migrates an existing collection only for its ``local`` and
 
 from __future__ import annotations
 
+import asyncio
 import copy
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import psycopg
@@ -24,6 +26,7 @@ from openviking.storage.collection_schemas import CollectionSchemas
 from openviking.storage.viking_vector_index_backend import VikingVectorIndexBackend
 
 from ov_postgres.adapter import PgVectorCollectionAdapter
+from ov_postgres.collection import PgVectorCollection
 
 from .test_integration import DIM, make_adapter, vec
 
@@ -164,27 +167,137 @@ def test_a_field_the_schema_drops_keeps_its_column(dsn: str, test_schema: str) -
     assert NEW_FIELDS <= columns(dsn, test_schema)
 
 
+@pytest.mark.parametrize("value", [{"not": "a string"}, 7])
 def test_a_value_the_column_cannot_hold_stays_in_extra(
-    dsn: str, test_schema: str
+    dsn: str, test_schema: str, value: object
 ) -> None:
-    """A stashed value of the wrong type is kept rather than failing the boot."""
+    """A stashed non-ACL value of the wrong type is kept rather than failing the boot.
+
+    ``md5`` only speeds up the incremental diff, so a value that does not fit
+    costs nothing to leave where it is. The column takes its default.
+    """
     old = make_adapter(dsn, test_schema)
     create(old, OLD)
-    old.upsert(resource("odd", acl_direct_grants={"not": "a list"}))
+    old.upsert(resource("odd", md5=value))
     old.close()
 
     adapter = reopen(dsn, test_schema, NEW)
     try:
-        record = adapter.get(["odd"])[0]
-        assert record["acl_direct_grants"] == [EMPTY_ACL_GRANT]
+        assert adapter.get(["odd"])[0]["md5"] == ""
         with psycopg.connect(dsn) as conn:
             extra = conn.execute(
                 f'SELECT extra FROM "{test_schema}".ov_context WHERE id = %s',
                 ("odd",),
             ).fetchone()
-        assert extra is not None and extra[0]["acl_direct_grants"] == {"not": "a list"}
+        assert extra is not None and extra[0]["md5"] == value
     finally:
         adapter.close()
+
+
+def restricted_and_open_on_an_old_table(dsn: str, schema: str) -> None:
+    """Write a restricted and an open resource while the table lacks ACL columns."""
+    old = make_adapter(dsn, schema)
+    create(old, OLD)
+    grants = acl_grant_tokens(["user:alice"], AclAction.READ)
+    old.upsert(resource("secret", acl_mode="restricted", acl_direct_grants=grants[:1]))
+    old.upsert(resource("open"))
+    old.close()
+
+
+def visible_to_bob(adapter: PgVectorCollectionAdapter) -> set[str]:
+    """Return the ids an ACL-scoped query shows a user with no grants."""
+    tenant = VikingVectorIndexBackend._tenant_filter(None, BOB, acl_enabled=True)
+    return {r["id"] for r in adapter.query(filter=tenant, limit=10, output_fields=["id"])}
+
+
+def test_a_failed_reconcile_fails_closed_until_one_succeeds(
+    dsn: str, test_schema: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reconcile that fails must not leave the server serving an ACL-less table.
+
+    OpenViking's ``create_collection`` catches the error, logs it and boots
+    anyway. Without the ACL columns every row reads as unrestricted, so the
+    adapter refuses every query until a reconcile succeeds -- here, the retry
+    the first query after the cause clears makes.
+    """
+    from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
+
+    restricted_and_open_on_an_old_table(dsn, test_schema)
+
+    def denied(self: object, cur: object, spec: object) -> None:
+        raise psycopg.errors.InsufficientPrivilege("must be owner of table ov_context")
+
+    monkeypatch.setattr(PgVectorCollection, "_add_column", denied)
+    backend = VikingVectorIndexBackend(
+        VectorDBBackendConfig(
+            backend="ov_postgres.adapter.PgVectorCollectionAdapter",
+            name="context",
+            index_name="default",
+            dimension=DIM,
+            distance_metric="cosine",
+            custom_params={"dsn": dsn, "schema": test_schema},
+        )
+    )
+
+    async def boot_and_query() -> None:
+        try:
+            assert await backend.create_collection("context", NEW) is False
+            adapter = backend._shared_adapter
+            with pytest.raises(RuntimeError, match="reconcile"):
+                visible_to_bob(adapter)
+            with pytest.raises(RuntimeError, match="reconcile"):
+                adapter.upsert(resource("late"))
+
+            monkeypatch.undo()
+            assert visible_to_bob(adapter) == {"open"}
+        finally:
+            await backend.close()
+
+    asyncio.run(boot_and_query())
+
+
+def test_an_acl_value_that_cannot_be_moved_fails_the_reconcile(
+    dsn: str, test_schema: str
+) -> None:
+    """A stashed ACL value that does not fit is never replaced by "unrestricted".
+
+    Leaving it in ``extra`` would give the row the column default, ``none``, and
+    show a resource someone restricted to everybody. The reconcile fails
+    instead, and the adapter refuses queries until the row is repaired.
+    """
+    old = make_adapter(dsn, test_schema)
+    create(old, OLD)
+    old.upsert(resource("odd", acl_mode=["not", "a string"]))
+    old.close()
+
+    adapter = make_adapter(dsn, test_schema)
+    try:
+        with pytest.raises(ValueError, match="acl_mode"):
+            create(adapter, NEW)
+        with pytest.raises(RuntimeError, match="reconcile"):
+            adapter.query(limit=10)
+        assert "acl_mode" not in columns(dsn, test_schema)
+    finally:
+        adapter.close()
+
+
+def test_two_servers_reconciling_at_once_both_end_current(
+    dsn: str, test_schema: str
+) -> None:
+    """Concurrent boots serialise on the advisory lock; neither fails or leaks."""
+    restricted_and_open_on_an_old_table(dsn, test_schema)
+    adapters = [make_adapter(dsn, test_schema) for _ in range(2)]
+    try:
+        for adapter in adapters:
+            assert adapter.collection_exists()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda a: create(a, NEW), adapters))
+        assert results == [False, False]
+        for adapter in adapters:
+            assert visible_to_bob(adapter) == {"open"}
+    finally:
+        for adapter in adapters:
+            adapter.close()
 
 
 @pytest.mark.parametrize("meta", [OLD, NEW], ids=["table-from-0.4", "fresh-table"])

@@ -138,3 +138,21 @@ def test_schema(dsn: str, _verify_pgvector: bool) -> Iterator[str]:
             conn.execute(
                 sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(name))
             )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _empty_openviking_config(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[None]:
+    """Point OpenViking at an empty config file for the whole session.
+
+    OpenViking 0.5's ``VikingVectorIndexBackend`` reads the global config on
+    construction, to set up its native logging. Left alone it would read the
+    developer's own ``~/.openviking/ov.conf``, or fail where there is none, as
+    on CI. An empty file gives OpenViking's defaults everywhere.
+    """
+    path = tmp_path_factory.mktemp("openviking") / "ov.conf"
+    path.write_text("{}")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("OPENVIKING_CONFIG_FILE", str(path))
+        yield

@@ -424,14 +424,24 @@ def default_for(spec: FieldSpec) -> object:
     # reinstate a NULL timestamp on every backfill pass, and a DefaultValue of
     # the wrong type reach a typed column and fail every write.
     declared = spec.declared_default
-    if declared is not None and _fits(spec, declared):
+    if declared is not None and fits(spec, declared):
         return declared
     value = TYPE_DEFAULTS.get(spec.ov_type)
     return list(value) if isinstance(value, list) else value
 
 
-def _fits(spec: FieldSpec, value: object) -> bool:
-    """Return whether a declared default is storable in the column.
+# The field types `fits` really checks.
+CHECKED_TYPES: frozenset[str] = frozenset(
+    {"string", "text", "path", "bool", "int64", "float32", "list<string>", "list<int64>"}
+)
+
+
+def fits(spec: FieldSpec, value: object) -> bool:
+    """Return whether a value is storable in the column as it stands.
+
+    Used for a declared default and for a value a reconcile moves out of
+    ``extra``. Answers False for a type it does not check (``date_time``,
+    ``geo_point``, vectors); see :data:`CHECKED_TYPES`.
 
     The engine does not validate ``DefaultValue`` -- pydantic skips defaults --
     so a mistyped one is silently accepted there and would fail every write
