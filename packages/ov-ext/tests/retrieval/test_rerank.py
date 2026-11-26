@@ -536,3 +536,23 @@ def test_nothing_moves_when_the_model_scored_nothing(
 ) -> None:
     """No model score, no second scale to separate from."""
     assert ranked(scores, reranked) == scores
+
+
+@pytest.mark.asyncio
+async def test_the_retrievers_rerank_threshold_sets_the_floor(
+    monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
+) -> None:
+    """A judged document under the rerank threshold does not pull the floor down.
+
+    OpenViking drops it, so the held-back go just under the lowest score that
+    survives -- here 2.0, not 0.1.
+    """
+    retriever, _ = make_recording_retriever(
+        monkeypatch, scores=[0.1, 2.0], rerank_max_documents=2
+    )
+    retriever.rerank_threshold = 0.5
+
+    result = await retriever._rerank_scores("q", ["a", "b", "c"], [0.9, 0.8, 0.3])
+
+    assert result.reranked == [True, True, False]
+    assert 2.0 > result.scores[2] > 0.1

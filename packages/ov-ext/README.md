@@ -291,9 +291,12 @@ lowest rerank score that survives — above zero and above the rerank threshold 
 in their own vector order. They stay above OpenViking's default threshold of
 zero, which is the one applied to them. A document the model was sent but
 returned no score for is ranked the same way. If no rerank score in the batch
-is positive, as with a reranker returning raw logits for a poor match, there is
-no room above zero, so they go below every reranked document and that threshold
-drops them.
+is above both zero and the rerank threshold — with a threshold of 0.1, scores of
+0.05 and 0.08 qualify as none — there is nothing to place them under, so they go
+below every reranked document and the zero threshold drops them. A negative
+rerank threshold is the one case where the order guarantee bends: a reranked
+document scored between that threshold and zero survives, but ranks below the
+held-back documents, which are kept above zero so that they survive too.
 
 Blanks are dropped **before** the cap applies. OpenViking never sends a blank
 abstract, so capping first could fill the whole allowance with documents the

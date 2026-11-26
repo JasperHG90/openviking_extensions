@@ -66,19 +66,24 @@ def _rank_below_the_model(
     fallback_scores: list[float],
     threshold: float = 0.0,
 ) -> None:
-    """Move every score the model did not produce below every one that survives.
+    """Move every score the model did not produce below the model scores that count.
 
     Rewrites ``scores`` in place. The floor is the lowest model score above
-    both zero and ``threshold`` -- a judged document under either is dropped
-    by OpenViking anyway, and a reranker returning raw logits puts some below
-    zero routinely. The unscored keep their order by vector score, spread
+    both zero and ``threshold`` -- a judged document under the threshold is
+    dropped by OpenViking anyway, and a reranker returning raw logits puts some
+    below zero routinely. The unscored keep their order by vector score, spread
     evenly over the open interval between zero and that floor, so they stay
     above the default threshold of zero, which is the one applied to them.
 
-    When no model score is positive there is no such interval. The unscored
-    then go below every model score, one step apart, and that threshold drops
-    them. Nothing changes when the model scored nothing, since then no scale
-    was mixed.
+    When no model score is above both zero and ``threshold`` there is no such
+    interval. The unscored then go below every model score, one step apart,
+    and the zero threshold drops them. Nothing changes when the model scored
+    nothing, since then no scale was mixed.
+
+    With a negative ``threshold`` the two aims conflict: a judged document
+    scored between the threshold and zero survives, but the unscored still go
+    above zero to survive too, so they outrank it. Keeping both would need the
+    unscored below zero, where the zero threshold drops them. This keeps them.
 
     Parameters
     ----------
