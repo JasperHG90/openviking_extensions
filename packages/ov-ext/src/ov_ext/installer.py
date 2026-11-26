@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 
+from .compat import check_openviking_version
 from .reflect.config import ReflectSettings
 from .reflect.patch import install as install_reflect_ticker
 from .reflect.patch import uninstall as uninstall_reflect_ticker
@@ -71,10 +72,12 @@ def install(
     Raises
     ------
     RuntimeError
-        If a subsystem cannot attach -- for example when OpenViking has moved
-        the class retrieval rebinds. Better a refused startup than an extension
-        that silently did nothing.
+        If the installed OpenViking is outside the range ov-ext was tested
+        against (see :mod:`ov_ext.compat`), or a subsystem cannot attach -- for
+        example when OpenViking has moved the class retrieval rebinds. Better a
+        refused startup than an extension that silently did nothing.
     """
+    check_openviking_version()
     retrieval_settings = retrieval or HybridSettings()
     reflect_settings = reflect or ReflectSettings()
 
