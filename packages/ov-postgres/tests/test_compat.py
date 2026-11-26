@@ -54,7 +54,16 @@ def test_the_range_matches_the_pyproject_requirement() -> None:
 
 
 @pytest.mark.parametrize(
-    "value", ["0.5.6", "0.5.9", "0.5.6.1", "0.5.6.post1", "0.5.6+local", "0.5.10rc1"]
+    "value",
+    [
+        "0.5.6",
+        "0.5.9",
+        "0.5.6.1",
+        "0.5.6.post1",
+        "0.5.6.post1.dev2",
+        "0.5.6+local",
+        "0.5.10rc1",
+    ],
 )
 def test_a_tested_version_starts_silently(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, value: str
@@ -74,6 +83,7 @@ def test_a_tested_version_starts_silently(
         "0.5.6rc1",
         "0.5.6.dev1",
         "0.5.6a2",
+        "0.5.6rc1.post1",
         "0.6.0",
         "0.6.0rc1",
         "1.0.0",

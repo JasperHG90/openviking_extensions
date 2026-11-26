@@ -34,9 +34,15 @@ OPENVIKING_BELOW: tuple[int, ...] = (0, 6)
 ALLOW_UNTESTED_ENV = "OV_EXT_ALLOW_UNTESTED_OPENVIKING"
 
 _RELEASE = re.compile(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?")
-# PEP 440 pre- and dev-release markers. Such a version sorts below its release,
-# so 0.5.6rc1 does not satisfy >=0.5.6, as pip agrees.
-_PRE_RELEASE = re.compile(r"(?:a|b|c|rc|alpha|beta|pre|preview|dev)\d*", re.IGNORECASE)
+# The first PEP 440 suffix marker decides where a version sorts against its
+# release: a pre- or dev-release (0.5.6rc1, 0.5.6.dev1) below it, a post-release
+# above it, even with a dev part of its own (0.5.6.post1.dev2) -- as pip agrees.
+_SUFFIX_MARKER = re.compile(
+    r"alpha|beta|preview|pre|post|rev|rc|dev|a|b|c|r", re.IGNORECASE
+)
+_BELOW_RELEASE = frozenset(
+    {"alpha", "beta", "preview", "pre", "rc", "dev", "a", "b", "c"}
+)
 _FLAG: TypeAdapter[bool] = TypeAdapter(bool)
 
 
@@ -44,14 +50,15 @@ def _release(text: str) -> tuple[int, ...] | None:
     """Return a sort key for a version string, or ``None`` if it has none.
 
     The key is ``major.minor.patch`` followed by 0 for a pre- or dev-release
-    and 1 otherwise, so ``0.5.6rc1`` sorts below ``0.5.6`` and a post or local
-    release does not.
+    and 1 otherwise, so ``0.5.6rc1`` sorts below ``0.5.6`` and a post
+    (``0.5.6.post1.dev2`` included) or local release does not.
     """
     match = _RELEASE.match(text)
     if match is None:
         return None
     rest = text[match.end() :].split("+", 1)[0]
-    final = 0 if _PRE_RELEASE.search(rest) else 1
+    marker = _SUFFIX_MARKER.search(rest)
+    final = 0 if marker and marker.group(0).lower() in _BELOW_RELEASE else 1
     return (*(int(part or 0) for part in match.groups()), final)
 
 
