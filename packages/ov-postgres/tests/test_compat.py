@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import logging
 import re
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 
 import pytest
-from importlib.metadata import PackageNotFoundError
 from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
 
 from ov_postgres import compat

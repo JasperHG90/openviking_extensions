@@ -93,6 +93,4 @@ def test_no_advance_options_are_accepted(advance: dict[str, object] | None) -> N
 def test_advance_options_are_refused_by_name() -> None:
     """An engine-side option this backend lacks fails rather than being ignored."""
     with pytest.raises(NotImplementedError, match="post_process_ops, time_decay"):
-        _refuse_advance(
-            "search_by_vector", {"time_decay": {}, "post_process_ops": []}
-        )
+        _refuse_advance("search_by_vector", {"time_decay": {}, "post_process_ops": []})

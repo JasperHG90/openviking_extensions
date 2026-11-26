@@ -551,7 +551,8 @@ def _candidate_leaves() -> list[dict[str, Any]]:
 # Leaves the native engine does not evaluate (see `LocalReference.evaluates`).
 # Listed rather than discovered, so the day the engine starts parsing one of
 # them the sweep fails and somebody decides what it should mean here. Until
-# then each is pinned by a test of its own in this file.
+# then each is pinned, alone and inside an and/or, by
+# `test_filters_the_engine_does_not_evaluate_keep_their_answers`.
 _UNEVALUATED_LEAVES: list[dict[str, Any]] = [
     {"op": "must", "field": "name", "conds": [None]},
     {"op": "must_not", "field": "name", "conds": [None]},
@@ -958,7 +959,8 @@ def _wide_candidate_leaves() -> list[dict[str, Any]]:
 
 
 # As `_UNEVALUATED_LEAVES`, for the wide schema: the engine evaluates no
-# equality test on a float32 field, and no `None` operand at all.
+# equality test on a float32 field, and no `None` operand at all. The same
+# shapes are pinned by `test_filters_the_engine_does_not_evaluate_keep_their_answers`.
 _WIDE_UNEVALUATED_LEAVES: list[dict[str, Any]] = [
     {"op": "must", "field": "score", "conds": [0.1]},
     {"op": "must", "field": "score", "conds": [0.1, 9.75]},
@@ -1285,3 +1287,68 @@ def test_legacy_rows_without_embeddings_rank_last_and_score_low(
     assert [r["id"] for r in results] == ["real", "legacy"]
     assert results[-1]["_score"] < results[0]["_score"]
     assert results[-1]["_score"] <= NO_VECTOR_SCORE
+
+
+# Each leaf the engine does not evaluate, with OpenViking 0.4's answer over
+# the records below: `named` has a name, `blank` takes the default "" (a
+# present value, so `None` never matches it), and `flag`/`score` default to
+# False/0.0 on the wide schema.
+_PINNED_UNEVALUATED: list[tuple[bool, dict[str, Any], set[str]]] = [
+    (False, {"op": "must", "field": "name", "conds": [None]}, set()),
+    (False, {"op": "must_not", "field": "name", "conds": [None]}, {"named", "blank"}),
+    (False, {"op": "must", "field": "context_type", "conds": []}, set()),
+    (
+        False,
+        {"filter": {"op": "must", "field": "context_type", "conds": ["memory"]}},
+        {"named"},
+    ),
+    (True, {"op": "must", "field": "score", "conds": [0.5]}, {"named"}),
+    (True, {"op": "must", "field": "score", "conds": [0.5, 9.75]}, {"named"}),
+    (True, {"op": "must_not", "field": "score", "conds": [0.5]}, {"blank"}),
+    (True, {"op": "must", "field": "flag", "conds": [None]}, set()),
+    (True, {"op": "must", "field": "score", "conds": [None]}, set()),
+]
+
+
+@pytest.mark.parametrize(
+    "wide,leaf,expect",
+    _PINNED_UNEVALUATED,
+    ids=[repr(leaf) for _, leaf, _ in _PINNED_UNEVALUATED],
+)
+def test_filters_the_engine_does_not_evaluate_keep_their_answers(
+    dsn: str, test_schema: str, wide: bool, leaf: dict[str, Any], expect: set[str]
+) -> None:
+    """Pin the 0.4 answer where the 0.5 engine has none, alone and combined.
+
+    The engine drops these filters and returns every row, so the sweep cannot
+    use it. ANDed with a condition both records meet the answer must not
+    change, and ORed with one neither meets it must not change either.
+    """
+    meta = WIDE_META if wide else META
+    records: list[dict[str, Any]] = (
+        [
+            {"id": "named", "flag": True, "score": 0.5, "vector": vec(1)},
+            {"id": "blank", "vector": vec(2)},
+        ]
+        if wide
+        else [
+            {"id": "named", "name": "n", "context_type": "memory", "vector": vec(1)},
+            {"id": "blank", "context_type": "resource", "vector": vec(2)},
+        ]
+    )
+    inst = make_adapter(dsn, test_schema)
+    inst.create_collection(
+        "context", meta, distance="cosine", sparse_weight=0.0, index_name="default"
+    )
+    try:
+        inst.upsert(records)
+        everyone = {"op": "must", "field": "id", "conds": ["named", "blank"]}
+        nobody = {"op": "must", "field": "id", "conds": ["ghost"]}
+        for node in (
+            leaf,
+            {"op": "and", "conds": [leaf, everyone]},
+            {"op": "or", "conds": [nobody, leaf]},
+        ):
+            assert {r["id"] for r in inst.query(filter=node, limit=10)} == expect, node
+    finally:
+        inst.close()

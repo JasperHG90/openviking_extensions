@@ -78,6 +78,8 @@ def check_openviking_version() -> None:
         "anyway."
     )
     if _FLAG.validate_python(os.environ.get(ALLOW_UNTESTED_ENV, "false")):
-        logger.warning("%s Starting anyway because %s is set.", message, ALLOW_UNTESTED_ENV)
+        logger.warning(
+            "%s Starting anyway because %s is set.", message, ALLOW_UNTESTED_ENV
+        )
         return
     raise RuntimeError(message)
