@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -510,3 +511,48 @@ def test_a_server_that_loaded_before_another_reconciled_sees_the_new_fields(
         assert seen == {"viking://resources/team/open.md"}
     finally:
         late.close()
+
+
+def test_requests_arriving_together_share_one_retry(
+    dsn: str, test_schema: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the retry window opens, only one of the waiting requests retries.
+
+    The other finds, under the adapter's lock, that an attempt has just been
+    made, and is refused instead of running a second one.
+    """
+    restricted_and_open_on_an_old_table(dsn, test_schema)
+    attempts: list[int] = []
+    reconcile = PgVectorCollection.reconcile_schema
+
+    def slow(self: PgVectorCollection, meta: dict[str, Any]) -> Any:
+        attempts.append(1)
+        time.sleep(0.3)
+        return reconcile(self, meta)
+
+    def denied(self: object, cur: object, spec: object) -> None:
+        raise psycopg.errors.InsufficientPrivilege("must be owner of table ov_context")
+
+    monkeypatch.setattr(PgVectorCollection, "_add_column", denied)
+    monkeypatch.setattr(PgVectorCollectionAdapter, "_RECONCILE_RETRY_SECONDS", 1.0)
+    adapter = make_adapter(dsn, test_schema)
+    try:
+        assert adapter.collection_exists()
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            create(adapter, NEW)
+        monkeypatch.setattr(PgVectorCollection, "reconcile_schema", slow)
+        adapter._last_reconcile_attempt = time.monotonic() - 2.0
+
+        together = threading.Barrier(2)
+
+        def query() -> None:
+            together.wait(timeout=5)
+            with pytest.raises(RuntimeError, match="reconcile"):
+                adapter.query(limit=10)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            for future in [pool.submit(query), pool.submit(query)]:
+                future.result()
+        assert len(attempts) == 1
+    finally:
+        adapter.close()

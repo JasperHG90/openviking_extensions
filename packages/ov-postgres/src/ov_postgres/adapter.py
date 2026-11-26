@@ -509,29 +509,51 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
             is made at most once every ``_RECONCILE_RETRY_SECONDS``; in between
             the call is refused at once.
         """
-        pending = self._pending_reconcile
-        if pending is not None:
-            wait = (
-                self._last_reconcile_attempt
-                + self._RECONCILE_RETRY_SECONDS
-                - time.monotonic()
-            )
-            if wait > 0:
-                raise RuntimeError(
-                    f"collection {self._collection_name!r} is not served: its schema "
-                    f"reconcile failed and is retried in {wait:.1f}s. Without the "
-                    "fields it adds, ACL filters would let restricted rows through."
-                )
-            try:
-                self._reconcile(pending)
-            except Exception as exc:
-                raise RuntimeError(
-                    f"collection {self._collection_name!r} is not served: its schema "
-                    f"reconcile failed ({type(exc).__name__}: {exc}). Without the "
-                    "fields it adds, ACL filters would let restricted rows through."
-                ) from exc
+        if self._pending_reconcile is not None:
+            # Checked again under the lock: requests that arrive together as
+            # the window opens must share one retry, not each run their own.
+            with self._lock:
+                pending = self._pending_reconcile
+                if pending is not None:
+                    self._retry_reconcile(pending)
         collection: Collection = super().get_collection()
         return collection
+
+    def _retry_reconcile(self, pending: dict[str, Any]) -> None:
+        """Retry a failed reconcile if the retry window is open, else refuse.
+
+        Call with ``self._lock`` held, so the window is read and the attempt
+        made by one thread at a time.
+
+        Parameters
+        ----------
+        pending :
+            The schema of the reconcile that failed.
+
+        Raises
+        ------
+        RuntimeError
+            If the window is still closed, or the retry fails.
+        """
+        wait = (
+            self._last_reconcile_attempt
+            + self._RECONCILE_RETRY_SECONDS
+            - time.monotonic()
+        )
+        if wait > 0:
+            raise RuntimeError(
+                f"collection {self._collection_name!r} is not served: its schema "
+                f"reconcile failed and is retried in {wait:.1f}s. Without the "
+                "fields it adds, ACL filters would let restricted rows through."
+            )
+        try:
+            self._reconcile(pending)
+        except Exception as exc:
+            raise RuntimeError(
+                f"collection {self._collection_name!r} is not served: its schema "
+                f"reconcile failed ({type(exc).__name__}: {exc}). Without the "
+                "fields it adds, ACL filters would let restricted rows through."
+            ) from exc
 
     def _table_exists(self, table_name: str) -> bool:
         """Return whether the named table is present in the configured schema."""

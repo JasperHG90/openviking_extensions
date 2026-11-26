@@ -2564,10 +2564,12 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                     plain, before=current, after=CollectionSchema.from_meta(stored)
                 )
                 # The registry is written last. Readers see none of this until
-                # the commit either way; going last means no row lock taken
-                # here can serialise two reconciles in place of the advisory
-                # lock, so tests/test_schema_reconcile.py can tell whether that
-                # lock is doing its job.
+                # the commit either way; going last keeps the UPDATE's row lock
+                # from serialising two reconciles before the index step, so
+                # tests/test_schema_reconcile.py can tell whether they are
+                # serialised at all. Two locks do that: the advisory lock, and
+                # the registry row's FOR UPDATE above; the test covers the pair,
+                # and either alone is enough to pass it.
                 plain.execute(
                     sql.SQL("UPDATE {} SET meta = %s WHERE name = %s").format(
                         self._registry(ddl.REGISTRY_COLLECTIONS)
