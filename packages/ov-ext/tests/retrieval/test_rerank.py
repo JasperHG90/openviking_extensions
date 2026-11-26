@@ -314,6 +314,7 @@ def make_recording_retriever(
     monkeypatch: pytest.MonkeyPatch,
     *,
     scores: list[float] | None = None,
+    declined: frozenset[str] = frozenset(),
     **overrides: Any,
 ) -> tuple[HybridRetriever, list[tuple[list[str], list[float]]]]:
     """Return a retriever whose base rerank records what it was handed.
@@ -328,6 +329,9 @@ def make_recording_retriever(
         Model scores, consumed in order by the documents that carry text.
         Defaults to a constant, which is enough when the test is about what
         was sent rather than what came back.
+    declined :
+        Texts the model answers with no usable score, as it does for a
+        non-finite one: they keep their fallback and are not marked reranked.
 
     Returns
     -------
@@ -342,11 +346,12 @@ def make_recording_retriever(
     ) -> RerankScores:
         seen.append((list(documents), list(fallback_scores)))
         answers = iter(scores or [9.0] * len(documents))
+        judged = [bool(text.strip()) and text not in declined for text in documents]
         out = [
-            next(answers) if text.strip() else fallback
-            for text, fallback in zip(documents, fallback_scores, strict=True)
+            next(answers) if ok else fallback
+            for ok, fallback in zip(judged, fallback_scores, strict=True)
         ]
-        return RerankScores(out, [bool(text.strip()) for text in documents])
+        return RerankScores(out, judged)
 
     monkeypatch.setattr(HierarchicalRetriever, "_rerank_scores", base_rerank)
 
@@ -396,15 +401,15 @@ async def test_the_document_cap_sends_the_strongest_candidates_in_batch_order(
 
 
 @pytest.mark.asyncio
-async def test_candidates_past_the_document_cap_keep_their_vector_scores(
+async def test_candidates_past_the_document_cap_rank_below_every_reranked_one(
     monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
 ) -> None:
-    """Held back from the reranker, not from the pool, and marked as such.
+    """Held back from the reranker, not from the pool, and never above it.
 
-    Dropping them, or flooring them below the reranked band, would push them
-    under the retrieval threshold and out of the answer entirely. Keeping the
-    vector score, flagged as not reranked, is the base class's own treatment
-    of a document the model skipped -- so the rerank threshold leaves them be.
+    Dropping them would push them out of the answer entirely. Leaving them on
+    their cosines would let them outrank reranked documents, since OpenViking
+    sorts the whole list by score. So they keep their own order, strictly
+    between zero and the lowest model score, marked as not reranked.
     """
     retriever, _ = make_recording_retriever(
         monkeypatch, scores=[5.0, 6.0], rerank_max_documents=2
@@ -414,10 +419,26 @@ async def test_candidates_past_the_document_cap_keep_their_vector_scores(
         "q", ["a", "b", "c", "d"], [0.1, 0.7, 0.3, 0.9]
     )
 
-    assert result.scores == [0.1, 5.0, 0.3, 6.0], (
-        "reranked scores land on the chosen indexes; the rest keep theirs"
-    )
     assert result.reranked == [False, True, False, True]
+    assert result.scores[1] == 5.0 and result.scores[3] == 6.0
+    assert 5.0 > result.scores[2] > result.scores[0] > 0, (
+        "c above a, as their vector scores rank them, both under the model's 5.0"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_document_the_model_declines_inside_the_cap_is_not_counted_reranked(
+    monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
+) -> None:
+    """Sent but not scored stays unscored, and ranks with the held-back."""
+    retriever, _ = make_recording_retriever(
+        monkeypatch, scores=[5.0], declined=frozenset({"b"}), rerank_max_documents=2
+    )
+
+    result = await retriever._rerank_scores("q", ["a", "b", "c"], [0.9, 0.8, 0.1])
+
+    assert result.reranked == [True, False, False]
+    assert 5.0 > result.scores[1] > result.scores[2] > 0
 
 
 @pytest.mark.asyncio
@@ -458,5 +479,5 @@ async def test_the_cap_spends_its_allowance_on_documents_that_carry_text(
     assert seen[0][0] == ["real text"], (
         "the allowance must go to text the service can read"
     )
-    assert result.scores == [9.0, 0.9, 0.8]
     assert result.reranked == [True, False, False]
+    assert 9.0 > result.scores[1] > result.scores[2] > 0

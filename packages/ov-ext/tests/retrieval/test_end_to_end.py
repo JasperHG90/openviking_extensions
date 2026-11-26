@@ -466,3 +466,66 @@ async def test_the_keyword_leg_hides_a_restricted_resource_when_acl_is_on(
 
     assert found == ["viking://resources/open.md"]
     await backend.close()
+
+
+class _LowScoringReranker:
+    """A rerank client whose scores all sit below the held-back cosines."""
+
+    def __init__(self) -> None:
+        self.batches: list[list[str]] = []
+
+    def rerank_batch(self, query: str, documents: list[str]) -> list[float]:
+        self.batches.append(list(documents))
+        return [0.05 + 0.01 * index for index in range(len(documents))]
+
+
+async def test_with_a_document_cap_every_reranked_result_outranks_every_held_back_one(
+    backend: Any,
+) -> None:
+    """The cap must not let the weakest candidates jump the reranked ones.
+
+    Four documents with falling cosines; the cap sends the two strongest, and
+    the model scores them low. Held back on their cosines, the other two would
+    sort above them -- OpenViking ranks the whole list by score.
+    """
+    from openviking_cli.retrieve.types import TypedQuery
+
+    from ov_ext.retrieval.config import HybridSettings
+    from ov_ext.retrieval.retriever import HybridRetriever
+
+    ctx = request_context()
+    assert await backend.create_collection(COLLECTION, schema())
+    vectors = {
+        "d1": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "d2": [0.9, 0.44, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "d3": [0.8, 0.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "d4": [0.7, 0.71, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    }
+    await backend.upsert_many(
+        [
+            record(key, uri=f"viking://resources/{key}", vector=vector, name=f"doc {key}")
+            for key, vector in vectors.items()
+        ],
+        ctx=ctx,
+    )
+    retriever = HybridRetriever(
+        settings=HybridSettings(
+            keyword_enabled=False, mmr_enabled=False, rerank_max_documents=2
+        ),
+        storage=backend,
+        embedder=StubEmbedder(NEAR_A),
+    )
+    reranker = _LowScoringReranker()
+    retriever._rerank_client = reranker
+
+    result = await retriever.retrieve(
+        TypedQuery(query="doc", context_type=None, intent="", target_directories=[]),
+        ctx=ctx,
+        limit=4,
+    )
+
+    order = [context.uri.rsplit("/", 1)[-1] for context in result.matched_contexts]
+    assert reranker.batches == [["doc d1", "doc d2"]]
+    assert set(order[:2]) == {"d1", "d2"}, order
+    assert order[2:] == ["d3", "d4"], "held back, in their own vector order"
+    await backend.close()

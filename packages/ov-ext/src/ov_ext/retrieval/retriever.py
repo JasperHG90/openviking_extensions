@@ -60,6 +60,45 @@ _KEYWORD = "keyword"
 _TRAILING_FRAGMENT = re.compile(r"\s\S*\Z")
 
 
+def _rank_below_the_model(
+    scores: list[float], reranked: list[bool], fallback_scores: list[float]
+) -> None:
+    """Move every score the model did not produce below every one it did.
+
+    Rewrites ``scores`` in place. The unscored keep their order by vector
+    score, spread evenly over the open interval between zero and the lowest
+    model score, so they stay above OpenViking's default threshold of zero.
+    When the lowest model score is not positive there is no such interval, and
+    they go below it one step apart instead; ordering beats keeping them.
+    Nothing changes when the model scored nothing, since then no scale was
+    mixed.
+
+    Parameters
+    ----------
+    scores :
+        The merged scores, in input order.
+    reranked :
+        Per document, whether the model produced its score.
+    fallback_scores :
+        Vector scores, which order the unscored among themselves.
+    """
+    model = [score for score, scored in zip(scores, reranked, strict=True) if scored]
+    if not model:
+        return
+    floor = min(model)
+    unscored = sorted(
+        (index for index, scored in enumerate(reranked) if not scored),
+        key=lambda index: fallback_scores[index],
+        reverse=True,
+    )
+    count = len(unscored)
+    for rank, index in enumerate(unscored):
+        if floor > 0:
+            scores[index] = floor * (count - rank) / (count + 1)
+        else:
+            scores[index] = floor - (rank + 1)
+
+
 def _clip_query(text: str, max_chars: int) -> str:
     """Cut ``text`` to ``max_chars``, ending on a whole word.
 
@@ -215,10 +254,13 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
         spends. With the cap at zero it defers entirely; with a cap, only the
         strongest candidates by vector score are sent.
 
-        The rest **keep their vector scores and stay in the running**, marked
-        as not reranked. That is the base class's own treatment of a document
-        the model skipped, so the rerank threshold leaves them alone and the
-        worst case is a ranking OpenViking itself considers acceptable.
+        The rest stay in the running, marked as not reranked, but **below
+        every model score in the batch**, in their own vector order. OpenViking
+        sorts the whole list by score, and a cosine compared against a rerank
+        score is a comparison of two unrelated scales: left on their cosines,
+        the weakest candidates -- the very ones the cap held back -- could
+        outrank documents the model judged. A document the model was sent but
+        declined to score is treated the same way.
 
         Parameters
         ----------
@@ -254,6 +296,7 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
         ):
             scores[index] = score
             reranked[index] = from_model
+        _rank_below_the_model(scores, reranked, fallback_scores)
         annotate(
             {
                 "ov_ext.retrieval.reranked_documents": sum(reranked),
