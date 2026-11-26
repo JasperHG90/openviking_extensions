@@ -36,9 +36,19 @@ from .schema import CollectionSchema
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["DSN_ENV_VARS", "PgVectorCollectionAdapter"]
+__all__ = ["DSN_ENV_VARS", "MODE", "PgVectorCollectionAdapter"]
 
 _IDENT_SAFE = re.compile(r"[^a-z0-9_]+")
+
+# What this adapter reports as its `mode`. Not "pgvector": since 0.5.5 that
+# names OpenViking's own PostgreSQL backend, and OpenViking branches on it.
+# `CollectionAdapter.query` passes an event-time-decay request through raw
+# for "pgvector", expecting that backend's SQL to apply it, and the
+# incremental inventory scan probes for NULL timestamps the way that backend
+# sorts them. Neither holds here. Under a name OpenViking does not know, time
+# decay is refused up front with an error naming this backend, and every other
+# path takes the generic route.
+MODE = "ov_postgres"
 
 # PostgreSQL truncates identifiers at 63 bytes.
 _MAX_IDENTIFIER_LENGTH = 63
@@ -65,7 +75,7 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
     Attributes
     ----------
     mode : str
-        Backend identifier reported to OpenViking; always ``"pgvector"``.
+        Backend identifier reported to OpenViking; always ``MODE``.
     USE_CONTENT_FIELD : bool
         Whether OpenViking should write each record's body text to the
         ``content`` column. Taken from ``params.store_content``.
@@ -101,13 +111,17 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
     # `content` at 1 MiB of *characters*, which is up to 4 MiB of UTF-8, so its
     # cap alone does not keep us under the limit.
     #
-    # The base class truncates each field in ``_TRUNCATABLE_TEXT_FIELDS``
-    # ("content", "abstract") to this many bytes, on a UTF-8 character
-    # boundary. Both can land in one tsvector alongside the shorter keyword
-    # columns, so the budget is set below half the limit rather than at it.
-    # Applied whether or not `store_content` is on: a large `abstract` is in
-    # the default keyword fields and could overflow the same index on its own.
+    # The base class truncates ``content`` (``_TRUNCATABLE_TEXT_FIELDS``) to
+    # ``_TEXT_FIELD_BYTE_LIMIT`` bytes and ``abstract``
+    # (``_TRUNCATABLE_STRING_FIELDS``) to ``_STRING_FIELD_BYTE_LIMIT``, each on
+    # a UTF-8 character boundary. A limit left at ``None`` truncates nothing,
+    # so both are set. The two fields can land in one tsvector alongside the
+    # shorter keyword columns, so each budget is below half the limit rather
+    # than at it. Applied whether or not `store_content` is on: a large
+    # `abstract` is in the default keyword fields and could overflow the same
+    # index on its own.
     _TEXT_FIELD_BYTE_LIMIT: int = 448 * 1024
+    _STRING_FIELD_BYTE_LIMIT: int = 448 * 1024
 
     def __init__(
         self,
@@ -119,7 +133,7 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
         sparse_weight: float = 0.0,
     ) -> None:
         super().__init__(collection_name=collection_name, index_name=index_name)
-        self.mode = "pgvector"
+        self.mode = MODE
         self._dsn = dsn
         self._params = params
         # Shadows the class attribute, so one collection can store bodies while
@@ -358,6 +372,67 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
             )
 
         return self._build_collection(coll_schema, table_name)
+
+    @traced("ov_postgres.ensure_collection")
+    def create_collection(
+        self,
+        name: str,
+        schema: dict[str, Any],
+        *,
+        distance: str,
+        sparse_weight: float,
+        index_name: str,
+    ) -> bool:
+        """Create the collection, or bring an existing one up to ``schema``.
+
+        OpenViking calls this on every boot with its full current schema, and
+        migrates an existing collection itself only for its ``local`` and
+        ``cuvs`` backends. So the existing case is where a table created by an
+        older OpenViking gains the fields added since -- ``md5`` and the ACL
+        fields among them -- along with their scalar indexes. Only ever adds;
+        see :meth:`PgVectorCollection.reconcile_schema`.
+
+        Parameters
+        ----------
+        name :
+            Collection name.
+        schema :
+            The collection schema.
+        distance :
+            Distance metric for a new collection's vector index.
+        sparse_weight :
+            Sparse weight for a new collection's index bundle.
+        index_name :
+            Name of a new collection's index bundle.
+
+        Returns
+        -------
+        bool
+            True if the collection was created, False if it already existed.
+        """
+        if not self.collection_exists():
+            created: bool = super().create_collection(
+                name,
+                schema,
+                distance=distance,
+                sparse_weight=sparse_weight,
+                index_name=index_name,
+            )
+            return created
+        inner = self._pg_collection
+        if inner is None:
+            return False
+        reconciled = inner.reconcile_schema(dict(schema))
+        if reconciled is None:
+            return False
+        with self._lock:
+            # Rebuilt rather than patched: the filter compiler, the projection
+            # and the keyword fields are all derived from the schema.
+            self._collection = self._build_collection(
+                CollectionSchema.from_meta(reconciled), inner.table_name
+            )
+            inner.close()
+        return False
 
     def _table_exists(self, table_name: str) -> bool:
         """Return whether the named table is present in the configured schema."""

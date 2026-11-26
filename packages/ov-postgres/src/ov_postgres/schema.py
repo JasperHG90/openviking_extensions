@@ -223,7 +223,7 @@ class CollectionSchema:
 
     @property
     def field_types(self) -> dict[str, str]:
-        """Field name to OpenViking type, as ``matches_filter`` expects."""
+        """Field name to OpenViking type, for each declared field."""
         return {spec.name: spec.ov_type for spec in self.fields}
 
     def selectable_names(self) -> list[str]:

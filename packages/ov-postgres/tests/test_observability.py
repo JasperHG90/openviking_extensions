@@ -328,7 +328,7 @@ class TestSpansFromRealQueries:
         steady-state path, where it only reads the catalog.
         """
         from .test_backends import build
-        from .test_integration import vec
+        from .test_integration import META, vec
 
         adapter = build(dsn, test_schema)
         try:
@@ -362,6 +362,16 @@ class TestSpansFromRealQueries:
             collection.pairwise_similarity(["a", "b"])
             collection.backfill_defaults()
             collection.ensure_indexes()
+            collection.reconcile_schema(
+                {
+                    **META,
+                    "Fields": [
+                        *META["Fields"],
+                        {"FieldName": "probe_field", "FieldType": "string"},
+                    ],
+                    "ScalarIndex": [*META["ScalarIndex"], "probe_field"],
+                }
+            )
             collection.create_index("probe_index", {})
             collection.update_index("probe_index", description="probe")
             collection.drop_index("probe_index")
@@ -416,6 +426,7 @@ class TestSpansFromRealQueries:
         assert declared == {
             "ov_postgres.get_meta_data": "SELECT",
             "ov_postgres.update": "UPDATE",
+            "ov_postgres.reconcile_schema": "ALTER TABLE",
             "ov_postgres.list_indexes": "SELECT",
             "ov_postgres.has_index": "SELECT",
             "ov_postgres.get_index_meta_data": "SELECT",

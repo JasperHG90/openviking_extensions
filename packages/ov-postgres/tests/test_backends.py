@@ -16,7 +16,6 @@ from typing import Any, cast
 
 import psycopg
 import pytest
-from openviking.storage.vectordb.index.cuvs_index import matches_filter
 from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
 from psycopg import sql
 from pydantic import ValidationError
@@ -27,11 +26,10 @@ from ov_postgres.collection import NULL_BUCKET
 from ov_postgres.filters import UnsupportedFilterError
 from ov_postgres.schema import CollectionSchema
 
+from .reference import engine_answer
 from .test_integration import (
     DIM,
-    FIELD_TYPES,
     META,
-    as_reference_row,
     vec,
 )
 
@@ -438,8 +436,6 @@ def test_table_prefix_is_honoured(dsn: str, test_schema: str) -> None:
         adapter.close()
 
 
-GEO_FIELD_TYPES: dict[str, str] = {}
-
 GEO_META: dict[str, Any] = {
     "CollectionName": "context",
     "Description": "geo and float test collection",
@@ -454,8 +450,6 @@ GEO_META: dict[str, Any] = {
     ],
     "ScalarIndex": ["name", "score", "counts", "flag"],
 }
-
-GEO_FIELD_TYPES.update({f["FieldName"]: f["FieldType"] for f in GEO_META["Fields"]})
 
 
 def build_geo(dsn: str, schema: str) -> PgVectorCollectionAdapter:
@@ -1336,15 +1330,28 @@ def test_auto_index_method_still_gets_the_scan_guc(dsn: str, test_schema: str) -
         reopened.close()
 
 
-@pytest.mark.parametrize("bound", [True, False])
-@pytest.mark.parametrize("key", ["gt", "gte", "lt", "lte"])
+@pytest.mark.parametrize(
+    "key,bound,expect",
+    [
+        ("gt", True, set()),
+        ("gt", False, {"t"}),
+        ("gte", True, {"t"}),
+        ("gte", False, {"t", "f"}),
+        ("lt", True, {"f"}),
+        ("lt", False, set()),
+        ("lte", True, {"t", "f"}),
+        ("lte", False, {"f"}),
+    ],
+)
 def test_boolean_bounds_on_a_bool_range(
-    dsn: str, test_schema: str, key: str, bound: bool
+    dsn: str, test_schema: str, key: str, bound: bool, expect: set[str]
 ) -> None:
     """A boolean bound must survive the numeric ordering cast.
 
     Casting the column to int while leaving the bound a PostgreSQL boolean
-    made every one of these raise ``integer >= boolean``.
+    made every one of these raise ``integer >= boolean``. The answers order
+    ``False`` before ``True``, as Python does; the 0.5 engine does not evaluate
+    a range over a bool, so they are pinned rather than compared.
     """
     adapter = build_geo(dsn, test_schema)
     try:
@@ -1354,12 +1361,8 @@ def test_boolean_bounds_on_a_bool_range(
         ]
         adapter.upsert(records)
         node = {"op": "range", "field": "flag", key: bound}
-        expected = {
-            r["id"]
-            for r in (as_reference_row(GEO_META, rec) for rec in records)
-            if matches_filter(r, node, GEO_FIELD_TYPES)
-        }
-        assert {r["id"] for r in adapter.query(filter=node, limit=10)} == expected
+        assert {r["id"] for r in adapter.query(filter=node, limit=10)} == expect
+        assert engine_answer(GEO_META, records, node) in (None, expect)
     finally:
         adapter.close()
 
@@ -1490,13 +1493,9 @@ def test_string_ranges_use_code_point_order(
         node = {"op": "range", "field": "name", key: bound}
         assert {r["id"] for r in adapter.query(filter=node, limit=10)} == expect
 
-        # And the reference agrees with that expectation.
-        reference = {
-            r["id"]
-            for r in (as_reference_row(META, rec) for rec in records)
-            if matches_filter(r, node, FIELD_TYPES)
-        }
-        assert reference == expect
+        # The 0.5 engine does not evaluate a range over text; where it does,
+        # it must agree.
+        assert engine_answer(META, records, node) in (None, expect)
     finally:
         adapter.close()
 
@@ -1533,12 +1532,8 @@ def test_infinite_bounds_on_a_text_column_match_nothing(
         records: list[dict[str, Any]] = [{"id": "a", "name": "alpha", "vector": vec(1)}]
         adapter.upsert(records)
         node = {"op": "range", "field": "name", key: bound}
-        expected = {
-            r["id"]
-            for r in (as_reference_row(META, rec) for rec in records)
-            if matches_filter(r, node, FIELD_TYPES)
-        }
-        assert {r["id"] for r in adapter.query(filter=node, limit=10)} == expected
+        assert {r["id"] for r in adapter.query(filter=node, limit=10)} == set()
+        assert engine_answer(META, records, node) in (None, set())
     finally:
         adapter.close()
 

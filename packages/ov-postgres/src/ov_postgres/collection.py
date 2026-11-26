@@ -39,6 +39,9 @@ from .schema import (
     fulltext_candidates,
 )
 
+# Rows read per page while moving values out of `extra` during a reconcile.
+_EXTRA_MOVE_PAGE = 1000
+
 # What psycopg's execute()/executemany() actually accept.
 Statement = sql.SQL | sql.Composed
 
@@ -87,6 +90,39 @@ _KEYWORD_RANK_FNS: dict[str, sql.SQL] = {
 # Validated like the rank function: a typo silently falling through to `any`
 # would change what every query matches.
 _KEYWORD_QUERY_MODES = frozenset({"all", "any"})
+
+# Keyword modes OpenViking may ask for. `bm25` is what its own callers send;
+# this backend ranks with `keyword_rank` either way, as openGauss accepts the
+# same name for its own ranking.
+_ACCEPTED_KEYWORD_MODES = frozenset({None, "bm25"})
+
+
+def _refuse_advance(method: str, advance: dict[str, Any] | None) -> None:
+    """Raise when a caller asks for engine-side options this backend lacks.
+
+    OpenViking's ``advance`` carries post-processing for the engines that have
+    it: ``time_decay``, ``post_process_ops``, ``post_process_input_limit``.
+    None of them has a PostgreSQL form here, and quietly ignoring one would
+    return results ranked or cut differently from what was asked for.
+
+    Parameters
+    ----------
+    method :
+        The method that was called, for the message.
+    advance :
+        The options passed; ``None`` or empty is accepted.
+
+    Raises
+    ------
+    NotImplementedError
+        Naming the keys that were passed.
+    """
+    if advance:
+        raise NotImplementedError(
+            f"PgVectorCollection.{method} does not support advance options: "
+            f"{', '.join(sorted(map(str, advance)))}"
+        )
+
 
 # Words allowed in one `any`-mode term before it is split into several. The
 # rewrite re-parses a flat `a | b | c ...` chain, which PostgreSQL's parser
@@ -285,6 +321,11 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             "db.namespace": db_schema,
             "db.collection.name": table_name,
         }
+
+    @property
+    def table_name(self) -> str:
+        """The PostgreSQL table holding this collection's rows."""
+        return self._table
 
     @property
     def _qualified(self) -> Statement:
@@ -506,14 +547,26 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         return True
 
     @traced("ov_postgres.get_meta_data")
-    def get_meta_data(self) -> dict[str, Any]:
+    def get_meta_data(self, *, raise_on_error: bool = False) -> dict[str, Any]:
         """Return the collection metadata recorded in the registry.
+
+        Parameters
+        ----------
+        raise_on_error :
+            Raise instead of falling back to the in-memory copy when the
+            registry row is missing. OpenViking sets it where a stale answer
+            would be worse than none.
 
         Returns
         -------
         dict[str, Any]
             The stored schema, or the in-memory copy if the registry row is
-            missing.
+            missing and ``raise_on_error`` is false.
+
+        Raises
+        ------
+        LookupError
+            If the registry row is missing and ``raise_on_error`` is set.
         """
         annotate({"db.operation.name": "SELECT"})
         row = self._execute(
@@ -524,6 +577,10 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             fetch="one",
         )
         if not row:
+            if raise_on_error:
+                raise LookupError(
+                    f"collection {self._name!r} has no row in the registry table"
+                )
             return dict(self._schema.raw)
         meta = row["meta"]
         return meta if isinstance(meta, dict) else json.loads(meta)
@@ -1210,6 +1267,8 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         filters: dict[str, Any] | None = None,
         sparse_vector: dict[str, float] | None = None,
         output_fields: list[str] | None = None,
+        advance: dict[str, Any] | None = None,
+        return_detail_info: bool = False,
     ) -> SearchResult:
         """Rank rows by similarity to a dense and/or sparse query vector.
 
@@ -1229,6 +1288,12 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             Sparse query vector, used only when ``sparse_weight`` is positive.
         output_fields :
             Columns to return; ``None`` returns all non-vector columns.
+        advance :
+            Engine-side post-processing. Must be empty: this backend has none.
+        return_detail_info :
+            Accepted for interface compatibility. The score has no components
+            to break down, so results carry no ``origin_score`` or
+            ``addition_score`` either way.
 
         Returns
         -------
@@ -1239,7 +1304,10 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         ------
         ValueError
             If neither a dense nor a sparse vector is supplied.
+        NotImplementedError
+            If ``advance`` asks for anything.
         """
+        _refuse_advance("search_by_vector", advance)
         if dense_vector is None and sparse_vector is None:
             raise ValueError("search_by_vector requires a dense or sparse vector")
 
@@ -1375,13 +1443,70 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         offset: int = 0,
         filters: dict[str, Any] | None = None,
         output_fields: list[str] | None = None,
+        mode: str | None = None,
+        fields: list[str] | None = None,
+        bm25_k1: float | None = None,
+        bm25_b: float | None = None,
+        advance: dict[str, Any] | None = None,
     ) -> SearchResult:
         """Lexical search over the indexed text columns via Postgres FTS.
 
         The native local backend raises NotImplementedError here because it
         cannot vectorise text itself.  Postgres can rank lexically without an
         embedding model, so this is implemented rather than refused.
+
+        Parameters
+        ----------
+        index_name :
+            Accepted for interface compatibility; unused.
+        keywords :
+            Phrases; the words inside one are ANDed, separate ones ORed.
+        query :
+            Natural-language text; its words combine per
+            ``keyword_query_mode``.
+        limit :
+            Maximum rows to return.
+        offset :
+            Rows to skip.
+        filters :
+            Compiled filter DSL restricting the candidate set.
+        output_fields :
+            Columns to return; ``None`` returns all non-vector columns.
+        mode :
+            ``None`` or ``"bm25"``. Either way rows are ranked with the
+            configured ``keyword_rank``.
+        fields :
+            Accepted and recorded, not applied. The search always covers the
+            configured ``keyword_fields``, which is what the full-text index is
+            built over; another set would scan the table instead.
+        bm25_k1, bm25_b :
+            Must be ``None``: PostgreSQL's ranking has no such parameters.
+        advance :
+            Must be empty: this backend has no engine-side post-processing.
+
+        Returns
+        -------
+        SearchResult
+            Matching rows, best match first.
+
+        Raises
+        ------
+        ValueError
+            If ``mode`` is not ``bm25``, a BM25 parameter is set, or there are
+            more terms than one statement can bind.
+        NotImplementedError
+            If ``advance`` asks for anything.
         """
+        if mode not in _ACCEPTED_KEYWORD_MODES:
+            raise ValueError(
+                f"PgVectorCollection keyword mode must be bm25, not {mode!r}"
+            )
+        if bm25_k1 is not None or bm25_b is not None:
+            raise ValueError(
+                "PgVectorCollection ranks with PostgreSQL full-text search, which "
+                "takes no bm25_k1 or bm25_b"
+            )
+        _refuse_advance("search_by_keywords", advance)
         # Each term carries how its own words combine. A `keywords` entry is a
         # deliberate phrase, so its words are ANDed; a `query` is natural
         # language, where requiring every word matches almost nothing -- the
@@ -1419,6 +1544,8 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 "ov_postgres.offset": offset,
                 "ov_postgres.terms": len(terms),
                 "ov_postgres.filtered": filters is not None,
+                "ov_postgres.keyword_mode": mode or "",
+                "ov_postgres.requested_fields": ",".join(fields or []),
             }
         )
         if not terms:
@@ -1620,6 +1747,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         offset: int = 0,
         filters: dict[str, Any] | None = None,
         output_fields: list[str] | None = None,
+        advance: dict[str, Any] | None = None,
     ) -> SearchResult:
         """Return an arbitrary sample of matching rows.
 
@@ -1635,12 +1763,20 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             Compiled filter DSL restricting the candidate set.
         output_fields :
             Columns to return; ``None`` returns all non-vector columns.
+        advance :
+            Engine-side post-processing. Must be empty: this backend has none.
 
         Returns
         -------
         SearchResult
             Randomly ordered rows; scores are not meaningful and are zero.
+
+        Raises
+        ------
+        NotImplementedError
+            If ``advance`` asks for anything.
         """
+        _refuse_advance("search_by_random", advance)
         annotate(
             {
                 "db.operation.name": "SELECT",
@@ -2294,7 +2430,272 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         annotate({"ov_postgres.indexes_built": len(built)})
         return built
 
-    def _reconcilable_index_statements(self) -> list[ddl.IndexStatement]:
+    @traced("ov_postgres.reconcile_schema")
+    def reconcile_schema(self, meta: dict[str, Any]) -> dict[str, Any] | None:
+        """Add the fields and scalar indexes ``meta`` declares that the table lacks.
+
+        OpenViking passes its full current schema to ``create_collection`` on
+        every boot, and only migrates an existing collection itself for the
+        ``local`` and ``cuvs`` backends. A table created by an older OpenViking
+        would otherwise keep its old columns for ever -- and every field it
+        lacks is treated as missing by filters and dropped from explicit
+        projections, which is how ACL filters stop filtering on a table that
+        predates the ACL columns.
+
+        In one transaction, under the schema's advisory lock:
+
+        1. ``ADD COLUMN`` for each missing field, set to the engine's default
+           for that field on every existing row;
+        2. move any value already written into ``extra`` under that name into
+           the new column, and drop it from ``extra``;
+        3. record the new fields and scalar indexes in the registry;
+        4. build the indexes the new scalar-index entries call for.
+
+        A crash part way rolls all of it back, so the next boot starts over
+        rather than finding columns without their indexes.
+
+        Columns are only ever added. A field the schema no longer names keeps
+        its column and its data. A value in ``extra`` that the column cannot
+        hold stays in ``extra``, with a warning, rather than failing the boot.
+
+        Parameters
+        ----------
+        meta :
+            The collection schema OpenViking passed to ``create_collection``.
+
+        Returns
+        -------
+        dict[str, Any] | None
+            The registry's updated schema, or ``None`` when nothing was
+            missing. The caller rebuilds its view of the collection from it.
+        """
+        self._check_open()
+        incoming = CollectionSchema.from_meta(meta)
+        with self._lock, self._pool.connection() as conn, conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock(%s)",
+                    (ddl.advisory_lock_key(self._db_schema),),
+                )
+                # Read under the lock: another server may have reconciled while
+                # this one waited, and its columns must not be added twice.
+                cur.execute(
+                    sql.SQL("SELECT meta FROM {} WHERE name = %s FOR UPDATE").format(
+                        self._registry(ddl.REGISTRY_COLLECTIONS)
+                    ),
+                    (self._name,),
+                )
+                row = cur.fetchone()
+                stored_raw = row["meta"] if row else dict(self._schema.raw)
+                stored = dict(
+                    stored_raw if isinstance(stored_raw, dict) else json.loads(stored_raw)
+                )
+                current = CollectionSchema.from_meta(stored)
+                added = [
+                    spec
+                    for spec in incoming.fields
+                    if current.by_name(spec.name) is None
+                    and not spec.is_primary
+                    and not spec.is_vector
+                ]
+                indexed = [
+                    name
+                    for name in incoming.scalar_index
+                    if name not in current.scalar_index
+                ]
+                annotate(
+                    {
+                        "db.operation.name": "SELECT",
+                        "ov_postgres.fields_added": len(added),
+                        "ov_postgres.scalar_indexes_added": len(indexed),
+                    }
+                )
+                if not added and not indexed:
+                    return None
+
+                for spec in added:
+                    self._add_column(cur, spec)
+                moved = self._move_extra_into_columns(cur, added)
+
+                raw_by_name = {
+                    str(field.get("FieldName")): field for field in meta.get("Fields", [])
+                }
+                stored["Fields"] = [
+                    *stored.get("Fields", []),
+                    *(raw_by_name[spec.name] for spec in added),
+                ]
+                stored["ScalarIndex"] = [*stored.get("ScalarIndex", []), *indexed]
+                cur.execute(
+                    sql.SQL("UPDATE {} SET meta = %s WHERE name = %s").format(
+                        self._registry(ddl.REGISTRY_COLLECTIONS)
+                    ),
+                    (json.dumps(stored), self._name),
+                )
+                # The index bundle keeps its own scalar-index list, as the
+                # local backend's does; extend it the same way.
+                cur.execute(
+                    sql.SQL(
+                        "UPDATE {} SET meta = jsonb_set(meta, '{{ScalarIndex}}', "
+                        "coalesce(meta->'ScalarIndex', '[]'::jsonb) || %s::jsonb) "
+                        "WHERE collection = %s"
+                    ).format(self._registry(ddl.REGISTRY_INDEXES)),
+                    (json.dumps(indexed), self._name),
+                )
+            with conn.cursor() as plain:
+                built = self._create_new_indexes(
+                    plain, before=current, after=CollectionSchema.from_meta(stored)
+                )
+        annotate(
+            {
+                "db.operation.name": "ALTER TABLE",
+                "ov_postgres.rows": moved,
+                "ov_postgres.indexes_built": len(built),
+            }
+        )
+        logger.info(
+            "ov_postgres: added %d field(s) to %s.%s (%s); "
+            "moved %d value(s) out of extra",
+            len(added),
+            self._db_schema,
+            self._table,
+            ", ".join(spec.name for spec in added) or "none",
+            moved,
+        )
+        return stored
+
+    def _add_column(self, cur: Cursor[Any], spec: FieldSpec) -> None:
+        """Add the column(s) for one field, holding its default on every row.
+
+        ``ADD COLUMN ... DEFAULT`` with a constant fills existing rows without
+        rewriting the table. The default is dropped again straight after,
+        because this backend applies defaults on write and its tables carry no
+        column defaults; the rows already present keep the value.
+        """
+        table = self._qualified
+        if spec.is_geo:
+            for suffix in (GEO_LON_SUFFIX, GEO_LAT_SUFFIX):
+                cur.execute(
+                    sql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} real").format(
+                        table, sql.Identifier(spec.name + suffix)
+                    )
+                )
+            return
+        column = sql.Identifier(spec.name)
+        column_type = ddl.column_type(spec)
+        default = default_for(spec)
+        if default is None:
+            cur.execute(
+                sql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} {}").format(
+                    table, column, column_type
+                )
+            )
+            return
+        cur.execute(
+            sql.SQL(
+                "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {type} "
+                "DEFAULT {value}::{type}"
+            ).format(
+                table=table,
+                col=column,
+                type=column_type,
+                value=sql.Literal(self._adapt_value(spec, default)),
+            )
+        )
+        cur.execute(
+            sql.SQL("ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT").format(table, column)
+        )
+
+    def _create_new_indexes(
+        self, cur: Cursor[Any], *, before: CollectionSchema, after: CollectionSchema
+    ) -> list[str]:
+        """Build the indexes ``after`` calls for that ``before`` did not.
+
+        Only those: an index an older version of this package never built is
+        :meth:`ensure_indexes`'s business, run when an operator chooses, not
+        something to build unasked during a boot.
+
+        Returns
+        -------
+        list[str]
+            Names of the indexes built.
+        """
+        known = {entry.name for entry in self._reconcilable_index_statements(before)}
+        present = self._existing_index_names(cur)
+        built: list[str] = []
+        for entry in self._reconcilable_index_statements(after):
+            if entry.name in known or entry.name in present:
+                continue
+            cur.execute(entry.statement)
+            _stamp(cur, self._db_schema, entry)
+            present.add(entry.name)
+            built.append(entry.name)
+        return built
+
+    def _move_extra_into_columns(self, cur: Cursor[Any], added: list[FieldSpec]) -> int:
+        """Move values written under the new fields' names out of ``extra``.
+
+        A field OpenViking sent before this table had a column for it was kept
+        in ``extra``. Walked by primary key in pages, so memory stays bounded
+        and each row is visited once even when a value cannot be moved.
+
+        Returns
+        -------
+        int
+            How many values were moved.
+        """
+        movable = {spec.name: spec for spec in added if not spec.is_geo}
+        if not movable:
+            return 0
+        keys = sorted(movable)
+        pk = sql.Identifier(self._schema.primary_key.name)
+        page = sql.SQL(
+            "SELECT {pk} AS pk, extra FROM {table} "
+            "WHERE extra ?| %s::text[] AND ({pk} > %s OR %s) "
+            "ORDER BY {pk} LIMIT %s"
+        ).format(pk=pk, table=self._qualified)
+        moved = 0
+        after: object = None
+        while True:
+            cur.execute(page, (keys, after, after is None, _EXTRA_MOVE_PAGE))
+            rows = cur.fetchall()
+            for row in rows:
+                extra = row["extra"] if isinstance(row["extra"], dict) else {}
+                columns: list[sql.Composable] = []
+                values: list[Any] = []
+                taken: list[str] = []
+                for name in keys:
+                    if name not in extra:
+                        continue
+                    try:
+                        values.append(self._adapt_value(movable[name], extra[name]))
+                    except (TypeError, ValueError, OverflowError):
+                        logger.warning(
+                            "ov_postgres: left %r in extra for row %r of %s.%s; "
+                            "the value does not fit the new %s column",
+                            name,
+                            row["pk"],
+                            self._db_schema,
+                            self._table,
+                            movable[name].ov_type,
+                        )
+                        continue
+                    columns.append(sql.SQL("{} = %s").format(sql.Identifier(name)))
+                    taken.append(name)
+                if taken:
+                    cur.execute(
+                        sql.SQL(
+                            "UPDATE {} SET {}, extra = extra - %s::text[] WHERE {} = %s"
+                        ).format(self._qualified, sql.SQL(", ").join(columns), pk),
+                        [*values, taken, row["pk"]],
+                    )
+                    moved += len(taken)
+            if len(rows) < _EXTRA_MOVE_PAGE:
+                return moved
+            after = rows[-1]["pk"]
+
+    def _reconcilable_index_statements(
+        self, schema: CollectionSchema | None = None
+    ) -> list[ddl.IndexStatement]:
         """Return the scalar and full-text index statements for this collection.
 
         Names are assigned in the same order as ``create_index``, so a field
@@ -2305,21 +2706,27 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         method recorded at creation, which reconciliation must not silently
         change.
 
+        Parameters
+        ----------
+        schema :
+            The schema to build for; the collection's own when omitted.
+
         Returns
         -------
         list[ddl.IndexStatement]
             ``CREATE INDEX`` statements with their names, full-text last.
         """
+        coll_schema = schema or self._schema
         taken: set[str] = set()
         fts = ddl.fulltext_index_statement(
             self._db_schema,
             self._table,
-            self._fulltext_specs(),
+            self._fulltext_specs(coll_schema),
             self._text_search_config,
             taken,
         )
         statements = ddl.scalar_index_statements(
-            self._db_schema, self._table, self._schema, taken
+            self._db_schema, self._table, coll_schema, taken
         )
         if fts is not None:
             statements.append(fts)
@@ -2362,17 +2769,23 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         """
         return {entry.name for entry in self._reconcilable_index_statements()}
 
-    def _fulltext_specs(self) -> list[FieldSpec]:
+    def _fulltext_specs(self, schema: CollectionSchema | None = None) -> list[FieldSpec]:
         """Return the schema fields backing keyword search.
+
+        Parameters
+        ----------
+        schema :
+            The schema to read; the collection's own when omitted.
 
         Returns
         -------
         list[FieldSpec]
             Declared, textual columns among the configured keyword fields.
         """
+        coll_schema = schema or self._schema
         specs: list[FieldSpec] = []
-        for name in fulltext_candidates(self._schema, self._keyword_fields):
-            spec = self._schema.by_name(name)
+        for name in fulltext_candidates(coll_schema, self._keyword_fields):
+            spec = coll_schema.by_name(name)
             if spec is not None:
                 specs.append(spec)
         return specs

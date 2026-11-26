@@ -214,7 +214,7 @@ def index_name(table: str, *parts: str, taken: set[str] | None = None) -> str:
 def _path_matches_fn(schema_name: str) -> Statement:
     """Build the path-scope helper, a port of ``_path_matches``.
 
-    Kept equivalent to the Python reference in
+    Kept equivalent to the Python reference in OpenViking 0.4's
     ``openviking/storage/vectordb/index/cuvs_index.py``: normalise both sides
     to a leading slash and no trailing slash, compute the relative depth of
     *value* beneath *expected*, and compare against the depth budget (negative
@@ -356,7 +356,7 @@ _COLUMN_TYPES: dict[str, sql.SQL] = {
 }
 
 
-def _column_type(spec: FieldSpec) -> sql.Composable:
+def column_type(spec: FieldSpec) -> sql.Composable:
     """Return the PostgreSQL column type for a field.
 
     Parameters
@@ -412,7 +412,7 @@ def create_table(schema_name: str, table: str, coll: CollectionSchema) -> Statem
                     sql.SQL("{} real").format(sql.Identifier(spec.name + suffix))
                 )
             continue
-        column = sql.SQL("{} {}").format(sql.Identifier(spec.name), _column_type(spec))
+        column = sql.SQL("{} {}").format(sql.Identifier(spec.name), column_type(spec))
         if spec.is_primary:
             column = sql.SQL("{} PRIMARY KEY").format(column)
         columns.append(column)

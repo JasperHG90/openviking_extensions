@@ -7,8 +7,8 @@ Run with::
 
 The most valuable test here is ``test_filter_semantics_match_reference``: it
 generates random records and random filters, evaluates each filter both in
-PostgreSQL (through the adapter) and in Python (through OpenViking's own
-``matches_filter``), and asserts the two agree on every row.  That is what
+PostgreSQL (through the adapter) and in OpenViking's own local backend (see
+``tests/reference.py``), and asserts the two agree on every row.  That is what
 pins this backend to native behaviour rather than to my reading of it.
 """
 
@@ -19,26 +19,20 @@ import random
 from collections.abc import Iterator
 from typing import Any
 
+import psycopg
 import pytest
-from openviking.storage.vectordb.index.cuvs_index import (
-    UnsupportedCuVSFilterError,
-    matches_filter,
-)
-from openviking.storage.vectordb.utils.data_processor import DataProcessor
 from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
 from psycopg import sql
 
 from ov_postgres.adapter import PgVectorCollectionAdapter
 from ov_postgres.collection import NO_VECTOR_SCORE
 
+from .reference import LocalReference, engine_answer
+
 pytestmark = pytest.mark.integration
 
-# `CollectionAdapter.query` synthesises a random vector for filter-only queries,
-# sized from `get_openviking_config().embedding.dimension` rather than from the
-# collection, so the two must agree or those queries fail on a dimension
-# mismatch. Rather than read the developer's real ~/.openviking config -- which
-# would make the suite machine-dependent -- the `_fixed_embedding_dimension`
-# fixture in conftest.py pins that lookup to this value.
+# `CollectionAdapter.query` sizes the random vector it builds for a filter-only
+# query from the collection's own `Dim`, so every schema here declares this.
 DIM = 8
 
 META: dict[str, Any] = {
@@ -53,6 +47,9 @@ META: dict[str, Any] = {
         {"FieldName": "level", "FieldType": "int64"},
         {"FieldName": "active_count", "FieldType": "int64"},
         {"FieldName": "created_at", "FieldType": "date_time"},
+        # `CollectionAdapter.delete(filter=...)` pages through matches ordered
+        # by `updated_at`, as the real context schema allows.
+        {"FieldName": "updated_at", "FieldType": "date_time"},
         {"FieldName": "search_tags", "FieldType": "list<string>"},
         {"FieldName": "vector", "FieldType": "vector", "Dim": DIM},
         {"FieldName": "sparse_vector", "FieldType": "sparse_vector"},
@@ -67,43 +64,6 @@ META: dict[str, Any] = {
         "search_tags",
     ],
 }
-
-FIELD_TYPES = {f["FieldName"]: f["FieldType"] for f in META["Fields"]}
-
-
-def as_reference_row(meta: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
-    """Return the row the native engine would hold for ``record``.
-
-    The reference's validator substitutes a per-type default for every omitted
-    field, so evaluating ``matches_filter`` against the raw input dict would
-    compare this backend's SQL against this backend's own NULL model -- a
-    self-confirming oracle that can never see a defaulting divergence. Passing
-    the record through ``DataProcessor`` uses the engine's real row instead.
-
-    Parameters
-    ----------
-    meta :
-        The collection schema the record belongs to.
-    record :
-        The record as handed to ``upsert``.
-
-    Returns
-    -------
-    dict[str, Any]
-        The validated, defaulted row the engine would store.
-    """
-    fields = {f["FieldName"]: f for f in meta["Fields"]}
-    processor = DataProcessor(fields_dict=fields, tz_policy="local")
-    validated = processor.validate_and_process(record)
-    # `LocalCollection._write_data_list` pops the vector and sparse-vector keys
-    # before serialising, so the engine's index row holds neither. Leaving them
-    # in would make the oracle agree with this backend exactly where this
-    # backend disagrees with the engine.
-    for spec in meta["Fields"]:
-        if spec["FieldType"] in ("vector", "sparse_vector"):
-            validated.pop(spec["FieldName"], None)
-    row: dict[str, Any] = processor.convert_fields_dict_for_index(validated)
-    return row
 
 
 def make_adapter(dsn: str, schema: str, **params: object) -> PgVectorCollectionAdapter:
@@ -356,6 +316,74 @@ def test_keyword_search_covers_array_fields(adapter: PgVectorCollectionAdapter) 
     assert [r["id"] for r in adapter.search_by_keywords(keywords=["kubernetes"])] == ["a"]
 
 
+def test_keyword_search_accepts_the_engine_arguments_openviking_sends(
+    adapter: PgVectorCollectionAdapter,
+) -> None:
+    """``mode`` and ``fields`` pass through the facade and change nothing.
+
+    OpenViking's own keyword callers send ``mode="bm25", fields=["content"]``.
+    This backend searches its configured keyword fields either way, so the
+    hits must match a plain call.
+    """
+    adapter.upsert(
+        [
+            {"id": "a", "name": "postgres vector search", "vector": vec(1)},
+            {"id": "b", "name": "completely unrelated", "vector": vec(2)},
+        ]
+    )
+    plain = adapter.search_by_keywords(query="postgres", limit=10)
+    tuned = adapter.search_by_keywords(
+        query="postgres", limit=10, mode="bm25", fields=["content"]
+    )
+    assert [r["id"] for r in tuned] == [r["id"] for r in plain] == ["a"]
+
+
+@pytest.mark.parametrize(
+    "kwargs,error",
+    [
+        ({"mode": "vector"}, ValueError),
+        ({"bm25_k1": 1.2}, ValueError),
+        ({"advance": {"post_process_input_limit": 50}}, NotImplementedError),
+    ],
+)
+def test_keyword_search_refuses_what_it_cannot_honour(
+    adapter: PgVectorCollectionAdapter, kwargs: dict[str, Any], error: type[Exception]
+) -> None:
+    """An option with no PostgreSQL form fails rather than being ignored."""
+    with pytest.raises(error):
+        adapter.search_by_keywords(query="postgres", limit=10, **kwargs)
+
+
+def test_random_search_runs_through_the_facade(
+    adapter: PgVectorCollectionAdapter,
+) -> None:
+    """The facade always passes ``advance``; ``None`` must be accepted."""
+    adapter.upsert([{"id": "a", "level": 1, "vector": vec(1)}])
+    results = adapter.search_by_random(
+        filter={"op": "must", "field": "level", "conds": [1]}, limit=5
+    )
+    assert [r["id"] for r in results] == ["a"]
+    with pytest.raises(NotImplementedError, match="post_process_ops"):
+        adapter.search_by_random(limit=5, advance={"post_process_ops": []})
+
+
+def test_get_meta_data_raises_when_asked_and_the_registry_row_is_gone(
+    dsn: str, adapter: PgVectorCollectionAdapter, test_schema: str
+) -> None:
+    """``raise_on_error=True`` refuses the in-memory fallback."""
+    collection = adapter.get_collection()
+    assert collection.get_meta_data(raise_on_error=True)["CollectionName"] == "context"
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(
+            sql.SQL("DELETE FROM {}.{}").format(
+                sql.Identifier(test_schema), sql.Identifier("ov_collections")
+            )
+        )
+    assert collection.get_meta_data()["CollectionName"] == "context"
+    with pytest.raises(LookupError):
+        collection.get_meta_data(raise_on_error=True)
+
+
 def test_count_with_and_without_filter(adapter: PgVectorCollectionAdapter) -> None:
     """Counting honours the filter it is given."""
     adapter.upsert(
@@ -473,8 +501,8 @@ def _random_record(rng: random.Random, index: int) -> dict[str, Any]:
     return record
 
 
-def _candidate_filters() -> list[dict[str, Any]]:
-    """Return every leaf filter plus each pairwise and/or combination."""
+def _candidate_leaves() -> list[dict[str, Any]]:
+    """Return the leaf filters the main sweep combines pairwise."""
     leaves: list[dict[str, Any]] = [
         {"op": "must", "field": "context_type", "conds": ["memory"]},
         {"op": "must", "field": "context_type", "conds": ["memory", "skill"]},
@@ -517,58 +545,113 @@ def _candidate_filters() -> list[dict[str, Any]]:
         # A wrapper around a leaf.
         {"filter": {"op": "must", "field": "context_type", "conds": ["memory"]}},
     ]
-    combos: list[dict[str, Any]] = list(leaves)
-    for left, right in itertools.combinations(leaves, 2):
-        combos.append({"op": "and", "conds": [left, right]})
-        combos.append({"op": "or", "conds": [left, right]})
-    return combos
+    return leaves
+
+
+# Leaves the native engine does not evaluate (see `LocalReference.evaluates`).
+# Listed rather than discovered, so the day the engine starts parsing one of
+# them the sweep fails and somebody decides what it should mean here. Until
+# then each is pinned by a test of its own in this file.
+_UNEVALUATED_LEAVES: list[dict[str, Any]] = [
+    {"op": "must", "field": "name", "conds": [None]},
+    {"op": "must_not", "field": "name", "conds": [None]},
+    {"op": "must", "field": "context_type", "conds": []},
+    {"filter": {"op": "must", "field": "context_type", "conds": ["memory"]}},
+]
+
+# Leaves the engine evaluates and this backend deliberately answers otherwise.
+# OpenViking 0.4's Python evaluator matched `contains` against text only; the
+# 0.5 engine stringifies an int64 and substring-matches it. OpenViking builds
+# `contains` only for text fields, so this backend keeps the narrower rule
+# rather than invent a decimal rendering for numbers.
+_DIVERGENT_LEAVES: list[dict[str, Any]] = [
+    {"op": "contains", "field": "level", "substring": "1"},
+]
+
+
+def _sweep(
+    adapter: PgVectorCollectionAdapter,
+    reference: LocalReference,
+    leaves: list[dict[str, Any]],
+    *,
+    unevaluated: list[dict[str, Any]],
+    divergent: list[dict[str, Any]],
+) -> int:
+    """Compare every evaluable leaf, and each pairwise and/or of them.
+
+    Parameters
+    ----------
+    adapter :
+        The backend under test, holding the same records as ``reference``.
+    reference :
+        OpenViking's local backend.
+    leaves :
+        Leaf filters to compare and combine.
+    unevaluated :
+        The leaves the engine is expected not to evaluate. Asserted exactly.
+    divergent :
+        Leaves left out of the comparison on purpose, each with its reason
+        beside the list that names it.
+
+    Returns
+    -------
+    int
+        How many filters were compared.
+    """
+    skipped = [leaf for leaf in leaves if not reference.evaluates(leaf)]
+    assert skipped == unevaluated, (
+        "the set of leaves the engine cannot evaluate changed; decide what "
+        f"each should mean here, then update the list: {skipped!r}"
+    )
+    compared = [leaf for leaf in leaves if leaf not in skipped and leaf not in divergent]
+    nodes = list(compared)
+    for left, right in itertools.combinations(compared, 2):
+        nodes.append({"op": "and", "conds": [left, right]})
+        nodes.append({"op": "or", "conds": [left, right]})
+
+    mismatches: list[str] = []
+    for node in nodes:
+        expected = reference.matching_ids(node)
+        actual = {r["id"] for r in adapter.query(filter=node, limit=1000)}
+        if actual != expected:
+            mismatches.append(
+                f"filter {node!r}\n  sql-only: {sorted(actual - expected)}"
+                f"\n  engine-only: {sorted(expected - actual)}"
+            )
+    assert not mismatches, f"{len(mismatches)} filters disagree:\n" + "\n".join(
+        mismatches
+    )
+    for leaf in divergent:
+        assert reference.evaluates(leaf), f"no longer evaluated by the engine: {leaf!r}"
+        assert reference.matching_ids(leaf), f"engine stopped matching: {leaf!r}"
+        assert adapter.query(filter=leaf, limit=1000) == [], leaf
+    return len(nodes)
 
 
 def test_filter_semantics_match_reference(adapter: PgVectorCollectionAdapter) -> None:
-    """Every filter must select the same rows in SQL as in Python.
+    """Every filter must select the same rows in SQL as in the native engine.
 
-    ``matches_filter`` is the evaluator OpenViking's cuVS path uses, and it is
-    the authoritative statement of what the DSL means.  Anywhere the SQL
-    disagrees, the SQL is wrong.
+    OpenViking's local backend is the authoritative statement of what the DSL
+    means. Anywhere the SQL disagrees, the SQL is wrong.
     """
     rng = random.Random(20260829)
     records = [_random_record(rng, i) for i in range(60)]
     adapter.upsert(records)
+    reference = LocalReference(META)
+    reference.upsert(records)
 
-    # The adapter path-encodes `uri` on write, so the Python evaluator must see
-    # the same encoded value the database stores; DataProcessor then applies the
-    # engine's own defaults and conversions.
-    encoded = []
-    for record in records:
-        row = dict(record)
-        row["uri"] = PgVectorCollectionAdapter._encode_uri_field_value(row["uri"])
-        encoded.append(as_reference_row(META, row))
-
-    checked = 0
-    skipped: list[dict[str, Any]] = []
-    for node in _candidate_filters():
-        try:
-            expected = {
-                row["id"] for row in encoded if matches_filter(row, node, FIELD_TYPES)
-            }
-        except UnsupportedCuVSFilterError:
-            # The reference refuses some nodes (date_time, geo_point). Those
-            # cannot be compared against anything, so they are counted and
-            # asserted on below rather than quietly dropped.
-            skipped.append(node)
-            continue
-
-        actual = {r["id"] for r in adapter.query(filter=node, limit=1000)}
-        assert actual == expected, (
-            f"filter {node!r}\n  sql-only: {sorted(actual - expected)}"
-            f"\n  py-only:  {sorted(expected - actual)}"
+    try:
+        checked = _sweep(
+            adapter,
+            reference,
+            _candidate_leaves(),
+            unevaluated=_UNEVALUATED_LEAVES,
+            divergent=_DIVERGENT_LEAVES,
         )
-        checked += 1
+    finally:
+        reference.close()
 
     assert checked > 100, f"expected a broad sweep, only compared {checked} filters"
-    # Every candidate must actually be compared. A new filter the reference
-    # cannot evaluate would otherwise pass this test without being verified.
-    assert not skipped, f"{len(skipped)} filters were never compared: {skipped[:3]}"
 
 
 @pytest.mark.parametrize(
@@ -727,9 +810,9 @@ def test_conds_containing_none_matches_a_null_column(
 
     Once engine defaults are applied, a scalar is never missing -- a string is
     ``""``, an int is ``0``. Only ``date_time`` and ``geo_point`` stay NULL,
-    because the engine drops them when empty. The reference cannot be used as
-    an oracle here: ``matches_filter`` refuses ``date_time`` fields outright
-    (``UnsupportedCuVSFilterError``), so this pins our own behaviour instead.
+    because the engine drops them when empty. The engine cannot be used as an
+    oracle here: it does not evaluate a ``None`` operand (see
+    ``tests/reference.py``), so this pins our own behaviour instead.
     """
     adapter.upsert(
         [
@@ -813,8 +896,6 @@ WIDE_META: dict[str, Any] = {
     "ScalarIndex": ["flag", "score", "counts", "body"],
 }
 
-WIDE_FIELD_TYPES = {f["FieldName"]: f["FieldType"] for f in WIDE_META["Fields"]}
-
 
 @pytest.fixture
 def wide_adapter(dsn: str, test_schema: str) -> Iterator[PgVectorCollectionAdapter]:
@@ -845,8 +926,8 @@ def _wide_record(rng: random.Random, index: int) -> dict[str, Any]:
     return record
 
 
-def _wide_candidate_filters() -> list[dict[str, Any]]:
-    """Return leaf filters over the wide schema, plus pairwise combinations."""
+def _wide_candidate_leaves() -> list[dict[str, Any]]:
+    """Return the leaf filters over the wide schema that its sweep combines."""
     leaves: list[dict[str, Any]] = [
         {"op": "must", "field": "flag", "conds": [True]},
         {"op": "must", "field": "flag", "conds": [False]},
@@ -873,11 +954,18 @@ def _wide_candidate_filters() -> list[dict[str, Any]]:
         {"op": "contains", "field": "score", "substring": "0"},
         {"op": "must", "field": "body", "conds": [7]},
     ]
-    combos: list[dict[str, Any]] = list(leaves)
-    for left, right in itertools.combinations(leaves, 2):
-        combos.append({"op": "and", "conds": [left, right]})
-        combos.append({"op": "or", "conds": [left, right]})
-    return combos
+    return leaves
+
+
+# As `_UNEVALUATED_LEAVES`, for the wide schema: the engine evaluates no
+# equality test on a float32 field, and no `None` operand at all.
+_WIDE_UNEVALUATED_LEAVES: list[dict[str, Any]] = [
+    {"op": "must", "field": "score", "conds": [0.1]},
+    {"op": "must", "field": "score", "conds": [0.1, 9.75]},
+    {"op": "must_not", "field": "score", "conds": [0.5]},
+    {"op": "must", "field": "flag", "conds": [None]},
+    {"op": "must", "field": "score", "conds": [None]},
+]
 
 
 def test_filter_semantics_match_reference_for_remaining_types(
@@ -895,43 +983,43 @@ def test_filter_semantics_match_reference_for_remaining_types(
     rng = random.Random(20260830)
     records = [_wide_record(rng, i) for i in range(60)]
     wide_adapter.upsert(records)
-    reference_rows = [as_reference_row(WIDE_META, r) for r in records]
+    reference = LocalReference(WIDE_META)
+    reference.upsert(records)
 
-    checked = 0
-    skipped: list[dict[str, Any]] = []
-    for node in _wide_candidate_filters():
-        try:
-            expected = {
-                row["id"]
-                for row in reference_rows
-                if matches_filter(row, node, WIDE_FIELD_TYPES)
-            }
-        except UnsupportedCuVSFilterError:
-            skipped.append(node)
-            continue
-
-        actual = {r["id"] for r in wide_adapter.query(filter=node, limit=1000)}
-        assert actual == expected, (
-            f"filter {node!r}\n  sql-only: {sorted(actual - expected)}"
-            f"\n  py-only:  {sorted(expected - actual)}"
+    try:
+        checked = _sweep(
+            wide_adapter,
+            reference,
+            _wide_candidate_leaves(),
+            unevaluated=_WIDE_UNEVALUATED_LEAVES,
+            divergent=[],
         )
-        checked += 1
+    finally:
+        reference.close()
 
-    assert checked > 400, f"expected a broad sweep, only compared {checked} filters"
-    assert not skipped, f"{len(skipped)} filters were never compared: {skipped[:3]}"
+    assert checked > 300, f"expected a broad sweep, only compared {checked} filters"
 
 
-@pytest.mark.parametrize("field", ["search_tags", "level"])
-@pytest.mark.parametrize("op", ["range", "range_out"])
+@pytest.mark.parametrize(
+    "op,field,expect",
+    [
+        ("range", "search_tags", {"has", "empty"}),
+        ("range", "level", {"has", "empty"}),
+        ("range_out", "search_tags", set()),
+        ("range_out", "level", set()),
+    ],
+)
 def test_range_without_bounds_matches_present_values(
-    adapter: PgVectorCollectionAdapter, field: str, op: str
+    adapter: PgVectorCollectionAdapter, op: str, field: str, expect: set[str]
 ) -> None:
     """A range carrying no bounds tests only for a present value.
 
     ``Range(field)`` with every bound left as None compiles to a bare
-    ``{"op": "range", "field": ...}``. The reference rejects only a missing
-    *value*, so a present one passes every absent check and matches. Guarding
-    array columns unconditionally made this return nothing.
+    ``{"op": "range", "field": ...}``. OpenViking 0.4's evaluator rejected only
+    a missing *value*, so a present one passed every absent check and matched;
+    guarding array columns unconditionally made this return nothing. The 0.5
+    engine does not evaluate a range without bounds, so the expectation is
+    pinned to the 0.4 answer.
     """
     records: list[dict[str, Any]] = [
         {"id": "has", "level": 3, "search_tags": ["x"], "vector": vec(1)},
@@ -940,35 +1028,51 @@ def test_range_without_bounds_matches_present_values(
     adapter.upsert(records)
 
     node = {"op": op, "field": field}
-    expected = {
-        r["id"]
-        for r in (as_reference_row(META, rec) for rec in records)
-        if matches_filter(r, node, FIELD_TYPES)
-    }
-    actual = {r["id"] for r in adapter.query(filter=node, limit=50)}
-    assert actual == expected
+    assert {r["id"] for r in adapter.query(filter=node, limit=50)} == expect
+    assert engine_answer(META, records, node) in (None, expect)
+
+
+# The answer OpenViking's 0.5 engine gives where it differs from 0.4's. It
+# has no range over a bool and no bool operand against a float32, and answers
+# both with nothing. OpenViking never builds either filter, so this backend
+# keeps 0.4's `True == 1`; these entries make a change on either side visible.
+_ENGINE_ANSWERS_NOTHING: set[str] = set()
 
 
 @pytest.mark.parametrize(
-    "node",
+    "node,expect,engine",
     [
-        {"op": "must", "field": "flag", "conds": [1]},
-        {"op": "must", "field": "flag", "conds": [0]},
-        {"op": "must_not", "field": "flag", "conds": [1]},
-        {"op": "range", "field": "flag", "gte": 0},
-        {"op": "must", "field": "flag", "conds": [2]},
-        {"op": "must", "field": "score", "conds": [True]},
-        {"op": "range", "field": "score", "gte": True},
+        ({"op": "must", "field": "flag", "conds": [1]}, {"t"}, None),
+        ({"op": "must", "field": "flag", "conds": [0]}, {"f", "none"}, None),
+        ({"op": "must_not", "field": "flag", "conds": [1]}, {"f", "none"}, None),
+        (
+            {"op": "range", "field": "flag", "gte": 0},
+            {"t", "f", "none"},
+            _ENGINE_ANSWERS_NOTHING,
+        ),
+        ({"op": "must", "field": "flag", "conds": [2]}, set(), None),
+        (
+            {"op": "must", "field": "score", "conds": [True]},
+            {"t"},
+            _ENGINE_ANSWERS_NOTHING,
+        ),
+        ({"op": "range", "field": "score", "gte": True}, {"t"}, None),
     ],
 )
 def test_bool_and_int_operands_interoperate(
-    wide_adapter: PgVectorCollectionAdapter, node: dict[str, Any]
+    wide_adapter: PgVectorCollectionAdapter,
+    node: dict[str, Any],
+    expect: set[str],
+    engine: set[str] | None,
 ) -> None:
     """Python compares ``True == 1``; the SQL must agree in both directions.
 
     PostgreSQL has no implicit boolean/bigint comparison, so these operands are
     converted rather than dropped. ``2`` against a boolean column still matches
-    nothing, because the reference finds ``True == 2`` false as well.
+    nothing, because ``True == 2`` is false as well. ``none`` takes the
+    engine's default of ``False``. Where the engine evaluates the node it must
+    agree, unless ``engine`` names its differing answer; where it does not
+    evaluate the node, the answer is OpenViking 0.4's.
     """
     records: list[dict[str, Any]] = [
         {"id": "t", "flag": True, "score": 1.0, "vector": vec(1)},
@@ -977,13 +1081,11 @@ def test_bool_and_int_operands_interoperate(
     ]
     wide_adapter.upsert(records)
 
-    expected = {
-        r["id"]
-        for r in (as_reference_row(WIDE_META, rec) for rec in records)
-        if matches_filter(r, node, WIDE_FIELD_TYPES)
-    }
-    actual = {r["id"] for r in wide_adapter.query(filter=node, limit=50)}
-    assert actual == expected
+    assert {r["id"] for r in wide_adapter.query(filter=node, limit=50)} == expect
+    if engine is None:
+        assert engine_answer(WIDE_META, records, node) in (None, expect)
+    else:
+        assert engine_answer(WIDE_META, records, node) == engine
 
 
 def test_a_record_without_an_embedding_is_refused(
@@ -1013,7 +1115,6 @@ def test_omitted_fields_take_the_engine_defaults(
     """
     record = {"id": "omit", "vector": vec(1)}
     adapter.upsert(record)
-    reference = as_reference_row(META, record)
 
     for node in (
         {"op": "must", "field": "level", "conds": [0]},
@@ -1021,9 +1122,11 @@ def test_omitted_fields_take_the_engine_defaults(
         {"op": "must", "field": "name", "conds": [""]},
         {"op": "must", "field": "search_tags", "conds": []},
     ):
-        expected = {r["id"] for r in [reference] if matches_filter(r, node, FIELD_TYPES)}
         actual = {r["id"] for r in adapter.query(filter=node, limit=10)}
-        assert actual == expected, node
+        # An empty operand list matches nothing; the others match the default.
+        expect = set() if node.get("conds") == [] else {"omit"}
+        assert actual == expect, node
+        assert engine_answer(META, record, node) in (None, expect), node
 
     stored = adapter.get(["omit"])[0]
     assert stored["level"] == 0

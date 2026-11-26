@@ -445,3 +445,36 @@ def test_similarity_by_uri_speaks_the_callers_uri_scheme(
         ), "keys must come back in the scheme the caller passed"
     finally:
         adapter.close()
+
+
+def test_an_oversized_abstract_beside_a_full_body_is_stored_and_searchable(
+    dsn: str, test_schema: str
+) -> None:
+    """A 1 MiB ``abstract`` is truncated as ``content`` is, so the row lands.
+
+    OpenViking 0.5 moved ``abstract`` from the text-field byte limit to a
+    separate string-field limit that truncates nothing unless set. Distinct
+    words make the full abstract alone overflow PostgreSQL's tsvector ceiling,
+    which would abort the INSERT.
+    """
+    meta = {
+        **META,
+        "Fields": [
+            *META["Fields"],
+            {"FieldName": "abstract", "FieldType": "string"},
+            {"FieldName": "content", "FieldType": "text"},
+        ],
+    }
+    adapter = build(dsn, test_schema, meta=meta, store_content=True)
+    try:
+        abstract = " ".join(f"zq{index}" for index in range(150_000))
+        assert len(abstract.encode()) > 1024 * 1024
+        body = ("lorem ipsum dolor " * 30_000)[: 448 * 1024]
+
+        adapter.upsert([{**record("big", content=body), "abstract": abstract}])
+
+        assert adapter.get(["big"]), "the write must succeed rather than abort"
+        hits = adapter.search_by_keywords(query="zq7", limit=5)
+        assert [row["id"] for row in hits] == ["big"]
+    finally:
+        adapter.close()

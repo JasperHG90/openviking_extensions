@@ -18,7 +18,6 @@ from __future__ import annotations
 import os
 import uuid
 from collections.abc import Iterator
-from dataclasses import dataclass
 
 import pytest
 from opentelemetry import trace
@@ -139,42 +138,3 @@ def test_schema(dsn: str, _verify_pgvector: bool) -> Iterator[str]:
             conn.execute(
                 sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(name))
             )
-
-
-# Dimension the test collections declare. Must match `TEST_DIMENSION` in
-# tests/test_integration.py.
-TEST_DIMENSION = 8
-
-
-@dataclass(frozen=True)
-class _StubEmbedding:
-    """The one embedding attribute the adapter reads from global config."""
-
-    dimension: int
-
-
-@dataclass(frozen=True)
-class _StubConfig:
-    """Stand-in for the global OpenViking config during tests."""
-
-    embedding: _StubEmbedding
-
-
-@pytest.fixture(autouse=True)
-def _fixed_embedding_dimension(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pin the embedding dimension the adapter reads from global config.
-
-    ``CollectionAdapter.query`` builds a random vector for filter-only queries,
-    sized from ``get_openviking_config().embedding.dimension`` -- the single
-    global-config read in that module. Left alone the suite would consult the
-    developer's real ``~/.openviking/ov.conf``, making results depend on a file
-    no test wrote. ``EmbeddingConfig.dimension`` is a read-only property, so a
-    stub is used rather than a mutated copy.
-    """
-    from openviking.storage.vectordb_adapters import base
-
-    monkeypatch.setattr(
-        base,
-        "get_openviking_config",
-        lambda: _StubConfig(embedding=_StubEmbedding(dimension=TEST_DIMENSION)),
-    )
