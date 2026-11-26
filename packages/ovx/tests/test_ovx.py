@@ -1173,8 +1173,17 @@ def test_login_needs_no_vault_cli(
     # system directories the script needs for bash and coreutils — but no
     # `vault`. If ovx shelled out to it, this would fail. The interpreter comes
     # before /usr/bin so python3 is 3.12 rather than the 3.9 macOS ships.
+    # The system directories are linked file by file, leaving `vault` out,
+    # because a host that installs the vault CLI puts it in /usr/bin.
+    system = workspace / "system-bin"
+    system.mkdir()
+    for directory in (Path("/bin"), Path("/usr/bin")):
+        for tool in directory.iterdir():
+            link = system / tool.name
+            if tool.name != "vault" and not link.exists():
+                link.symlink_to(tool)
     interpreter = str(Path(sys.executable).parent)
-    path = os.pathsep.join([str(workspace / "bin"), interpreter, "/usr/bin", "/bin"])
+    path = os.pathsep.join([str(workspace / "bin"), interpreter, str(system)])
     assert shutil.which("vault", path=path) is None
 
     result = run(["--login", "lab"], PATH=path)
