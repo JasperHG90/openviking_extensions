@@ -26,13 +26,15 @@ classifiers = [
 dependencies = [
     # Capped: the adapter factory is a documented extension point, but what
     # this package subclasses is not. It inherits `CollectionAdapter` and
-    # depends on `_normalize_record_for_write`, `_URI_FIELD_NAMES`,
-    # `_TRUNCATABLE_TEXT_FIELDS` and `USE_CONTENT_FIELD` behaving as they do
+    # depends on `_normalize_record_for_write`, `_URI_FIELD_NAMES`, the
+    # `_TRUNCATABLE_*_FIELDS` limits and `USE_CONTENT_FIELD` behaving as they do
     # today, and on the filter DSL's exact semantics -- which the differential
-    # test pins against OpenViking's own evaluator. OpenViking is pre-1.0, so
+    # test pins against OpenViking's own engine. OpenViking is pre-1.0, so
     # the minor version is where breakage lands. Raise it once a version has
-    # been tested against this suite.
-    "openviking>=0.4.16,<0.5",
+    # been tested against this suite, together with the range in
+    # src/ov_postgres/compat.py, which enforces it at startup for installs that
+    # skip dependencies; tests/test_compat.py fails if the two disagree.
+    "openviking>=0.5.6,<0.6",
     # Spans only -- no SDK, no exporter. OpenViking's server installs the
     # global TracerProvider and owns the endpoint; this package just emits
     # into whatever is already there, and records nothing when that is

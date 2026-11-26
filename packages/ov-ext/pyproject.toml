@@ -32,11 +32,12 @@ dependencies = [
     # that is promised to survive a release. OpenViking is pre-1.0, so the
     # minor version is where breakage lands.
     #
-    # `install()` verifies what it patches at startup, so an unexpected version
-    # fails loudly rather than silently reverting to vector-only -- but a cap
-    # stops the bad combination being installed at all. Raise it once a version
-    # has been tested, not before.
-    "openviking>=0.4.16,<0.5",
+    # The cap stops the bad combination being installed at all; `install()`
+    # repeats it at startup (src/ov_ext/compat.py) for installs that skip
+    # dependencies, and verifies the internals it patches. Raise it once a
+    # version has been tested, not before, and the range in compat.py with it;
+    # tests/test_compat.py fails if the two disagree.
+    "openviking>=0.5.6,<0.6",
     # Spans only -- no SDK, no exporter. OpenViking's server installs the
     # global TracerProvider and owns the endpoint; this package just emits
     # into whatever is already there, and records nothing when that is
