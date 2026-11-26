@@ -61,17 +61,24 @@ _TRAILING_FRAGMENT = re.compile(r"\s\S*\Z")
 
 
 def _rank_below_the_model(
-    scores: list[float], reranked: list[bool], fallback_scores: list[float]
+    scores: list[float],
+    reranked: list[bool],
+    fallback_scores: list[float],
+    threshold: float = 0.0,
 ) -> None:
-    """Move every score the model did not produce below every one it did.
+    """Move every score the model did not produce below every one that survives.
 
-    Rewrites ``scores`` in place. The unscored keep their order by vector
-    score, spread evenly over the open interval between zero and the lowest
-    model score, so they stay above OpenViking's default threshold of zero.
-    When the lowest model score is not positive there is no such interval, and
-    they go below it one step apart instead; ordering beats keeping them.
-    Nothing changes when the model scored nothing, since then no scale was
-    mixed.
+    Rewrites ``scores`` in place. The floor is the lowest model score above
+    both zero and ``threshold`` -- a judged document under either is dropped
+    by OpenViking anyway, and a reranker returning raw logits puts some below
+    zero routinely. The unscored keep their order by vector score, spread
+    evenly over the open interval between zero and that floor, so they stay
+    above the default threshold of zero, which is the one applied to them.
+
+    When no model score is positive there is no such interval. The unscored
+    then go below every model score, one step apart, and that threshold drops
+    them. Nothing changes when the model scored nothing, since then no scale
+    was mixed.
 
     Parameters
     ----------
@@ -81,11 +88,13 @@ def _rank_below_the_model(
         Per document, whether the model produced its score.
     fallback_scores :
         Vector scores, which order the unscored among themselves.
+    threshold :
+        The rerank threshold applied to model scores.
     """
     model = [score for score, scored in zip(scores, reranked, strict=True) if scored]
     if not model:
         return
-    floor = min(model)
+    surviving = [score for score in model if score > max(threshold, 0.0)]
     unscored = sorted(
         (index for index, scored in enumerate(reranked) if not scored),
         key=lambda index: fallback_scores[index],
@@ -93,10 +102,10 @@ def _rank_below_the_model(
     )
     count = len(unscored)
     for rank, index in enumerate(unscored):
-        if floor > 0:
-            scores[index] = floor * (count - rank) / (count + 1)
+        if surviving:
+            scores[index] = min(surviving) * (count - rank) / (count + 1)
         else:
-            scores[index] = floor - (rank + 1)
+            scores[index] = min(model) - (rank + 1)
 
 
 def _clip_query(text: str, max_chars: int) -> str:
@@ -296,7 +305,12 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
         ):
             scores[index] = score
             reranked[index] = from_model
-        _rank_below_the_model(scores, reranked, fallback_scores)
+        _rank_below_the_model(
+            scores,
+            reranked,
+            fallback_scores,
+            float(getattr(self, "rerank_threshold", 0.0) or 0.0),
+        )
         annotate(
             {
                 "ov_ext.retrieval.reranked_documents": sum(reranked),

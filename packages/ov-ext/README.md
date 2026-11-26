@@ -287,9 +287,13 @@ but always rank **below every reranked document**. OpenViking sorts the whole
 list by score, and left on their cosines the weakest candidates could outrank
 documents the model judged, since a cosine and a rerank score share a range and
 nothing else. So their scores are replaced with values between zero and the
-lowest rerank score, in their own vector order. They stay above OpenViking's
-default threshold of zero, and the rerank threshold leaves them alone. A
-document the model was sent but returned no score for is ranked the same way.
+lowest rerank score that survives — above zero and above the rerank threshold —
+in their own vector order. They stay above OpenViking's default threshold of
+zero, which is the one applied to them. A document the model was sent but
+returned no score for is ranked the same way. If no rerank score in the batch
+is positive, as with a reranker returning raw logits for a poor match, there is
+no room above zero, so they go below every reranked document and that threshold
+drops them.
 
 Blanks are dropped **before** the cap applies. OpenViking never sends a blank
 abstract, so capping first could fill the whole allowance with documents the

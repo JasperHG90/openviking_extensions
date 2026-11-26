@@ -23,7 +23,7 @@ from ov_ext.retrieval.rerank import (
     install_pooled_rerank,
     uninstall_pooled_rerank,
 )
-from ov_ext.retrieval.retriever import HybridRetriever
+from ov_ext.retrieval.retriever import HybridRetriever, _rank_below_the_model
 
 _OPENAI_RERANK = "openviking.models.rerank.openai_rerank"
 
@@ -412,7 +412,7 @@ async def test_candidates_past_the_document_cap_rank_below_every_reranked_one(
     between zero and the lowest model score, marked as not reranked.
     """
     retriever, _ = make_recording_retriever(
-        monkeypatch, scores=[5.0, 6.0], rerank_max_documents=2
+        monkeypatch, scores=[0.05, 0.06], rerank_max_documents=2
     )
 
     result = await retriever._rerank_scores(
@@ -420,9 +420,10 @@ async def test_candidates_past_the_document_cap_rank_below_every_reranked_one(
     )
 
     assert result.reranked == [False, True, False, True]
-    assert result.scores[1] == 5.0 and result.scores[3] == 6.0
-    assert 5.0 > result.scores[2] > result.scores[0] > 0, (
-        "c above a, as their vector scores rank them, both under the model's 5.0"
+    assert result.scores[1] == 0.05 and result.scores[3] == 0.06
+    assert 0.05 > result.scores[2] > result.scores[0] > 0, (
+        "c above a, as their vector scores rank them, both under the model's 0.05 "
+        "-- though their cosines, 0.3 and 0.1, sit above it"
     )
 
 
@@ -432,13 +433,13 @@ async def test_a_document_the_model_declines_inside_the_cap_is_not_counted_reran
 ) -> None:
     """Sent but not scored stays unscored, and ranks with the held-back."""
     retriever, _ = make_recording_retriever(
-        monkeypatch, scores=[5.0], declined=frozenset({"b"}), rerank_max_documents=2
+        monkeypatch, scores=[0.02], declined=frozenset({"b"}), rerank_max_documents=2
     )
 
     result = await retriever._rerank_scores("q", ["a", "b", "c"], [0.9, 0.8, 0.1])
 
     assert result.reranked == [True, False, False]
-    assert 5.0 > result.scores[1] > result.scores[2] > 0
+    assert 0.02 > result.scores[1] > result.scores[2] > 0
 
 
 @pytest.mark.asyncio
@@ -470,7 +471,9 @@ async def test_the_cap_spends_its_allowance_on_documents_that_carry_text(
     blanks -- the base class never sends a blank, so the call would go out
     empty. Found by adversarial review.
     """
-    retriever, seen = make_recording_retriever(monkeypatch, rerank_max_documents=2)
+    retriever, seen = make_recording_retriever(
+        monkeypatch, scores=[0.05], rerank_max_documents=2
+    )
 
     result = await retriever._rerank_scores(
         "q", ["real text", "", "   "], [0.1, 0.9, 0.8]
@@ -480,4 +483,56 @@ async def test_the_cap_spends_its_allowance_on_documents_that_carry_text(
         "the allowance must go to text the service can read"
     )
     assert result.reranked == [True, False, False]
-    assert 9.0 > result.scores[1] > result.scores[2] > 0
+    assert 0.05 > result.scores[1] > result.scores[2] > 0
+
+
+def ranked(
+    scores: list[float], reranked: list[bool], threshold: float = 0.0
+) -> list[float]:
+    """Run ``_rank_below_the_model`` on a copy, with the scores as the fallbacks."""
+    out = list(scores)
+    _rank_below_the_model(out, reranked, list(scores), threshold)
+    return out
+
+
+def test_logit_scores_below_zero_do_not_drag_the_unscored_under_the_threshold() -> None:
+    """A negative model score is dropped anyway; the floor is the lowest that survives.
+
+    Rerankers returning raw logits put some judged documents below zero. Taking
+    the floor from those would push every unscored document negative too, and
+    OpenViking's default threshold of zero would then drop them all.
+    """
+    out = ranked([-2.0, 3.0, -3.0, -4.0], [True, True, False, False])
+    assert out[:2] == [-2.0, 3.0]
+    assert 3.0 > out[2] > out[3] > 0
+
+
+def test_with_no_positive_model_score_the_unscored_go_below_everything() -> None:
+    """No interval above zero exists, so order wins and the threshold drops them."""
+    out = ranked([0.0, 0.5, -1.0], [True, False, False])
+    assert out[0] == 0.0
+    assert 0.0 > out[1] > out[2]
+
+
+def test_equal_model_scores_still_leave_room_below_them() -> None:
+    """All the model scores alike: the unscored go under that one value."""
+    out = ranked([1.0, 1.0, 1.4, 1.3], [True, True, False, False])
+    assert 1.0 > out[2] > out[3] > 0
+
+
+def test_the_floor_ignores_model_scores_the_rerank_threshold_drops() -> None:
+    """Only scores that clear the rerank threshold set the floor."""
+    out = ranked([0.1, 2.0, 0.9], [True, True, False], threshold=0.5)
+    assert 2.0 > out[2] > 0.1, "0.1 is under the threshold and does not set the floor"
+
+
+@pytest.mark.parametrize(
+    "scores,reranked",
+    [([0.4, 0.3], [False, False]), ([], [])],
+    ids=["all-held", "empty"],
+)
+def test_nothing_moves_when_the_model_scored_nothing(
+    scores: list[float], reranked: list[bool]
+) -> None:
+    """No model score, no second scale to separate from."""
+    assert ranked(scores, reranked) == scores
