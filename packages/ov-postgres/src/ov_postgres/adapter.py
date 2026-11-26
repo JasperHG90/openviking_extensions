@@ -30,6 +30,7 @@ from psycopg_pool import ConnectionPool
 
 from . import ddl
 from .collection import PgVectorCollection
+from .compat import check_openviking_version
 from .config import DSN_ENV_VARS, PgVectorParams, VectorDBConfigLike, resolve_dsn
 from .observability import DB_SYSTEM, annotate, traced
 from .schema import CollectionSchema
@@ -168,11 +169,15 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
 
         Raises
         ------
+        RuntimeError
+            If the installed OpenViking is outside the range this package was
+            tested against; see :mod:`ov_postgres.compat`.
         pydantic.ValidationError
             If ``custom_params`` contains an unknown or invalid option.
         ValueError
             If no connection string is configured.
         """
+        check_openviking_version()
         raw_params = getattr(config, "custom_params", None) or {}
         params = PgVectorParams.model_validate(raw_params)
 
