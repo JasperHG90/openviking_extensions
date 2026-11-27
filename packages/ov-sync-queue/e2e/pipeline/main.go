@@ -9,7 +9,8 @@
 // it serves the fake OpenViking itself.
 //
 // The fake keeps files and folders in memory and answers the three calls the
-// consumer makes for text files: content/write, DELETE fs and fs/ls. Anything
+// consumer makes for text files: content/write, DELETE fs and fs/ls, which
+// lists OpenViking's .abstract.md and .overview.md in every folder. Anything
 // else, such as an image upload, is logged as UNEXPECTED and refused. GET
 // /_files returns every file it holds (uri to content), GET /_dirs every
 // folder, and GET /_calls every call it took.
@@ -108,7 +109,12 @@ func (f *fakeOV) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"status":"error"}`, http.StatusNotFound)
 			return
 		}
-		entries := []map[string]any{}
+		// OpenViking keeps a summary pair in every folder, so the consumer
+		// must look past them to see that a folder is empty.
+		entries := []map[string]any{
+			{"uri": uri + "/.abstract.md", "isDir": false},
+			{"uri": uri + "/.overview.md", "isDir": false},
+		}
 		for k := range f.files {
 			if parent(k) == uri {
 				entries = append(entries, map[string]any{"uri": k, "isDir": false})

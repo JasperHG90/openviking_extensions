@@ -146,12 +146,17 @@ jq -e --arg r "$ov/notes/docs/deep" 'has($r) | not' <<<"$dirs" >/dev/null ||
     fail "the emptied folder docs/deep was left in OpenViking: $all"
 jq -e --arg r "$ov/notes/docs" 'has($r)' <<<"$dirs" >/dev/null ||
     fail "the folder docs, which still holds a.md, was removed: $all"
-if docker logs "$run_id-consumer" 2>&1 | grep -q 'dead-lettering'; then
+# Capture first: under pipefail, grep -q exiting early can kill docker logs
+# with SIGPIPE and hide the match.
+consumer_log=$(docker logs "$run_id-consumer" 2>&1)
+if grep -q 'dead-lettering' <<<"$consumer_log"; then
     fail "the consumer dead-lettered an event"
 fi
 msgs=$(curl -sf "http://127.0.0.1:$mon_port/jsz?streams=true" |
     jq '.account_details[0].stream_detail[] | select(.name == "OV_SYNC") | .state.messages')
-[ "$msgs" -ge 6 ] || fail "OV_SYNC holds $msgs events; want at least 6 (3 uploads, 1 edit, 2 deletes)"
+# Folder and manifest events count too, so this only shows events flowed;
+# wait_for above is what checks each change.
+[ "$msgs" -ge 6 ] || fail "OV_SYNC holds $msgs events; six file changes should give at least 6"
 out=$("$work/ovsq" status .)
 grep -qF "0 to upload, 0 to delete, 1 unchanged" <<<"$out" || fail "ovsq status after the runs: $out"
 
