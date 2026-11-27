@@ -3,8 +3,8 @@
   "rows": [
     {
       "id": "r1",
-      "behavior": "A first ovsq run uploads every selected file to <prefix>/<path> and writes <prefix>/_state/manifest.json mapping each repo-relative path to its sha256, in the CI action's format.",
-      "fails_when": "a selected file is not in the fake bucket under its key, or the manifest is missing, not path-to-sha256 JSON, or lists a wrong hash",
+      "behavior": "A first ovsq run uploads every selected file to <prefix>/<path> and writes <prefix>/_state/ovsq-<source>.json mapping each prefix-relative path (subdir included) to its sha256, in the CI action's format, and never writes <prefix>/_state/manifest.json.",
+      "fails_when": "a selected file is not in the fake bucket under its key, the manifest is missing, not path-to-sha256 JSON, lists a wrong hash or a path without subdir, or manifest.json is written",
       "command": "go -C packages/ov-sync-queue test ./... -run '^TestRunUploadsAndWritesManifest$' -count=1"
     },
     {
@@ -33,7 +33,7 @@
     },
     {
       "id": "r6",
-      "behavior": "The config loads from ov-sync-queue.toml with defaults, OVSQ_ environment variables override it, and a prefix that is not <owner>/<name> is refused with a message naming the key.",
+      "behavior": "The config loads from ov-sync-queue.toml with defaults, OVSQ_ environment variables override it, and a prefix that is not <owner>/<name> or a source that is not letters, digits and dashes is refused with a message naming the key.",
       "fails_when": "a default, an override or the refusal does not behave as stated",
       "command": "go -C packages/ov-sync-queue test ./... -run '^TestConfig$' -count=1"
     },

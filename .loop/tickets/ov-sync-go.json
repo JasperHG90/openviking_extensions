@@ -22,16 +22,16 @@
   "stamps": [],
   "signoff": {
     "signer": "delegated:jasperginn@gmail.com/claude",
-    "hash": "813c58f902985e0dc6d3dddcdd6aade27af28e6058c68c686cf3f06c778b2340",
-    "at": "2026-11-27T08:47:05+00:00"
+    "hash": "430c27c563a7b915aecb0b666675ebb8356799a6cf824410744e626a0eddfaa0",
+    "at": "2026-11-27T08:49:58+00:00"
   },
   "delegation": null,
   "budget_base": null,
   "signed_rows": [
     {
       "id": "r1",
-      "behavior": "A first ovsq run uploads every selected file to <prefix>/<path> and writes <prefix>/_state/manifest.json mapping each repo-relative path to its sha256, in the CI action's format.",
-      "fails_when": "a selected file is not in the fake bucket under its key, or the manifest is missing, not path-to-sha256 JSON, or lists a wrong hash",
+      "behavior": "A first ovsq run uploads every selected file to <prefix>/<path> and writes <prefix>/_state/ovsq-<source>.json mapping each prefix-relative path (subdir included) to its sha256, in the CI action's format, and never writes <prefix>/_state/manifest.json.",
+      "fails_when": "a selected file is not in the fake bucket under its key, the manifest is missing, not path-to-sha256 JSON, lists a wrong hash or a path without subdir, or manifest.json is written",
       "command": "go -C packages/ov-sync-queue test ./... -run '^TestRunUploadsAndWritesManifest$' -count=1",
       "judgment": false
     },
@@ -65,7 +65,7 @@
     },
     {
       "id": "r6",
-      "behavior": "The config loads from ov-sync-queue.toml with defaults, OVSQ_ environment variables override it, and a prefix that is not <owner>/<name> is refused with a message naming the key.",
+      "behavior": "The config loads from ov-sync-queue.toml with defaults, OVSQ_ environment variables override it, and a prefix that is not <owner>/<name> or a source that is not letters, digits and dashes is refused with a message naming the key.",
       "fails_when": "a default, an override or the refusal does not behave as stated",
       "command": "go -C packages/ov-sync-queue test ./... -run '^TestConfig$' -count=1",
       "judgment": false
@@ -99,7 +99,26 @@
       "judgment": true
     }
   ],
-  "resigns": [],
+  "resigns": [
+    {
+      "signer": "delegated:jasperginn@gmail.com/claude",
+      "reason": "plan round 1: each source gets its own manifest key, never manifest.json; source key validated",
+      "diff": {
+        "added": [],
+        "removed": [],
+        "changed": {
+          "r1": [
+            "behavior",
+            "fails_when"
+          ],
+          "r6": [
+            "behavior"
+          ]
+        }
+      },
+      "at": "2026-11-27T08:49:58+00:00"
+    }
+  ],
   "accepted_risks": [],
   "waivers": [],
   "overrides": [],
@@ -138,5 +157,5 @@
     }
   ],
   "by": "process:loopctl/2.3.1.dev65+g93b143856",
-  "at": "2026-11-27T08:49:45+00:00"
+  "at": "2026-11-27T08:49:58+00:00"
 }
