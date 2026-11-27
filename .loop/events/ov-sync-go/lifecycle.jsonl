@@ -1,2 +1,3 @@
 {"at": "2026-11-27T08:43:51+00:00", "kind": "register", "schema_version": "1.0", "stage": "planning"}
 {"at": "2026-11-27T08:46:20+00:00", "kind": "spike-note", "n": 1, "replaced": false, "schema_version": "1.0"}
+{"at": "2026-11-27T08:47:05+00:00", "grant": "g1", "hash": "813c58f902985e0dc6d3dddcdd6aade27af28e6058c68c686cf3f06c778b2340", "kind": "signoff", "schema_version": "1.0", "signer": "delegated:jasperginn@gmail.com/claude", "step": "eval-sign"}

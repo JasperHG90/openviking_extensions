@@ -1,0 +1,65 @@
+{
+  "schema_version": "1.0",
+  "rows": [
+    {
+      "id": "r1",
+      "behavior": "A first ovsq run uploads every selected file to <prefix>/<path> and writes <prefix>/_state/manifest.json mapping each repo-relative path to its sha256, in the CI action's format.",
+      "fails_when": "a selected file is not in the fake bucket under its key, or the manifest is missing, not path-to-sha256 JSON, or lists a wrong hash",
+      "command": "go -C packages/ov-sync-queue test ./... -run '^TestRunUploadsAndWritesManifest$' -count=1"
+    },
+    {
+      "id": "r2",
+      "behavior": "A second run with no change, and a run after the local cache is deleted while the manifest matches, uploads nothing.",
+      "fails_when": "the fake bucket records any PUT other than none on either run",
+      "command": "go -C packages/ov-sync-queue test ./... -run '^TestRunUnchangedUploadsNothing$' -count=1"
+    },
+    {
+      "id": "r3",
+      "behavior": "A file removed from the folder is reported but not deleted without --delete, and with --delete its key is removed and its manifest entry dropped.",
+      "fails_when": "a run without --delete issues a DELETE, or a run with --delete leaves the key or its manifest entry",
+      "command": "go -C packages/ov-sync-queue test ./... -run '^TestRunDelete$' -count=1"
+    },
+    {
+      "id": "r4",
+      "behavior": "A failed upload keeps the file's old manifest entry and makes ovsq run exit non-zero, a failed delete keeps its entry, and the manifest is written after every batch so a run killed midway keeps its progress.",
+      "fails_when": "the manifest records a hash for a failed upload, drops a failed delete, the run exits 0, or a mid-run manifest is not written after a full batch",
+      "command": "go -C packages/ov-sync-queue test ./... -run '^TestRunFailuresKeepManifestTrue$' -count=1"
+    },
+    {
+      "id": "r5",
+      "behavior": "Files under _state/ in the folder, files outside include_folders, excluded globs and wrong extensions are never uploaded; git_tracked_only selects files by git ls-files.",
+      "fails_when": "any such file is uploaded, or an untracked file is uploaded with git_tracked_only on",
+      "command": "go -C packages/ov-sync-queue test ./... -run '^TestSelection$' -count=1"
+    },
+    {
+      "id": "r6",
+      "behavior": "The config loads from ov-sync-queue.toml with defaults, OVSQ_ environment variables override it, and a prefix that is not <owner>/<name> is refused with a message naming the key.",
+      "fails_when": "a default, an override or the refusal does not behave as stated",
+      "command": "go -C packages/ov-sync-queue test ./... -run '^TestConfig$' -count=1"
+    },
+    {
+      "id": "r7",
+      "behavior": "ovsq status prints what the next run would upload and delete and makes no write to the bucket or the local cache.",
+      "fails_when": "status issues a PUT or DELETE, changes the cache file, or its counts differ from what run then does",
+      "command": "go -C packages/ov-sync-queue test ./... -run '^TestStatusWritesNothing$' -count=1"
+    },
+    {
+      "id": "r8",
+      "behavior": "A file whose size and mtime match the local cache is not read again.",
+      "fails_when": "the hasher is called for an unchanged file",
+      "command": "go -C packages/ov-sync-queue test ./... -run '^TestCacheSkipsUnchanged$' -count=1"
+    },
+    {
+      "id": "r9",
+      "behavior": "The module builds, vets and passes its whole test suite, and the repo's gates run it.",
+      "fails_when": "go vet or go test fails, or neither the pre-commit config nor the loop gates run them",
+      "command": "go -C packages/ov-sync-queue vet ./... && go -C packages/ov-sync-queue test ./... -count=1 && grep -q 'ov-sync-queue' .pre-commit-config.yaml"
+    },
+    {
+      "id": "r10",
+      "behavior": "The package README explains install, config keys, how files reach OpenViking through the bucket and queue, the manifest, and deletes, and docs/ gains a reference page for the config.",
+      "fails_when": "a config key or command is undocumented, or the docs describe behavior the code does not have",
+      "judgment": true
+    }
+  ]
+}
