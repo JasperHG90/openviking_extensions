@@ -835,6 +835,10 @@ def test_installing_the_guard_gives_up_on_a_held_lock(
     monkeypatch.setattr(collection_module, "_RECONCILE_LOCK_TIMEOUT", "300ms")
     holder = psycopg.connect(dsn)
     try:
+        # If the guard stops giving up, the server ends this session after 5s
+        # and frees the lock: the guard then installs, and the test fails on
+        # the missing error instead of hanging.
+        holder.execute("SET idle_in_transaction_session_timeout = '5s'")
         holder.execute(f'LOCK TABLE "{test_schema}".ov_context IN ACCESS EXCLUSIVE MODE')
         reopened = make_adapter(dsn, test_schema)
         try:
