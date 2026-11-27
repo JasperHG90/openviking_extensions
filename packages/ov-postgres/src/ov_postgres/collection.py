@@ -1656,11 +1656,10 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             ``None`` or ``"bm25"``. Either way rows are ranked with the
             configured ``keyword_rank``.
         fields :
-            Columns to search; ``None`` means the configured
-            ``keyword_fields``, which the full-text index covers. Another set
-            is answered without that index, by scanning the table. Names that
-            are undeclared or not text are ignored, and if none is left the
-            search matches nothing.
+            Columns to narrow the search to, among the configured
+            ``keyword_fields`` the full-text index covers. A request naming
+            none of them -- OpenViking's ``["content"]`` with
+            ``store_content`` off, say -- searches all of them instead.
         bm25_k1, bm25_b :
             Must be ``None``: PostgreSQL's ranking has no such parameters.
         advance :
@@ -1747,15 +1746,18 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             )
 
         specs = self._fulltext_specs()
+        # Narrowed only to requested fields the full-text index covers. Every
+        # OpenViking keyword caller sends `fields=["content"]`, and with
+        # `store_content` off that column is empty and unindexed: honoured
+        # literally, OpenViking's keyword search would find nothing. A request
+        # naming no indexed field gets the configured keyword fields instead.
+        narrow: list[FieldSpec] = []
         if fields is not None:
-            # Narrowed to what was asked for, as OpenViking's other keyword
-            # backends narrow it. A set other than `keyword_fields` matches
-            # no full-text index, so it is answered by scanning the table.
-            requested = [self._schema.by_name(str(name)) for name in fields]
-            specs = [spec for spec in requested if spec is not None and spec.is_textual]
-            if not specs:
-                annotate({"ov_postgres.outcome": "no_requested_text_fields"})
-                return SearchResult(data=[])
+            requested = {str(name) for name in fields}
+            narrow = [spec for spec in specs if spec.name in requested]
+            if len(narrow) == len(specs):
+                narrow = []
+        annotate({"ov_postgres.narrowed_fields": ",".join(s.name for s in narrow)})
         if not specs:
             logger.warning(
                 "search_by_keywords: no text fields available on collection %s",
@@ -1786,22 +1788,42 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         columns = self._output_columns(output_fields)
         include_extra = not output_fields
 
+        # A narrowed search keeps the full match as its first condition, so the
+        # GIN index over every keyword field still finds the candidates, then
+        # re-checks and ranks them on the narrowed text alone.
+        ranked = (
+            ddl.tsvector_expr(narrow, self._text_search_config, self._db_schema)
+            if narrow
+            else tsvector
+        )
+        recheck = (
+            sql.SQL(" AND {} @@ {}").format(ranked, tsquery) if narrow else sql.SQL("")
+        )
         statement = sql.SQL(
-            "SELECT {cols}, {rank}({tsv}, {tsq}) AS _score FROM {table} "
-            "WHERE {pred} AND {tsv} @@ {tsq} "
+            "SELECT {cols}, {rank}({ranked}, {tsq}) AS _score FROM {table} "
+            "WHERE {pred} AND {tsv} @@ {tsq}{recheck} "
             "ORDER BY _score DESC, {pk} LIMIT %s OFFSET %s"
         ).format(
             cols=self._select_list(columns, include_extra=include_extra),
             rank=_KEYWORD_RANK_FNS[self._keyword_rank],
+            ranked=ranked,
             tsv=tsvector,
             tsq=tsquery,
+            recheck=recheck,
             table=self._qualified,
             pred=predicate,
             pk=sql.Identifier(self._schema.primary_key.name),
         )
-        # Placeholder order: rank's tsquery terms, filter params, then the
-        # WHERE clause's copy of the same terms.
-        params = [*terms, *filter_params, *terms, limit, offset]
+        # Placeholder order: rank's tsquery terms, filter params, the WHERE
+        # clause's copy of the terms, then the recheck's copy when narrowed.
+        params = [
+            *terms,
+            *filter_params,
+            *terms,
+            *(terms if narrow else []),
+            limit,
+            offset,
+        ]
         rows = self._execute(statement, params, fetch="all")
         annotate({"ov_postgres.rows": len(rows), "ov_postgres.outcome": "ok"})
         return self._rows_to_search_result(rows, columns)

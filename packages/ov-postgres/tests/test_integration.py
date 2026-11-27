@@ -316,13 +316,14 @@ def test_keyword_search_covers_array_fields(adapter: PgVectorCollectionAdapter) 
     assert [r["id"] for r in adapter.search_by_keywords(keywords=["kubernetes"])] == ["a"]
 
 
-def test_keyword_search_searches_only_the_fields_asked_for(
+def test_keyword_search_narrows_to_indexed_fields_asked_for(
     adapter: PgVectorCollectionAdapter,
 ) -> None:
-    """``fields`` narrows the search, as on OpenViking's other keyword backends.
+    """``fields`` narrows among the indexed keyword fields; others fall back.
 
-    OpenViking's own keyword callers send ``mode="bm25", fields=["content"]``:
-    a match in another column is not a match in ``content``.
+    OpenViking's own keyword callers always send ``fields=["content"]``. With
+    ``store_content`` off the column is empty and not indexed, so honouring it
+    literally would find nothing; the configured keyword fields answer instead.
     """
     adapter.upsert(
         [
@@ -331,12 +332,42 @@ def test_keyword_search_searches_only_the_fields_asked_for(
             {"id": "other", "name": "completely unrelated", "vector": vec(3)},
         ]
     )
-    everywhere = adapter.search_by_keywords(query="postgres", limit=10, mode="bm25")
-    assert {r["id"] for r in everywhere} == {"named", "described"}
+    everywhere = {r["id"] for r in adapter.search_by_keywords(query="postgres")}
+    assert everywhere == {"named", "described"}
     in_names = adapter.search_by_keywords(query="postgres", limit=10, fields=["name"])
     assert [r["id"] for r in in_names] == ["named"]
-    # `content` is not declared on this schema, so nothing can match in it.
-    assert adapter.search_by_keywords(query="postgres", fields=["content"]) == []
+    as_openviking_asks = adapter.search_by_keywords(
+        query="postgres", mode="bm25", fields=["content"]
+    )
+    assert {r["id"] for r in as_openviking_asks} == everywhere
+
+
+def test_a_narrowed_keyword_search_still_uses_the_full_text_index(
+    adapter: PgVectorCollectionAdapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Narrowing must not turn every keyword query into a table scan."""
+    from ov_postgres.collection import PgVectorCollection
+
+    plans: list[str] = []
+    execute = PgVectorCollection._execute
+
+    def explained(self: Any, statement: Any, params: Any = None, **kw: Any) -> Any:
+        text = (
+            statement.as_string(None)
+            if hasattr(statement, "as_string")
+            else str(statement)
+        )
+        if "@@" in text and text.lstrip().upper().startswith("SELECT"):
+            with self._pool.connection() as conn, conn.cursor() as cur:
+                cur.execute("SET LOCAL enable_seqscan = off")
+                cur.execute(sql.SQL("EXPLAIN ") + statement, params)
+                plans.append("\n".join(str(row[0]) for row in cur.fetchall()))
+        return execute(self, statement, params, **kw)
+
+    adapter.upsert({"id": "named", "name": "postgres vector search", "vector": vec(1)})
+    monkeypatch.setattr(PgVectorCollection, "_execute", explained)
+    adapter.search_by_keywords(query="postgres", fields=["name"])
+    assert plans and "fts" in plans[-1] and "Index" in plans[-1], plans
 
 
 @pytest.mark.parametrize(

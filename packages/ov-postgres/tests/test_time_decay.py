@@ -230,3 +230,54 @@ def test_decay_demotes_older_rows_whatever_the_metric(
         assert decay(inst)[0]["id"] == "fresh"
     finally:
         inst.close()
+
+
+def test_openvikings_keyword_search_matches_on_the_default_fields(
+    dsn: str, test_schema: str
+) -> None:
+    """OpenViking's own keyword search, on a table that stores no bodies.
+
+    ``search_by_keywords_in_tenant`` sends ``fields=["content"]``; the match
+    must still come from ``abstract``, as it did before ``fields`` was honoured.
+    """
+    import asyncio
+
+    from openviking.server.identity import RequestContext, Role, UserIdentifier
+    from openviking.storage.collection_schemas import CollectionSchemas
+    from openviking.storage.viking_vector_index_backend import VikingVectorIndexBackend
+    from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
+
+    async def run() -> list[str]:
+        store = VikingVectorIndexBackend(
+            VectorDBBackendConfig(
+                backend="ov_postgres.adapter.PgVectorCollectionAdapter",
+                name="context",
+                index_name="default",
+                dimension=DIM,
+                distance_metric="cosine",
+                custom_params={"dsn": dsn, "schema": test_schema},
+            )
+        )
+        store.set_vector_config_resolver(_SharedVectorConfig())
+        try:
+            await store.create_collection(
+                "context", CollectionSchemas.context_collection("context", DIM)
+            )
+            store._shared_adapter.upsert(
+                {
+                    "id": "guide",
+                    "uri": "viking://resources/guide.md",
+                    "account_id": "acme",
+                    "context_type": "resource",
+                    "level": 2,
+                    "abstract": "a guide to postgres replication",
+                    "vector": NEAR,
+                }
+            )
+            ctx = RequestContext(user=UserIdentifier("acme", "bob"), role=Role.ROOT)
+            rows = await store.search_by_keywords_in_tenant(ctx, query="replication")
+            return [str(row["id"]) for row in rows]
+        finally:
+            await store.close()
+
+    assert asyncio.run(run()) == ["guide"]
