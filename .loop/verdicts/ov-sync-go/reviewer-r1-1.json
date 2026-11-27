@@ -1,0 +1,57 @@
+{
+  "schema_version": "1.0",
+  "placeholder": false,
+  "verdict": "fail",
+  "findings": [
+    {
+      "id": "f1",
+      "disposition": "open",
+      "claim": "When FOLDER is a symlink to a directory, scan.Select walks nothing (filepath.WalkDir Lstats the root and does not descend), so every manifest entry becomes a delete; `ovsq run LINK --delete` removes the whole prefix and exits 0. Config loads through the link, so nothing warns.",
+      "anchor": "packages/ov-sync-queue/internal/scan/scan.go:65",
+      "category": "bug",
+      "blocking": true,
+      "invalidates_plan": false,
+      "repeats": null,
+      "eval_row": null
+    },
+    {
+      "id": "f2",
+      "disposition": "open",
+      "claim": "The r4 test checks Engine.Run's Result.Failed, not the CLI exit code, so the row's \"the run exits 0\" clause is only covered indirectly through main.go's `res.Failed > 0` branch.",
+      "anchor": "packages/ov-sync-queue/internal/syncer/syncer_test.go:73",
+      "category": "test-strength",
+      "blocking": false,
+      "invalidates_plan": false,
+      "repeats": null,
+      "eval_row": null
+    },
+    {
+      "id": "f3",
+      "disposition": "open",
+      "claim": "The reference page and usage text say exit 2 means a config error, but a missing include_folders entry and a failed git ls-files (both config problems) come back from Prepare and exit 1.",
+      "anchor": "packages/ov-sync-queue/main.go:136",
+      "category": "docs",
+      "blocking": false,
+      "invalidates_plan": false,
+      "repeats": null,
+      "eval_row": null
+    },
+    {
+      "id": "f4",
+      "disposition": "open",
+      "claim": "On Ctrl-C the final manifest write uses the cancelled context, so it always fails and the last partial batch's uploads lose their manifest entries (they re-upload next run). Writing the final manifest with context.WithoutCancel(ctx) would keep that progress.",
+      "anchor": "packages/ov-sync-queue/internal/syncer/syncer.go:232",
+      "category": "hardening",
+      "blocking": false,
+      "invalidates_plan": false,
+      "repeats": null,
+      "eval_row": null
+    }
+  ],
+  "binds": {
+    "fingerprint": "b0158192c2d66ac00583062738aa5a596ff035d5835078a7bbf37a4b5548612a",
+    "plan_hash": null
+  },
+  "by": "process:loopctl/2.3.1.dev65+g93b143856",
+  "at": "2026-11-27T09:13:51+00:00"
+}
