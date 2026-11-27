@@ -56,6 +56,14 @@ PASSWORD = "hunter2"
 EMBEDDING_DIMENSION = 1024
 BOOT_TIMEOUT_SECONDS = 240.0
 
+# What the stub serves for any ``*.html`` path, so importing a remote page can
+# be tested with no internet: the container fetches it through the host
+# gateway, at ``LiveOpenViking.page_url``.
+PAGE = (
+    "<html><head><title>Stub Page</title></head>"
+    "<body><h1>Stub Page</h1><p>Served by the integration stub.</p></body></html>"
+)
+
 
 @dataclass(frozen=True)
 class LiveOpenViking:
@@ -81,6 +89,8 @@ class LiveOpenViking:
         A userpass login on that Vault whose entity maps to ``account``/``user``.
     vault_password : str
         That login's password.
+    page_url : str
+        A web page the server can fetch, for testing a remote import.
     """
 
     url: str
@@ -92,6 +102,7 @@ class LiveOpenViking:
     vault_url: str
     vault_user: str
     vault_password: str
+    page_url: str
 
 
 def docker_available() -> bool:
@@ -136,7 +147,15 @@ class _ModelHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:
-        """List one model, for clients that probe before calling."""
+        """Serve a web page to import, or list one model."""
+        if self.path.endswith(".html"):
+            body = PAGE.encode()
+            self.send_response(200)
+            self.send_header("content-type", "text/html; charset=utf-8")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self._answer({"object": "list", "data": [{"id": "stub", "object": "model"}]})
 
     def do_POST(self) -> None:
@@ -352,6 +371,10 @@ def _openviking_config(vault_port: int, model_port: int) -> dict[str, Any]:
             "api_key": "stub",
             "api_base": model_base,
         },
+        # Only so the server may fetch the stub's page through the host
+        # gateway: its import guard refuses private addresses otherwise. The
+        # lab does not set it.
+        "allow_private_networks": True,
     }
 
 
@@ -417,6 +440,7 @@ def openviking_stack(prefix: str) -> Iterator[LiveOpenViking]:
                 vault_url=vault,
                 vault_user=USER,
                 vault_password=PASSWORD,
+                page_url=f"http://host.docker.internal:{model_port}/stub-page.html",
             )
     finally:
         if not os.environ.get("OV_TEST_KEEP"):

@@ -328,3 +328,25 @@ def test_the_cli_syncs_with_the_token_ovcli_conf_holds(
     stored = live_client.stat(target_uri(target, "note.md"))
     assert stored is not None
     assert stored.size == len(b"from the cli")
+
+
+def test_a_write_into_a_tree_still_being_indexed_waits_its_turn(
+    live_client: OvClient, live_root: str
+) -> None:
+    """OpenViking 0.5 refuses it as a retryable ``CONFLICT``; the client retries.
+
+    A batch sent without waiting leaves its tree locked while it indexes, and
+    the next batch into that tree is refused with ``path_busy`` until it is
+    done. ``wait_for_indexing = false`` makes that the normal case for every
+    run after the first.
+    """
+    uri = f"{live_root}/busy.md"
+    live_client.batch_write(
+        live_root, [BatchWriteOperation(uri=uri, content="first")], wait=False
+    )
+
+    second = live_client.batch_write(
+        live_root, [BatchWriteOperation(uri=uri, content="second")], wait=False
+    )
+
+    assert second.updated == [uri]
