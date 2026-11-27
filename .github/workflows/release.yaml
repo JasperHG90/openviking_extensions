@@ -404,8 +404,8 @@ jobs:
             echo '```'
             echo
             echo "\`SHA256SUMS\` lists each archive's checksum; check a download with"
-            echo "\`shasum -a 256 -c SHA256SUMS --ignore-missing\`." On macOS, a binary"
-            echo "downloaded in a browser is quarantined; the \`curl\` route above is not."
+            echo "\`shasum -a 256 -c SHA256SUMS --ignore-missing\`. On macOS, a"
+            echo "binary downloaded in a browser is quarantined; the \`curl\` route above is not."
             echo
             echo "Then follow [Set up ovsq]($REPO/blob/$TAG/docs/how-to/set-up-ovsq.md)"
             echo "for the prefix map, the S3 key and the config."
