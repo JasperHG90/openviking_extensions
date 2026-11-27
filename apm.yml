@@ -1,0 +1,16 @@
+# APM (Agent Package Manager) dependencies: skills, rules, hooks and MCP
+# servers for the agent harnesses below. Install them with `just install`.
+name: openviking_extensions
+version: 0.1.0
+dependencies:
+  apm:
+    # kmctl: knowledge skills, rules, the session briefing hook and okf's
+    # MCP server. Keep the ref the same as the kmctl CLI (`just kmctl`).
+    - git: https://github.com/JasperHG90/kmctl.git
+      path: packages/kmctl/apm
+      ref: v0.18.0
+    # Add your own dependencies, and an mcp: block, below this line. just
+    # upgrade rewrites the kmctl ref above, and content added directly below it
+    # would conflict.
+targets:
+  - claude

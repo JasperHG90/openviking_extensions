@@ -1,0 +1,81 @@
+# Run `just` to list the recipes.
+
+apm := "uvx --from apm-cli==0.33.0 apm"
+kmctl_ref := "v0.18.0"
+kmctl_src := "git+https://github.com/JasperHG90/kmctl@" + kmctl_ref + "#subdirectory=packages/kmctl"
+# kmctl at the pinned release, without touching the kmctl on your PATH.
+kmctl := "uvx --from " + kmctl_src + " kmctl"
+
+# List the recipes.
+default:
+    @just --list
+
+# Set up a fresh clone: the kmctl CLI, the APM dependencies, the knowledge folders.
+bootstrap: kmctl install init
+
+# Refuse while git holds unmerged files, such as the conflicts a copier update leaves.
+# kmctl, install and install-frozen depend on it. The `just kmctl install` that upgrade
+# runs reads the rewritten justfile, so it stops here even when an old justfile, which
+# has no such check, started the upgrade.
+_merged:
+    @conflicts=$(git diff --name-only --diff-filter=U 2>/dev/null); if [ -n "$conflicts" ]; then printf '%s\n' "$conflicts" "git holds the unmerged files above, such as the conflicts a copier update leaves: keep your changes and the new kmctl ref, with your own content below the comment that follows each pin, git add the files, then run just kmctl install" >&2; exit 1; fi
+
+# Install the kmctl CLI on your PATH unless one as new as the pin is there, then fetch the pin.
+# The kmctl on PATH runs each project's pinned release, so one install serves every project.
+kmctl: _merged
+    #!/usr/bin/env bash
+    set -euo pipefail
+    have=$(KMCTL_PINNED=1 kmctl --version 2>/dev/null | awk '{print $2}') || have=""
+    if [ -z "$have" ] || uv run --no-project --quiet --with packaging python -c 'import sys; from packaging.version import Version; sys.exit(0 if Version(sys.argv[1]) < Version(sys.argv[2]) else 1)' "$have" "{{kmctl_ref}}"; then
+        uv tool install --force "{{kmctl_src}}"
+    fi
+    kmctl --version
+
+# Install the APM dependencies in apm.yml for its targets, then what APM cannot install yet.
+install: _merged
+    {{apm}} install
+    {{kmctl}} plugin patch
+
+# Install exactly what apm.lock.yaml records (for a clean clone or CI).
+install-frozen: _merged
+    {{apm}} install --frozen
+    {{kmctl}} plugin patch
+
+# Fail when a frozen install changes a committed file, such as a hand edit to an installed skill.
+# Run it on a clean checkout, as in CI: the install overwrites an uncommitted edit without a word.
+check-install: install-frozen
+    #!/usr/bin/env bash
+    set -euo pipefail
+    changed=$(git status --porcelain)
+    if [ -n "$changed" ]; then
+        printf '%s\n' "$changed"
+        echo "the committed files above differ from what apm.lock.yaml installs; make the change in the package they come from, and commit what just install-frozen writes" >&2
+        exit 1
+    fi
+
+# Resolve the dependencies again and rewrite apm.lock.yaml without installing.
+lock:
+    {{apm}} lock
+
+# Show locked dependencies that have newer versions.
+outdated:
+    {{apm}} outdated
+
+# Create docs/ and the .okf/ knowledge bundle, and kmctl's block in AGENTS.md (safe to run again).
+init:
+    {{kmctl}} init
+
+# Check the knowledge bundle and that kmctl is installed correctly.
+check:
+    {{kmctl}} check
+    {{kmctl}} doctor
+
+# Run `just` again rather than depending on recipes, so the second step reads the rewritten justfile.
+# Move to another kmctl release, such as v0.5.0: rewrite the pinned files, then reinstall at it.
+upgrade ref:
+    uvx copier update --defaults --data kmctl_ref={{ref}}
+    just kmctl install
+
+# Run the pre-commit hooks on every file.
+lint:
+    uvx prek@0.5.5 run --all-files

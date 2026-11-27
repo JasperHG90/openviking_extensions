@@ -45,3 +45,30 @@ data/
 # OpenViking's own workspace: ingested documents, extracted media, session
 # state. Never source, and it can hold private material.
 .openviking/
+
+# APM's package cache; `just install` restores it.
+apm_modules/
+
+# Operating systems
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Node
+node_modules/
+
+# Local secrets
+.env
+

@@ -182,3 +182,15 @@ jobs:
     uses: ./.github/workflows/template-check-node.yaml
     with:
       package: ${{ matrix.package }}
+
+  knowledge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Installs kmctl, runs kmctl check (fails the job on a broken bundle)
+      # and kmctl review due, and writes both to the job summary.
+      - uses: JasperHG90/kmctl@v0.18.0
+      # Add your own steps and jobs below this line. just upgrade rewrites the
+      # pin above, and content added directly below it would conflict.

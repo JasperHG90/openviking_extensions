@@ -1,0 +1,11 @@
+# Changes here are overwritten by `copier update`.
+_commit: v0.18.0
+_src_path: gh:JasperHG90/kmctl
+adversarial_review: false
+apm_version: 0.33.0
+codeowners: '@JasperHG90'
+harnesses:
+- claude
+kmctl_ref: v0.18.0
+project_description: Monorepo containing extensions for OpenViking <https://github.com/volcengine/OpenViking>.
+project_name: openviking_extensions
