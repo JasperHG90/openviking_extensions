@@ -1,0 +1,8 @@
+# The filer webhook for pipeline.sh, as localstack's seaweedfs.hcl renders it,
+# except that the receiver is another container instead of loopback.
+# pipeline.sh fills in @TOKEN@ and @RECEIVER@.
+[notification.webhook]
+enabled = true
+endpoint = "http://@RECEIVER@:20500/events"
+bearer_token = "@TOKEN@"
+path_prefixes = ["/buckets/ov-sync/"]

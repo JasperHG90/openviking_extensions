@@ -116,7 +116,18 @@ picks the profile). Short-lived STS credentials work through the first.
 ```console
 $ ./check.sh          # gofmt, go vet, go test: the same gate CI and the loop run
 $ ./e2e/run.sh        # against a real SeaweedFS in docker; not a gate
+$ ./e2e/pipeline.sh   # LOCAL ONLY: the whole pipeline, see below
 ```
+
+`e2e/pipeline.sh` runs ovsq through the whole pipeline in docker: SeaweedFS
+with its filer webhook, the receiver, NATS JetStream and ov-sync-consumer,
+which writes to a fake OpenViking. It builds the receiver and consumer from
+a clone of localstack (`LOCALSTACK_DIR`, default `../localstack` beside this
+repo) and uses the SeaweedFS and NATS images localstack pins. It checks that
+uploads, edits and deletes under a `subdir` reach OpenViking through events
+alone, that the consumer never touches ovsq's manifest, and that a folder a
+delete empties is removed. It is local only: CI has no localstack clone, so
+it is not a gate.
 
 The repo's `prek run --all-files` runs `check.sh` through the
 `go-ov-sync-queue` hook, so the repo's gates now need Go on PATH.
