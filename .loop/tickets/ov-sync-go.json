@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0",
   "slug": "ov-sync-go",
-  "stage": "planning",
+  "stage": "ready",
   "attempts": 0,
   "plan_rounds": 2,
   "review_rounds": 0,
@@ -177,8 +177,14 @@
       "to": "planning",
       "at": "2026-11-27T08:43:51+00:00",
       "by": "register"
+    },
+    {
+      "from": "planning",
+      "to": "ready",
+      "at": "2026-11-27T08:51:22+00:00",
+      "by": "advance"
     }
   ],
   "by": "process:loopctl/2.3.1.dev65+g93b143856",
-  "at": "2026-11-27T08:51:19+00:00"
+  "at": "2026-11-27T08:51:22+00:00"
 }
