@@ -1,0 +1,10 @@
+unformatted: File would be reformatted
+  --> packages/ov-ext/README.md:87:58
+   |
+86 | similarity = blend_similarity(
+   -     adapter.pairwise_similarity([d.uri for d in docs]),   # cosine, from the DB
+87 +     adapter.pairwise_similarity([d.uri for d in docs]),  # cosine, from the DB
+88 |     tag_similarity_matrix({d.uri: d.search_tags for d in docs}),
+   |
+
+1 file would be reformatted, 155 files already formatted

@@ -1,0 +1,541 @@
+rror  # noqa: E402
+40 + from ov_ext.reflect.exceptions import ContentUnavailableError
+41 | from ov_ext.reflect.models import (  # noqa: E402
+   |
+
+RUF100 [*] Unused `noqa` directive (non-enabled: `E402`)
+  --> packages/ov-ext/tests/reflect/test_integration.py:41:38
+   |
+39 | from ov_ext.reflect.engine import ReflectionEngine  # noqa: E402
+40 | from ov_ext.reflect.exceptions import ContentUnavailableError  # noqa: E402
+41 | from ov_ext.reflect.models import (  # noqa: E402
+   |                                      ^^^^^^^^^^^^
+42 |     CandidateObservation,
+43 |     EvidenceItem,
+   |
+help: Remove unused `noqa` directive
+   |
+40 | from ov_ext.reflect.exceptions import ContentUnavailableError  # noqa: E402
+   - from ov_ext.reflect.models import (  # noqa: E402
+41 + from ov_ext.reflect.models import (
+42 |     CandidateObservation,
+   |
+
+RUF100 [*] Unused `noqa` directive (non-enabled: `E402`)
+  --> packages/ov-ext/tests/reflect/test_integration.py:48:46
+   |
+46 | )
+47 | from ov_ext.reflect.locks import ProcessLock
+48 | from ov_ext.reflect.runner import run_sweep  # noqa: E402
+   |                                              ^^^^^^^^^^^^
+49 | from ov_ext.reflect.viking import VikingStore  # noqa: E402
+50 | from ov_ext.reflect.watermark import Watermark  # noqa: E402
+   |
+help: Remove unused `noqa` directive
+   |
+47 | from ov_ext.reflect.locks import ProcessLock
+   - from ov_ext.reflect.runner import run_sweep  # noqa: E402
+48 + from ov_ext.reflect.runner import run_sweep
+49 | from ov_ext.reflect.viking import VikingStore  # noqa: E402
+   |
+
+RUF100 [*] Unused `noqa` directive (non-enabled: `E402`)
+  --> packages/ov-ext/tests/reflect/test_integration.py:49:48
+   |
+47 | from ov_ext.reflect.locks import ProcessLock
+48 | from ov_ext.reflect.runner import run_sweep  # noqa: E402
+49 | from ov_ext.reflect.viking import VikingStore  # noqa: E402
+   |                                                ^^^^^^^^^^^^
+50 | from ov_ext.reflect.watermark import Watermark  # noqa: E402
+   |
+help: Remove unused `noqa` directive
+   |
+48 | from ov_ext.reflect.runner import run_sweep  # noqa: E402
+   - from ov_ext.reflect.viking import VikingStore  # noqa: E402
+49 + from ov_ext.reflect.viking import VikingStore
+50 | from ov_ext.reflect.watermark import Watermark  # noqa: E402
+   |
+
+RUF100 [*] Unused `noqa` directive (non-enabled: `E402`)
+  --> packages/ov-ext/tests/reflect/test_integration.py:50:49
+   |
+48 | from ov_ext.reflect.runner import run_sweep  # noqa: E402
+49 | from ov_ext.reflect.viking import VikingStore  # noqa: E402
+50 | from ov_ext.reflect.watermark import Watermark  # noqa: E402
+   |                                                 ^^^^^^^^^^^^
+51 |
+52 | from .helpers import FakeLLM  # noqa: E402
+   |
+help: Remove unused `noqa` directive
+   |
+49 | from ov_ext.reflect.viking import VikingStore  # noqa: E402
+   - from ov_ext.reflect.watermark import Watermark  # noqa: E402
+50 + from ov_ext.reflect.watermark import Watermark
+51 |
+   |
+
+RUF100 [*] Unused `noqa` directive (non-enabled: `E402`)
+  --> packages/ov-ext/tests/reflect/test_integration.py:52:31
+   |
+50 | from ov_ext.reflect.watermark import Watermark  # noqa: E402
+51 |
+52 | from .helpers import FakeLLM  # noqa: E402
+   |                               ^^^^^^^^^^^^
+53 |
+54 | pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
+   |
+help: Remove unused `noqa` directive
+   |
+51 |
+   - from .helpers import FakeLLM  # noqa: E402
+52 + from .helpers import FakeLLM
+53 |
+   |
+
+BLE001 Do not catch blind exception: `Exception`
+   --> packages/ov-ext/tests/reflect/test_integration.py:156:12
+    |
+154 |         container = PostgresContainer("pgvector/pgvector:pg17", driver=None)
+155 |         container.start()
+156 |     except Exception as exc:  # pragma: no cover - no container runtime
+    |            ^^^^^^^^^
+157 |         pytest.skip(f"cannot start a PostgreSQL container: {exc}")
+158 |     try:
+    |
+
+I001 [*] Import block is un-sorted or un-formatted
+   --> packages/ov-ext/tests/reflect/test_integration.py:166:5
+    |
+164 |   def _backend(dsn: str, *, store_content: bool) -> Any:
+165 |       """A real OpenViking vector backend on a real PostgreSQL, in its own schema."""
+166 | /     from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
+167 | |
+168 | |     from openviking.storage.viking_vector_index_backend import VikingVectorIndexBackend
+    | |_______________________________________________________________________________________^
+169 |
+170 |       return VikingVectorIndexBackend(
+    |
+help: Organize imports
+    |
+165 |     """A real OpenViking vector backend on a real PostgreSQL, in its own schema."""
+    -     from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
+    -
+166 |     from openviking.storage.viking_vector_index_backend import VikingVectorIndexBackend
+167 +     from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
+168 |
+    |
+
+I001 [*] Import block is un-sorted or un-formatted
+   --> packages/ov-ext/tests/reflect/test_integration.py:202:5
+    |
+200 |   def viking_fs() -> Iterator[Any]:
+201 |       """A real RAGFS filesystem over a temporary directory."""
+202 | /     from openviking_cli.utils.config.agfs_config import AGFSConfig
+203 | |
+204 | |     from openviking.storage.viking_fs import VikingFS
+205 | |     from openviking.utils.agfs_utils import RagfsBindingConfig, create_agfs_client
+    | |__________________________________________________________________________________^
+206 |
+207 |       with tempfile.TemporaryDirectory() as workspace:
+    |
+help: Organize imports
+    |
+201 |     """A real RAGFS filesystem over a temporary directory."""
+    -     from openviking_cli.utils.config.agfs_config import AGFSConfig
+    -
+202 |     from openviking.storage.viking_fs import VikingFS
+203 |     from openviking.utils.agfs_utils import RagfsBindingConfig, create_agfs_client
+204 +     from openviking_cli.utils.config.agfs_config import AGFSConfig
+205 |
+    |
+
+B017 Do not assert blind exception: `Exception`
+   --> packages/ov-ext/tests/reflect/test_integration.py:511:10
+    |
+509 |     assert report.written == 0
+510 |     assert report.dropped["quote_not_found"] == 1
+511 |     with pytest.raises(Exception):
+    |          ^^^^^^^^^^^^^^^^^^^^^^^^
+512 |         await viking_fs.ls(f"viking://user/{USER}/memories/observations", ctx=ctx())
+513 |     await backend.close()
+    |
+
+I001 [*] Import block is un-sorted or un-formatted
+  --> packages/ov-ext/tests/reflect/test_runner.py:8:1
+   |
+ 6 |   """
+ 7 |
+ 8 | / from __future__ import annotations
+ 9 | |
+10 | | import json
+11 | | from collections.abc import AsyncIterator
+12 | | from contextlib import asynccontextmanager
+13 | | from datetime import datetime, timedelta, timezone
+14 | | from typing import Any
+15 | |
+16 | | import pytest
+17 | |
+18 | | from ov_ext.reflect.config import ReflectSettings
+19 | | from ov_ext.reflect.models import (
+20 | |     CandidateObservation,
+21 | |     Consolidation,
+22 | |     EvidenceItem,
+23 | |     ProposedObservations,
+24 | | )
+25 | | from ov_ext.reflect.locks import ProcessLock
+26 | | from ov_ext.reflect.runner import run_sweep
+27 | | from ov_ext.reflect.verify import quote_is_present
+28 | | from ov_ext.reflect.viking import VikingStore
+29 | | from ov_ext.reflect.watermark import Watermark
+30 | |
+31 | | from .helpers import FakeLLM
+   | |____________________________^
+32 |
+33 |   NOW = datetime(2026, 9, 8, tzinfo=timezone.utc)
+   |
+help: Organize imports
+   |
+18 | from ov_ext.reflect.config import ReflectSettings
+19 + from ov_ext.reflect.locks import ProcessLock
+20 | from ov_ext.reflect.models import (
+--------------------------------------------------------------------------------
+25 | )
+   - from ov_ext.reflect.locks import ProcessLock
+26 | from ov_ext.reflect.runner import run_sweep
+   |
+
+RUF100 [*] Unused `noqa` directive (non-enabled: `N801`)
+  --> packages/ov-ext/tests/reflect/test_runner.py:75:18
+   |
+74 | class FakeCtx:
+75 |     class user:  # noqa: N801 - mirrors OpenViking's attribute shape
+   |                  ^^^^^^^^^^^^
+76 |         user_id = "jasper"
+   |
+help: Remove unused `noqa` directive
+   |
+74 | class FakeCtx:
+   -     class user:  # noqa: N801 - mirrors OpenViking's attribute shape
+75 +     class user:
+76 |         user_id = "jasper"
+   |
+
+I001 [*] Import block is un-sorted or un-formatted
+  --> packages/ov-ext/tests/reflect/test_ticker.py:9:1
+   |
+ 7 |   """
+ 8 |
+ 9 | / from __future__ import annotations
+10 | |
+11 | | import asyncio
+12 | | from contextlib import asynccontextmanager
+13 | | from collections.abc import AsyncIterator
+14 | | from typing import Any
+15 | |
+16 | | import pytest
+17 | |
+18 | | from ov_ext.reflect.config import LockKind, ReflectSettings
+19 | | from ov_ext.reflect.locks import ProcessLock
+20 | | from ov_ext.reflect.ticker import run_ticker
+   | |____________________________________________^
+21 |
+22 |   pytestmark = pytest.mark.usefixtures("clean_env")
+   |
+help: Organize imports
+   |
+11 | import asyncio
+12 + from collections.abc import AsyncIterator
+13 | from contextlib import asynccontextmanager
+   - from collections.abc import AsyncIterator
+14 | from typing import Any
+   |
+
+I001 [*] Import block is un-sorted or un-formatted
+  --> packages/ov-ext/tests/reflect/test_verify.py:8:1
+   |
+ 6 |   """
+ 7 |
+ 8 | / from __future__ import annotations
+ 9 | |
+10 | | import pytest
+11 | |
+12 | | from ov_ext.reflect.models import CandidateObservation, EvidenceItem
+13 | | from ov_ext.reflect.verify import (
+14 | |     normalise,
+15 | |     areas_covered,
+16 | |     quote_is_present,
+17 | |     verify_observations,
+18 | | )
+19 | |
+20 | | from .helpers import row
+   | |________________________^
+21 |
+22 |   MEMORIES = {
+   |
+help: Organize imports
+   |
+13 | from ov_ext.reflect.verify import (
+14 +     areas_covered,
+15 |     normalise,
+   -     areas_covered,
+16 |     quote_is_present,
+   |
+
+I001 [*] Import block is un-sorted or un-formatted
+  --> packages/ov-ext/tests/reflect/test_viking.py:11:1
+   |
+ 9 |   """
+10 |
+11 | / from __future__ import annotations
+12 | |
+13 | | import copy
+14 | | import random
+15 | | import sys
+16 | | import threading
+17 | | import types
+18 | | from datetime import datetime, timedelta, timezone
+19 | | from typing import Any, ClassVar
+20 | |
+21 | | import pytest
+22 | |
+23 | | from pydantic import BaseModel, Field, PrivateAttr
+24 | |
+25 | | from ov_ext.reflect.config import ReflectSettings
+26 | | from ov_ext.reflect.exceptions import ContentUnavailableError
+27 | | from ov_ext.reflect.models import MemoryRow, Observation
+28 | | from ov_ext.reflect.viking import VikingLLM, VikingStore, _primary, _render, _subject
+   | |_____________________________________________________________________________________^
+29 |
+30 |   NOW = datetime(2026, 9, 8, tzinfo=timezone.utc)
+   |
+help: Organize imports
+   |
+21 | import pytest
+   -
+22 | from pydantic import BaseModel, Field, PrivateAttr
+   |
+
+RUF100 [*] Unused `noqa` directive (non-enabled: `N801`)
+  --> packages/ov-ext/tests/reflect/test_viking.py:80:18
+   |
+78 |     """Just enough request context to name a user."""
+79 |
+80 |     class user:  # noqa: N801 - mirrors OpenViking's attribute shape
+   |                  ^^^^^^^^^^^^
+81 |         user_id = "jasper"
+   |
+help: Remove unused `noqa` directive
+   |
+79 |
+   -     class user:  # noqa: N801 - mirrors OpenViking's attribute shape
+80 +     class user:
+81 |         user_id = "jasper"
+   |
+
+BLE001 Do not catch blind exception: `Exception`
+   --> packages/ov-ext/tests/retrieval/test_end_to_end.py:115:12
+    |
+113 |         container = PostgresContainer("pgvector/pgvector:pg17", driver=None)
+114 |         container.start()
+115 |     except Exception as exc:  # pragma: no cover - no container runtime
+    |            ^^^^^^^^^
+116 |         pytest.skip(f"cannot start a PostgreSQL container: {exc}")
+117 |     try:
+    |
+
+I001 [*] Import block is un-sorted or un-formatted
+   --> packages/ov-ext/tests/retrieval/test_end_to_end.py:126:5
+    |
+124 |   def backend(postgres_dsn: str) -> Iterator[Any]:
+125 |       """A real OpenViking vector backend on a real PostgreSQL, per test."""
+126 | /     from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
+127 | |
+128 | |     from openviking.storage.viking_vector_index_backend import VikingVectorIndexBackend
+    | |_______________________________________________________________________________________^
+129 |
+130 |       db_schema = f"e2e_{uuid.uuid4().hex[:10]}"
+    |
+help: Organize imports
+    |
+125 |     """A real OpenViking vector backend on a real PostgreSQL, per test."""
+    -     from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
+    -
+126 |     from openviking.storage.viking_vector_index_backend import VikingVectorIndexBackend
+127 +     from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
+128 |
+    |
+
+I001 [*] Import block is un-sorted or un-formatted
+   --> packages/ov-ext/tests/retrieval/test_end_to_end.py:150:5
+    |
+148 |   def request_context() -> Any:
+149 |       """A request context for a single tenant."""
+150 | /     from openviking.server.identity import Role, UserIdentifier
+151 | |     from openviking.server.identity import RequestContext
+    | |_________________________________________________________^
+152 |
+153 |       return RequestContext(user=UserIdentifier("acct", "user"), role=Role.USER)
+    |
+help: Organize imports
+    |
+149 |     """A request context for a single tenant."""
+    -     from openviking.server.identity import Role, UserIdentifier
+    -     from openviking.server.identity import RequestContext
+150 +     from openviking.server.identity import RequestContext, Role, UserIdentifier
+151 |
+    |
+
+C401 Unnecessary generator (rewrite as a set comprehension)
+  --> packages/ov-ext/tests/retrieval/test_fusion.py:22:12
+   |
+20 |     # "c" is third for one ranker and absent from the other; "d" the mirror.
+21 |     # Neither should reach the top.
+22 |     assert set(key for key, _ in fused) == {"a", "b", "c", "d"}
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: Rewrite as a set comprehension
+
+I001 [*] Import block is un-sorted or un-formatted
+  --> packages/ov-ext/tests/retrieval/test_observability.py:9:1
+   |
+ 7 |   """
+ 8 |
+ 9 | / from __future__ import annotations
+10 | |
+11 | | import pytest
+12 | | from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+13 | | from opentelemetry.trace import StatusCode
+14 | |
+15 | | from ov_ext.observability import annotate, record_error, traced, traced_sync
+16 | |
+17 | | # Marked per test rather than with a module-level `pytestmark`, and explicit
+18 | | # rather than relying on `asyncio_mode = "auto"`: pytest reads that setting
+19 | | # from this package's pyproject only when rootdir is this package, so a run
+20 | | # from the workspace root would skip every async test here as unsupported. A
+21 | | # module-level mark would fix that too, but it also lands on the sync tests
+22 | | # below, which pytest-asyncio warns about.
+23 | |
+24 | | # Absolute, not relative: this test package carries no `__init__.py`, so pytest
+25 | | # imports each module top-level with the directory on sys.path.
+26 | | #
+27 | | # `restore_base_class` is imported for its effect as a fixture rather than to
+28 | | # be called: it is autouse, and pytest finds it in this module's namespace, so
+29 | | # the stub `make_retriever` puts on OpenViking's base class is undone here too.
+30 | | from .test_retriever import (  # noqa: F401
+31 | |     FakeQuery,
+32 | |     FakeStore,
+33 | |     ctx,
+34 | |     make_retriever,
+35 | |     restore_base_class,
+36 | | )
+   | |_^
+help: Organize imports
+   |
+22 | # below, which pytest-asyncio warns about.
+   -
+23 | # Absolute, not relative: this test package carries no `__init__.py`, so pytest
+   |
+
+I001 [*] Import block is un-sorted or un-formatted
+  --> packages/ov-ext/tests/retrieval/test_rerank.py:9:1
+   |
+ 7 |   """
+ 8 |
+ 9 | / from __future__ import annotations
+10 | |
+11 | | import importlib
+12 | | from collections.abc import Iterator
+13 | | from typing import Any
+14 | |
+15 | | import pytest
+16 | | from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+17 | | from openviking.retrieve.hierarchical_retriever import HierarchicalRetriever
+18 | | from openviking_cli.retrieve.types import QueryResult
+19 | | from .test_retriever import FakeQuery
+20 | |
+21 | | from ov_ext.retrieval.config import HybridSettings
+22 | | from ov_ext.observability import _tracer
+23 | | from ov_ext.retrieval.rerank import (
+24 | |     _PooledRequests,
+25 | |     install_pooled_rerank,
+26 | |     uninstall_pooled_rerank,
+27 | | )
+28 | | from ov_ext.retrieval.retriever import HybridRetriever, _rerank_budget
+   | |______________________________________________________________________^
+29 |
+30 |   _OPENAI_RERANK = "openviking.models.rerank.openai_rerank"
+   |
+help: Organize imports
+   |
+18 | from openviking_cli.retrieve.types import QueryResult
+   - from .test_retriever import FakeQuery
+19 |
+   - from ov_ext.retrieval.config import HybridSettings
+20 | from ov_ext.observability import _tracer
+21 + from ov_ext.retrieval.config import HybridSettings
+22 | from ov_ext.retrieval.rerank import (
+--------------------------------------------------------------------------------
+28 |
+29 + from .test_retriever import FakeQuery
+30 +
+31 | _OPENAI_RERANK = "openviking.models.rerank.openai_rerank"
+   |
+
+RUF100 [*] Unused `noqa` directive (non-enabled: `N802`)
+  --> packages/ov-ext/tests/retrieval/test_rerank_pooling_live.py:53:33
+   |
+51 |     protocol_version = "HTTP/1.1"
+52 |
+53 |     def do_POST(self) -> None:  # noqa: N802 - the name BaseHTTPRequestHandler wants
+   |                                 ^^^^^^^^^^^^
+54 |         """Reply with a score per document, and record any cookie sent."""
+55 |         length = int(self.headers.get("Content-Length", "0"))
+   |
+help: Remove unused `noqa` directive
+   |
+52 |
+   -     def do_POST(self) -> None:  # noqa: N802 - the name BaseHTTPRequestHandler wants
+53 +     def do_POST(self) -> None:
+54 |         """Reply with a score per document, and record any cookie sent."""
+   |
+
+RUF015 Prefer `next(m.uri for m in result.matched_contexts)` over single element slice
+   --> packages/ov-ext/tests/retrieval/test_retriever.py:175:12
+    |
+173 |     result = await retriever.retrieve(FakeQuery(), ctx=None, limit=3)
+174 |
+175 |     assert [m.uri for m in result.matched_contexts][0] == "a"
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+176 |     assert [m.uri for m in result.matched_contexts].index("c") < 2
+    |
+help: Replace with `next(m.uri for m in result.matched_contexts)`
+
+I001 [*] Import block is un-sorted or un-formatted
+   --> packages/ov-ext/tests/test_worker.py:216:5
+    |
+214 |   def _child_report(queue: Any) -> None:
+215 |       """Run in a spawned child, as uvicorn's workers do."""
+216 | /     import importlib
+217 | |
+218 | |     from ov_ext.worker import create_worker_app  # noqa: F401  (import is the point)
+219 | |
+220 | |     # Install the way the factory would, without building a whole FastAPI app.
+221 | |     from ov_ext.retrieval.config import HybridSettings
+222 | |     from ov_ext.retrieval.patch import install as install_retrieval
+    | |___________________________________________________________________^
+223 |
+224 |       install_retrieval(HybridSettings())
+    |
+help: Organize imports
+    |
+217 |
+    -     from ov_ext.worker import create_worker_app  # noqa: F401  (import is the point)
+    -
+218 |     # Install the way the factory would, without building a whole FastAPI app.
+219 |     from ov_ext.retrieval.config import HybridSettings
+220 |     from ov_ext.retrieval.patch import install as install_retrieval
+221 +     from ov_ext.worker import create_worker_app  # noqa: F401  (import is the point)
+222 |
+    |
+
+Found 45 errors.
+[*] 29 fixable with the `--fix` option (3 hidden fixes can be enabled with the `--unsafe-fixes` option).
