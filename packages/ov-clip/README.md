@@ -127,17 +127,17 @@ The suite covers the libraries: naming, URL canonicalization, frontmatter, save 
 
 ### Against a real OpenViking
 
-`npm run test:integration` runs the client against an actual server. It starts
-`ghcr.io/volcengine/openviking` in a container, creates an account and a user
-key, and saves real files — or points at one you are already running when
-`$OV_TEST_URL` and `$OV_TEST_KEY` are set. With neither a container runtime nor
-those variables it skips, so `npm test` stays runnable anywhere.
+`npm run test:integration` runs the client against an actual server, signed in
+the way the extension is. It starts a dev-mode Vault set up like the lab's and
+`ghcr.io/volcengine/openviking:v0.5.6` in `oidc` mode trusting it, mints a Vault
+identity token, and saves real files with it. `$OV_TEST_IMAGE` picks another
+image. It points at a server you already run instead when `$OV_TEST_URL` and
+`$OV_TEST_KEY` are set. With neither a container runtime nor those variables
+it skips, so `npm test` stays runnable anywhere.
 
-Two things the container needs, both learned by watching it refuse to boot and
-both encoded in the harness: `dev` auth mode will not bind anything but
-localhost, so it runs on `api_key`; and it will not start without an embedding
-provider, so a stub OpenAI-compatible endpoint runs in the test process purely
-to satisfy the config.
+OpenViking will not start without an embedding provider, so a stub
+OpenAI-compatible endpoint runs in the test process purely to satisfy the
+config.
 
 This suite exists because five things were wrong that the stubbed unit tests
 could not see, since a stub only proves the client sends what its author

@@ -14,7 +14,12 @@
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { type Session, addResource, listFolders } from "../../src/lib/ov-api";
+import {
+  type OvError,
+  type Session,
+  addResource,
+  listFolders,
+} from "../../src/lib/ov-api";
 import { planArticleSave } from "../../src/lib/save";
 import { type Live, listTree, startOpenViking, stopOpenViking } from "./harness";
 
@@ -70,16 +75,22 @@ const md = (title: string, body = "Body text.") =>
 describe("talking to a real OpenViking", () => {
   it("is accepted by the token, on the header the client actually sends", async () => {
     if (needsServer()) return;
-    // The client sends the credential as both X-API-Key and a bearer. If the
-    // server took neither, this throws.
-    await expect(listFolders(session, "viking://~")).resolves.toBeInstanceOf(Array);
+    // The client sends the credential as both X-API-Key and a bearer. A user
+    // OpenViking has only met through a token has no tree until their first
+    // write, so the listing may be a 404 — but never the refusal a token the
+    // server will not take gets.
+    const outcome = await listFolders(session, "viking://~").then(
+      () => null,
+      (error: OvError) => error,
+    );
+    expect(outcome?.needsLogin ?? false).toBe(false);
   });
 
   it("rejects a bad token rather than answering anyway", async () => {
     if (needsServer()) return;
     await expect(
       listFolders({ url: session.url, token: "not-a-key" }, "viking://~"),
-    ).rejects.toThrow();
+    ).rejects.toMatchObject({ needsLogin: true });
   });
 
   it("resolves viking://~ to the token's own user", async () => {
