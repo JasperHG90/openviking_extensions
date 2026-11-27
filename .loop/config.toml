@@ -37,13 +37,22 @@ notify_title = "loop harness"
 # The commands loopctl gate stamp runs; each passes when it exits 0. With
 # inputs (globs), a stamp reuses a green result while those files are
 # unchanged (ADR 0017).
+# Through prek, so the loop runs the ruff pinned in .pre-commit-config.yaml,
+# as CI does. `uv run ruff` picked up a newer ruff from the uv environment and
+# failed on code the pinned one passes.
 [[gates]]
 name = "lint"
-command = "uv run ruff check"
+command = "prek run ruff-check --all-files"
 
 [[gates]]
 name = "format"
-command = "uv run ruff format --check"
+command = "prek run ruff-format --all-files"
+
+# The Go module ov-sync-queue: gofmt, vet and its tests. Needs a Go toolchain.
+[[gates]]
+name = "go-ov-sync-queue"
+command = "bash packages/ov-sync-queue/check.sh"
+inputs = ["packages/ov-sync-queue/**"]
 
 # The passes that must give a verdict before a ticket's commit, and the most
 # review rounds a ticket gets (ADR 0023).

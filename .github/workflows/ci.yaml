@@ -38,6 +38,12 @@ jobs:
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
+      # The go-ov-sync-queue hook runs gofmt, go vet and go test on the Go
+      # module, at the version its go.mod names.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: packages/ov-sync-queue/go.mod
+          cache-dependency-path: packages/ov-sync-queue/go.sum
       # The Node hooks shell out to each package's own node_modules, which this
       # job never installs -- it is a Python job. Left in, they fail on a
       # missing biome rather than on anything about the code, and the tsc they

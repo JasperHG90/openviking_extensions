@@ -5,9 +5,9 @@
   ⎿  SessionStart:startup hook error
   ⎿  Failed with non-blocking status code: /bin/sh: 1: node: not found
 
-❯ I have a user that wants to add files in a nomad job. He's asking if he can   
-  use workload identity, or iuf he needds to use his single API key for         
-  everything including headless apps?                                           
+❯ I have a user that wants to add files in a nomad job. He's asking if he can
+  use workload identity, or iuf he needds to use his single API key for
+  everything including headless apps?
   ⎿  UserPromptSubmit hook error
   ⎿  Failed with non-blocking status code: /bin/sh: 1: node: not found
 
@@ -82,8 +82,8 @@
 
 ※ recap: You asked whether a Nomad job that adds files to OpenViking can use workload identity or needs a personal API key; I answered from the repo. Next: decide whether the job writes into jasper's scope or a shared one. (disable recaps in /config)
 
-❯ When openviking has OAuth turned on, how does the user authenticate with the  
-  CLI, and with the API?                                                        
+❯ When openviking has OAuth turned on, how does the user authenticate with the
+  CLI, and with the API?
   ⎿  UserPromptSubmit hook error
   ⎿  Failed with non-blocking status code: /bin/sh: 1: node: not found
 
@@ -155,18 +155,18 @@
 
 ✻ Brewed for 1m 25s · done 5:52 PM
 
-❯ - Web Studio does not start. It hard-refuses serverMode === 'oidc'. So you    
-  get the authenticated session and no UI. docs/openviking.md:86 puts it        
-  plainly: under oidc the API works and the entire browser half of the service  
-  does not.                                                                     
-                                                                                
-  And how, pray, is a user to add e.g. resources if OAuth is turned on?         
+❯ - Web Studio does not start. It hard-refuses serverMode === 'oidc'. So you
+  get the authenticated session and no UI. docs/openviking.md:86 puts it
+  plainly: under oidc the API works and the entire browser half of the service
+  does not.
+
+  And how, pray, is a user to add e.g. resources if OAuth is turned on?
   ⎿  UserPromptSubmit hook error
   ⎿  Failed with non-blocking status code: /bin/sh: 1: node: not found
 
   Searched for 2 patterns, ran 1 shell command (ctrl+o to expand)
 
-❯ And the CLI doesn't work nor the web ui                                       
+❯ And the CLI doesn't work nor the web ui
   ⎿  UserPromptSubmit hook error
   ⎿  Failed with non-blocking status code: /bin/sh: 1: node: not found
 
@@ -229,7 +229,7 @@
 
 ※ recap: We've been answering how OpenViking authentication works for a Nomad job and for people. Conclusion so far: under OIDC nobody can add resources, so the API key stays. Next: tell your user that, or start the dashboard route. (disable recaps in /config)
 
-❯ No, the last route standing is forking OV and adding it ourselves             
+❯ No, the last route standing is forking OV and adding it ourselves
   ⎿  UserPromptSubmit hook error
   ⎿  Failed with non-blocking status code: /bin/sh: 1: node: not found
 
@@ -307,7 +307,7 @@
 
 ✻ Crunched for 2m 54s · done 6:08 PM
 
-❯ Ok So OAuth would be a rust change, or a python change?                       
+❯ Ok So OAuth would be a rust change, or a python change?
   ⎿  UserPromptSubmit hook error
   ⎿  Failed with non-blocking status code: /bin/sh: 1: node: not found
 
@@ -341,7 +341,7 @@
   config file.
 
   Writing an ov login would be a Rust change, and it would be a Rust change with
-  nothing to call. Vault's lab provider advertises grant_types_supported: 
+  nothing to call. Vault's lab provider advertises grant_types_supported:
   ["authorization_code"] and nothing else, no device flow, no
   client_credentials, no refresh (P3, measured against its discovery document).
   So the token still comes from a browser round trip and still dies in an hour.
@@ -382,10 +382,10 @@
 ✻ Worked for 1m 46s · done 6:12 PM
 
 ※ recap: We're deciding how a Nomad job and the CLI authenticate to OpenViking, and whether OAuth is worth forking upstream for. Next: choose whether to patch the Python server so oidc and api_key can coexist. (disable recaps in /config)
-❯ Like this?                                                                    
-                                                                                
-  https://github.com/JasperHG90/memex/blob/main/packages/core/src/memex_core/se 
-  rver/auth.py                                                                  
+❯ Like this?
+
+  https://github.com/JasperHG90/memex/blob/main/packages/core/src/memex_core/se
+  rver/auth.py
   ⎿  UserPromptSubmit hook error
   ⎿  Failed with non-blocking status code: /bin/sh: 1: node: not found
 
@@ -458,7 +458,7 @@
 
 ※ recap: You want OpenViking to accept Vault OIDC alongside API keys, and we found it needs no fork: a chained auth plugin can ship in your openviking_extensions repo. Next, say whether I should draft that as a ticket.
 
-❯ Hold on, are you saying this can be shipped as an extension?                  
+❯ Hold on, are you saying this can be shipped as an extension?
   ⎿  UserPromptSubmit hook error
   ⎿  Failed with non-blocking status code: /bin/sh: 1: node: not found
 
@@ -525,7 +525,7 @@
   backend, since it faced the same problem and you own that answer.
 
   So the shape is: a plugin package next to ov-postgres, your memex
-  authenticate_request chain as its resolver, and the claims-to-(account_id, 
+  authenticate_request chain as its resolver, and the claims-to-(account_id,
   user_id) mapping as the design fork. No fork of OpenViking, no vendored
   frontend, no Rust.
 
@@ -535,8 +535,8 @@
 
 ※ recap: Goal: let OpenViking users authenticate with Vault OIDC instead of API keys. We found it can ship as a custom auth plugin next to ov-postgres, no fork needed. Next: check how ov-postgres registers itself, then draft the ticket.
 
-❯ https://github.com/JasperHG90/openviking_extensions/tree/main/packages/ov-pos 
-  tgres                                                                         
+❯ https://github.com/JasperHG90/openviking_extensions/tree/main/packages/ov-pos
+  tgres
   ⎿  UserPromptSubmit hook error
   ⎿  Failed with non-blocking status code: /bin/sh: 1: node: not found
 
@@ -592,7 +592,7 @@
 
   So the full shape, with nothing left unverified except the claims mapping:
 
-  - ov-auth-vault in openviking_extensions, registering auth_mode = 
+  - ov-auth-vault in openviking_extensions, registering auth_mode =
     "vault_chain" via register_auth_plugin
   - the resolver: your memex authenticate_request chain, X-API-Key first,
     Authorization: Bearer second
@@ -605,7 +605,7 @@
 
 ✻ Sautéed for 55s · done 7:06 PM
 
-❯ How does (1) work?                                                            
+❯ How does (1) work?
   ⎿  UserPromptSubmit hook error
   ⎿  Failed with non-blocking status code: /bin/sh: 1: node: not found
 
@@ -677,7 +677,7 @@
 
   Read the base image's ENTRYPOINT before you replace it. I don't know what
   ghcr.io/volcengine/openviking:v0.4.17.1 sets, and if that entrypoint does
-  setup beyond calling server_bootstrap, overriding command skips it. docker 
+  setup beyond calling server_bootstrap, overriding command skips it. docker
   inspect the base image and reproduce whatever it does. Embark's Dockerfile hit
   the same class of problem and its comment records the entrypoint's exec
   behavior; this one has to be checked, not assumed.

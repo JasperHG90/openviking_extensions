@@ -140,3 +140,12 @@ repos:
         language: system
         pass_filenames: false
         files: ^packages/ov-clip/
+
+      # ov-sync-queue is a Go module; ruff and mypy cannot read it. Its gates
+      # need a Go toolchain (1.26+) on PATH.
+      - id: go-ov-sync-queue
+        name: gofmt + go vet + go test (ov-sync-queue)
+        entry: bash packages/ov-sync-queue/check.sh
+        language: system
+        pass_filenames: false
+        files: ^packages/ov-sync-queue/
