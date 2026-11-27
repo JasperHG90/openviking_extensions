@@ -2979,39 +2979,48 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         # Read before taking the lock: a re-queue in between bumps the
         # generation past this one, and the run then leaves the mark set.
         generation = self.md5_backfill_generation()
-        # A connection of its own rather than one from the pool: the run holds
-        # it for minutes while its own queries need the pool, which may be a
-        # single connection.
+        conn = self._take_md5_run_lock(key)
+        if conn is None:
+            yield None
+            return
+        try:
+            yield generation
+        finally:
+            self._release_md5_run_lock(conn, key)
+
+    @traced("ov_postgres.take_md5_run_lock")
+    def _take_md5_run_lock(self, key: int) -> psycopg.Connection[Any] | None:
+        """Open a connection holding the backfill's session lock, or return None.
+
+        A connection of its own rather than one from the pool: the run holds it
+        for minutes while its own queries need the pool, which may be a single
+        connection. Never waits for the lock.
+        """
+        annotate({"db.operation.name": "SELECT"})
         conninfo = self._pool.conninfo
         kwargs = self._pool.kwargs
-        with psycopg.connect(
+        conn = psycopg.connect(
             conninfo() if callable(conninfo) else conninfo,
             autocommit=True,
             **((kwargs() if callable(kwargs) else kwargs) or {}),
-        ) as conn:
-            if not self._take_md5_run_lock(conn, key):
-                yield None
-                return
-            try:
-                yield generation
-            finally:
-                self._release_md5_run_lock(conn, key)
-
-    @traced("ov_postgres.take_md5_run_lock")
-    def _take_md5_run_lock(self, conn: psycopg.Connection[Any], key: int) -> bool:
-        """Try the backfill's session lock on ``conn``; never wait for it."""
-        annotate({"db.operation.name": "SELECT"})
+        )
         with conn.cursor() as cur:
             cur.execute("SELECT pg_try_advisory_lock(%s)", (key,))
             row = cur.fetchone()
-        return bool(row and row[0])
+        if row and row[0]:
+            return conn
+        conn.close()
+        return None
 
     @traced("ov_postgres.release_md5_run_lock")
     def _release_md5_run_lock(self, conn: psycopg.Connection[Any], key: int) -> None:
-        """Release the backfill's session lock on ``conn``."""
+        """Release the backfill's session lock and close its connection."""
         annotate({"db.operation.name": "SELECT"})
-        with conn.cursor() as cur:
-            cur.execute("SELECT pg_advisory_unlock(%s)", (key,))
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_unlock(%s)", (key,))
+        finally:
+            conn.close()
 
     @traced("ov_postgres.finish_md5_backfill")
     def finish_md5_backfill(self, generation: int) -> bool:
