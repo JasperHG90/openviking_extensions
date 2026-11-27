@@ -8,14 +8,16 @@ with no timestamp keeps its score.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from ov_postgres.adapter import PgVectorCollectionAdapter
 
-from .test_integration import DIM, adapter  # noqa: F401  # the fixture
+from .test_integration import DIM, META, make_adapter
 
 pytestmark = pytest.mark.integration
 
@@ -26,13 +28,31 @@ NEAR = [0.9, 0.3] + [0.0] * (DIM - 2)
 FAR = [0.3, 0.9] + [0.0] * (DIM - 2)
 
 
-def decay(adapter: PgVectorCollectionAdapter, *, protection: str = "0", **kw: object) -> list[dict]:
+@pytest.fixture
+def store(dsn: str, test_schema: str) -> Iterator[PgVectorCollectionAdapter]:
+    """Yield an adapter over the test schema, which declares ``updated_at``."""
+    inst = make_adapter(dsn, test_schema)
+    inst.create_collection(
+        "context", META, distance="cosine", sparse_weight=0.0, index_name="default"
+    )
+    try:
+        yield inst
+    finally:
+        inst.close()
+
+
+def decay(
+    store: PgVectorCollectionAdapter,
+    *,
+    protection: str = "0",
+    where: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     """Run a decayed vector query through the adapter, as OpenViking does."""
-    return adapter.query(
+    return store.query(
         query_vector=QUERY,
         limit=10,
+        filter=where,
         advance={"time_decay": {"protection": protection, "origin": ORIGIN.isoformat()}},
-        **kw,
     )
 
 
@@ -46,23 +66,23 @@ def expected_factor(updated: datetime, protection: str = "0") -> float:
 
 
 def test_a_recent_row_overtakes_an_older_closer_one(
-    adapter: PgVectorCollectionAdapter,
+    store: PgVectorCollectionAdapter,
 ) -> None:
     """Scores are the similarity times OpenViking's decay factor."""
     stale_at = ORIGIN - timedelta(days=60)
     fresh_at = ORIGIN - timedelta(hours=1)
-    adapter.upsert(
+    store.upsert(
         [
             {"id": "stale", "vector": NEAREST, "updated_at": stale_at.isoformat()},
             {"id": "fresh", "vector": NEAR, "updated_at": fresh_at.isoformat()},
             {"id": "undated", "vector": FAR},
         ]
     )
-    plain = adapter.query(query_vector=QUERY, limit=10)
+    plain = store.query(query_vector=QUERY, limit=10)
     assert plain[0]["id"] == "stale"
 
-    rows = {row["id"]: row for row in decay(adapter)}
-    assert [row["id"] for row in decay(adapter)][0] == "fresh"
+    rows = {row["id"]: row for row in decay(store)}
+    assert decay(store)[0]["id"] == "fresh"
     for key, when in (("stale", stale_at), ("fresh", fresh_at)):
         row = rows[key]
         assert row["_time_score"] == pytest.approx(expected_factor(when))
@@ -72,19 +92,19 @@ def test_a_recent_row_overtakes_an_older_closer_one(
 
 
 def test_the_protection_period_keeps_recent_rows_undecayed(
-    adapter: PgVectorCollectionAdapter,
+    store: PgVectorCollectionAdapter,
 ) -> None:
     """Within the protection window the factor is 1."""
     when = ORIGIN - timedelta(days=3)
-    adapter.upsert({"id": "a", "vector": NEAR, "updated_at": when.isoformat()})
-    row = decay(adapter, protection="7d")[0]
+    store.upsert({"id": "a", "vector": NEAR, "updated_at": when.isoformat()})
+    row = decay(store, protection="7d")[0]
     assert row["_time_score"] == pytest.approx(1.0)
     assert expected_factor(when, "7d") == pytest.approx(1.0)
 
 
-def test_decay_honours_filters_and_paging(adapter: PgVectorCollectionAdapter) -> None:
+def test_decay_honours_filters_and_paging(store: PgVectorCollectionAdapter) -> None:
     """The decayed ranking is filtered first and paged after."""
-    adapter.upsert(
+    store.upsert(
         [
             {
                 "id": f"d{index}",
@@ -95,9 +115,9 @@ def test_decay_honours_filters_and_paging(adapter: PgVectorCollectionAdapter) ->
             for index in range(6)
         ]
     )
-    odd = decay(adapter, filter={"op": "must", "field": "level", "conds": [1]})
+    odd = decay(store, where={"op": "must", "field": "level", "conds": [1]})
     assert [row["id"] for row in odd] == ["d1", "d3", "d5"]
-    page = adapter.query(
+    page = store.query(
         query_vector=QUERY,
         limit=2,
         offset=1,
@@ -118,14 +138,13 @@ class _SharedVectorConfig:
 def test_openvikings_own_decayed_search_runs_on_this_backend(
     dsn: str, test_schema: str
 ) -> None:
-    """Through ``search_in_tenant``, as ``find`` reaches it: events decay, nothing raises."""
+    """Through ``search_in_tenant``, as ``find`` reaches it: events decay."""
     import asyncio
 
     from openviking.server.identity import RequestContext, Role, UserIdentifier
+    from openviking.storage.collection_schemas import CollectionSchemas
     from openviking.storage.viking_vector_index_backend import VikingVectorIndexBackend
     from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
-
-    from openviking.storage.collection_schemas import CollectionSchemas
 
     async def run() -> list[str]:
         store = VikingVectorIndexBackend(
