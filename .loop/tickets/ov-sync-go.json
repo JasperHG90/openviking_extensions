@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0",
   "slug": "ov-sync-go",
-  "stage": "verifying",
+  "stage": "done",
   "attempts": 1,
   "plan_rounds": 2,
   "review_rounds": 3,
@@ -29,7 +29,7 @@
   "split": "j-20261127T084940+0000-1beeeb5d",
   "split_plan_hash": "1acce95aca04fb38055f362bdc3d0e4f7a18237ad7532b3a234c04ccc9528959",
   "split_hold": false,
-  "commit_sha": null,
+  "commit_sha": "135e3d2bdd8482837bd8edbe000e63b8ac6e8d2e",
   "closed_outside": false,
   "dropped": false,
   "archived": false,
@@ -240,8 +240,14 @@
       "to": "verifying",
       "at": "2026-11-27T09:19:23+00:00",
       "by": "review fixed"
+    },
+    {
+      "from": "verifying",
+      "to": "done",
+      "at": "2026-11-27T09:21:42+00:00",
+      "by": "done"
     }
   ],
   "by": "process:loopctl/2.3.1.dev65+g93b143856",
-  "at": "2026-11-27T09:21:21+00:00"
+  "at": "2026-11-27T09:21:43+00:00"
 }
