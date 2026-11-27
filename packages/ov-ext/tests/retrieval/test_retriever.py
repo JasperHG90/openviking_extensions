@@ -631,3 +631,30 @@ async def test_an_account_that_cannot_be_resolved_skips_diversity() -> None:
     )
     assert store._shared_adapter.calls == []
     assert [c.uri for c in result.matched_contexts] == ["a", "b"]
+
+
+class _AccountAwareAdapter(_FakeAdapter):
+    """Supplies similarity the way ov-postgres does, scoped to one account."""
+
+    def pairwise_similarity(
+        self,
+        values: list[str],
+        *,
+        field: str | None = None,
+        account_id: str | None = None,
+    ) -> dict[tuple[str, str], float]:
+        self.calls.append(
+            {"values": list(values), "field": field, "account_id": account_id}
+        )
+        return self._similarity
+
+
+async def test_similarity_is_scoped_to_the_requesting_account() -> None:
+    """A shared table holds a URI once per account; the account is passed through."""
+    store = FakeStore(similarity={})
+    store._shared_adapter = _AccountAwareAdapter({("a", "b"): 1.0, ("b", "a"): 1.0})
+    retriever = make_retriever(
+        store, [ctx("a"), ctx("b"), ctx("c")], keyword_enabled=False, mmr_lambda=0.5
+    )
+    await retriever.retrieve(FakeQuery(), ctx=SimpleNamespace(account_id="acme"), limit=3)
+    assert store._shared_adapter.calls[0]["account_id"] == "acme"

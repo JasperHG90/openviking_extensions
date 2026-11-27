@@ -28,6 +28,7 @@ have had without this package installed.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import re
 from typing import Any
@@ -111,6 +112,17 @@ def _rank_below_the_model(
             scores[index] = min(surviving) * (count - rank) / (count + 1)
         else:
             scores[index] = min(model) - (rank + 1)
+
+
+def _accepts(function: object, name: str) -> bool:
+    """Return whether ``function`` takes a keyword argument called ``name``."""
+    try:
+        parameters = inspect.signature(function).parameters  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    return name in parameters or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+    )
 
 
 def _clip_query(text: str, max_chars: int) -> str:
@@ -712,8 +724,15 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
         try:
             # By URI, not by row id: a retrieval result carries the URI, and
             # the backend picks one representative row per URI.
+            # Scoped to the account where the backend can: a shared table holds
+            # the same URI once per account.
+            scope = (
+                {"account_id": getattr(ctx, "account_id", None)}
+                if _accepts(similarity, "account_id")
+                else {}
+            )
             pairs: dict[tuple[str, str], float] = await asyncio.to_thread(
-                similarity, uris, field="uri"
+                similarity, uris, field="uri", **scope
             )
         except Exception as exc:
             logger.warning("hybrid: similarity failed; skipping diversity", exc_info=True)
