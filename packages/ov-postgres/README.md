@@ -537,8 +537,9 @@ pgvector's `vector` type stores **float4**, so components are rounded on write: 
 - **A primary key of the wrong type is refused on write**, matching the built-in backend: `{"id": 3}` against a `string` key raises rather than storing `"3"`. An `int64` key accepts what the engine's validator accepts, so `"7"` and `True` become `7` and `1`. Reads are lenient, again matching: the engine keys rows on a hash of `str(key)`, so `fetch_data([3])` finds the record stored under `"3"` — and `[7.0]` finds nothing on an `int64` key, because `"7.0"` is not `"7"`. A key no stored row can equal is reported as not found rather than raising.
 - **`search_by_keywords` takes at most 16384 distinct terms.** Each binds two parameters against PostgreSQL's limit of 65535, and planning costs roughly a millisecond per term. Repeated terms are collapsed before any of that.
 - **Server-side grep and `search_type="keywords"`** never route here. OpenViking gates both to `volcengine`, `vikingdb` and `opengauss`, so grep falls back to the filesystem — even with `store_content` on. A keyword query reaches this backend only from [ov-ext](../ov-ext/)'s keyword leg, or from code that calls `search_by_keywords` itself.
-- **`search_by_keywords` ranks with `keyword_rank`, whatever it is asked.** It accepts OpenViking's `mode="bm25"` and searches the configured `keyword_fields` regardless of `fields`, which is what the full-text index covers. `bm25_k1`, `bm25_b`, any other `mode`, and every `advance` option raise rather than being ignored.
-- **Event time decay** (`events_time_decay_protection` on `find` and `search`) is refused with `NotImplementedError: Time decay is not supported by ov_postgres`. The adapter reports its mode as `ov_postgres` rather than `pgvector`, because since 0.5.5 `pgvector` names OpenViking's own PostgreSQL backend and OpenViking treats that name specially.
+- **`search_by_keywords` ranks with `keyword_rank`, whatever it is asked.** It accepts OpenViking's `mode="bm25"`. `fields` narrows the search to those columns (OpenViking's own callers send `["content"]`); without it the configured `keyword_fields` are searched, which is what the full-text index covers, so another set is answered by scanning the table. `bm25_k1`, `bm25_b`, any other `mode`, and every `advance` option except `time_decay` raise rather than being ignored.
+- **Event time decay** (`events_time_decay_protection` on `find` and `search`) works as on OpenViking's other backends: the adapter compiles the request with OpenViking's own curve, and the nearest 1,000 candidates by similarity are re-ranked by similarity times the decay over `updated_at`. A row with no timestamp keeps its score. Results carry the two parts as `_origin_score` and `_time_score`. The adapter reports its mode as `ov_postgres` rather than `pgvector`, because since 0.5.5 `pgvector` names OpenViking's own PostgreSQL backend and OpenViking treats that name specially.
+- **A NULL sorts as the smallest value** in an ordered query: first ascending, last descending. OpenViking's incremental inventory walks `updated_at` ascending and relies on rows without a timestamp coming first.
 
 **`search_by_keywords` is implemented** using PostgreSQL full-text search, so lexical search needs no embedding model.
 
@@ -589,10 +590,45 @@ loses a lock wait behind another server's — or lacks the privilege to alter th
 table — is a failed boot, and a restart tries again. In a process already
 serving, every query and write raises naming the cause, and the reconcile is
 retried at most once every 5 seconds until it succeeds; requests in between are
-refused at once rather than queued. A server that loaded the old
-schema before another one reconciled picks up the new one on its own boot, but
-an older ov-postgres still running during a rolling upgrade keeps writing the
-new fields to `extra`, so stop old servers before starting new ones.
+refused at once rather than queued.
+
+**Mixed versions during a rolling upgrade, and downgrades.** The reconcile
+installs a trigger on the table that keeps the new fields correct whatever
+writes the row:
+
+- A server whose view of the table predates the reconcile — one still running
+  from before it, or an older ov-postgres — writes the new fields into `extra`.
+  The trigger moves each such value into its column on insert and update, so
+  reads, filters and the ACL check see it. An ACL value that fits no column
+  fails the write.
+- A column such a writer leaves NULL gets the field's default.
+- On an update by any writer other than this version, which marks its own
+  transactions, a field the writer did not supply keeps the row's value. An
+  older stack on an OpenViking without ACL fills in defaults for fields it does
+  not know, and OpenViking keeps ACL on the rows themselves, so without this a
+  rewrite would erase a restriction for good.
+
+Downgrading needs no migration. ov-postgres 0.6.0 on OpenViking 0.4.17.1 reads
+the new fields from the registry, and reads, filters, writes and deletes on a
+reconciled table; the test suite runs that exact stack against one
+(`tests/test_downgrade.py`). Upgrading again finds the table current.
+
+**md5 on existing rows.** OpenViking fingerprints each indexed file with the md5
+of its stored bytes, and each directory's abstract and overview with the md5 of
+the sidecar's text. Its maintenance reindex re-embeds every record whose md5 is
+empty, so a reconcile that adds `md5` marks the table for a backfill, and the
+server log says so on every boot until it is done. The backfill reads each
+file through the server's own filesystem — which also decrypts it when
+encryption at rest is on, so it cannot run from outside the server — and hashes
+it with OpenViking's own functions. It never overwrites an md5 written
+meanwhile. Under [ov-ext](../ov-ext/)'s `ov-ext-server` it runs by itself once
+the server has started. Without ov-ext, run it from inside the server process:
+
+```python
+from openviking.storage.viking_fs import get_viking_fs
+
+await adapter.run_md5_backfill(get_viking_fs())
+```
 
 Two repairs apply after upgrading this package. Both are idempotent, and both
 run from the same adapter:

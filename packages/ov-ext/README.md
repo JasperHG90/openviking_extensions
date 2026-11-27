@@ -84,7 +84,11 @@ mean a second round trip per query carrying the biggest payload in the system.
 Instead the caller supplies the matrix, computed wherever the vectors already
 live. For the PostgreSQL backend that is one `pgvector` query
 (`ov_postgres`'s `pairwise_similarity`), and the embeddings never leave the
-database.
+database. The matrix comes from the requesting account's own adapter, resolved
+the way OpenViking 0.5 resolves it for search: an account with a dedicated
+vector database keeps its rows in a collection of its own. If that account's
+backend cannot be resolved, the diversity pass is skipped rather than run
+against the shared collection, which would find none of its rows.
 
 ```python
 from ov_ext.retrieval import blend_similarity, mmr_select, tag_similarity_matrix
@@ -133,6 +137,18 @@ warning.
 `install()` also checks the private backend methods the keyword leg calls,
 `_build_scope_filter` and `_acl_enabled`, and refuses to start if their
 signatures no longer fit the call it makes.
+
+### Backend maintenance
+
+`install()` also starts a background task once OpenViking's service has
+started, which asks every vector adapter it can reach — the shared one and each
+account's dedicated one — to run its maintenance, then asks again every 5
+minutes. Today that is ov-postgres's md5 backfill: after a schema upgrade adds
+`md5`, every old row has an empty one, and OpenViking's maintenance reindex
+would re-embed all of them. The backfill hashes each stored file through the
+server's own filesystem, so it can only run inside the server, and this is
+what runs it. An adapter with nothing pending costs one registry read; other
+backends are left alone.
 
 ### More than one worker
 
@@ -678,6 +694,8 @@ prove a fabricated quote never reaches the store.
 |---|---|
 | `installer` | Yes — the one entry point, fans out to each subsystem |
 | `worker` | Yes — carries the patches into uvicorn's spawned workers |
+| `maintenance` | Yes — runs backend upkeep, such as the md5 backfill, once the service has started |
+| `compat` | Reads the installed OpenViking version; refuses an untested one |
 | `observability` | No — OpenTelemetry API only, shared by every subsystem |
 | `retrieval.fusion` | No — pure functions |
 | `retrieval.diversity` | No — pure functions |
