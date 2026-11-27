@@ -1,0 +1,1 @@
+{"ask":"Add a local-only end-to-end test of ovsq through the full pipeline: SeaweedFS webhook, receiver, NATS JetStream, ov-sync-consumer, fake OpenViking. Mark it local only and check the end-to-end flow."}

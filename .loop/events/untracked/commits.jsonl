@@ -1,2 +1,3 @@
 {"at": "2026-11-27T06:55:28+00:00", "branch": "main", "kind": "commit", "schema_version": "1.0", "sha": "3de20f801498767b774dcb0d62a8491036c761e3", "subject": "build: init loop"}
 {"ask": "j-20261127T090902+0000-b74c69b4", "at": "2026-11-27T09:09:48+00:00", "branch": "main", "kind": "commit", "schema_version": "1.0", "sha": "3b9c2bdab5e4ce50851858fa01a7c9ceccdb9346", "subject": "loop: run the ruff gates through prek"}
+{"at": "2026-11-27T10:39:58+00:00", "branch": "main", "kind": "commit", "schema_version": "1.0", "sha": "395b6ffab17c44b6eda30a62e656472fd73a2c85", "subject": "loop: gate the Go module ov-sync-queue"}
