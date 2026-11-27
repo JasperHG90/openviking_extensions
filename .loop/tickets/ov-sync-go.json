@@ -1,14 +1,30 @@
 {
   "schema_version": "1.0",
   "slug": "ov-sync-go",
-  "stage": "fixing",
+  "stage": "verifying",
   "attempts": 1,
   "plan_rounds": 2,
   "review_rounds": 2,
   "extra_plan_rounds": 0,
   "extra_review_rounds": 0,
   "blocker": null,
-  "fix": null,
+  "fix": {
+    "round": 2,
+    "fingerprint": "3018ea4bdd2cb5b04c6faa64a5c2e042522cfef0844441140d62662252f25b04",
+    "tree": "835442a0597022a9b6f221585e620009a74527ec",
+    "decisions": [
+      {
+        "finding": "reviewer:f5",
+        "outcome": "sent-back",
+        "by": "fallback",
+        "judgement": "j-20261127T091923+0000-fc14999b",
+        "paths": [
+          "packages/ov-sync-queue/main.go"
+        ]
+      }
+    ],
+    "at": "2026-11-27T09:19:23+00:00"
+  },
   "ask": "j-20261127T070006+0000-1b9166b7",
   "split": "j-20261127T084940+0000-1beeeb5d",
   "split_plan_hash": "1acce95aca04fb38055f362bdc3d0e4f7a18237ad7532b3a234c04ccc9528959",
@@ -218,8 +234,14 @@
       "to": "fixing",
       "at": "2026-11-27T09:18:46+00:00",
       "by": "review close"
+    },
+    {
+      "from": "fixing",
+      "to": "verifying",
+      "at": "2026-11-27T09:19:23+00:00",
+      "by": "review fixed"
     }
   ],
   "by": "process:loopctl/2.3.1.dev65+g93b143856",
-  "at": "2026-11-27T09:19:20+00:00"
+  "at": "2026-11-27T09:19:23+00:00"
 }
