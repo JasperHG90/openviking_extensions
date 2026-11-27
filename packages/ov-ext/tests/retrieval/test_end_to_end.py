@@ -529,3 +529,75 @@ async def test_with_a_document_cap_every_reranked_result_outranks_every_held_bac
     assert set(order[:2]) == {"d1", "d2"}, order
     assert order[2:] == ["d3", "d4"], "held back, in their own vector order"
     await backend.close()
+
+
+class _DedicatedVectorConfig:
+    """Resolve one account to a vector database of its own, as OpenViking 0.5 allows."""
+
+    def __init__(self, dedicated: Any) -> None:
+        self._dedicated = dedicated
+
+    async def resolve(self, account_id: str) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(dedicated_vectordb=True, vectordb=self._dedicated)
+
+
+async def test_diversity_works_for_an_account_with_a_dedicated_vector_database(
+    postgres_dsn: str,
+) -> None:
+    """Similarity comes from the account's own collection, not the shared one.
+
+    Looked up in the shared collection, which holds none of this account's
+    rows, the embedding signal is empty and MMR quietly does nothing.
+    """
+    from openviking.storage.viking_vector_index_backend import VikingVectorIndexBackend
+    from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
+
+    def config(schema_name: str) -> Any:
+        return VectorDBBackendConfig(
+            backend="ov_postgres.adapter.PgVectorCollectionAdapter",
+            name=COLLECTION,
+            index_name="default",
+            dimension=DIM,
+            distance_metric="cosine",
+            custom_params={
+                "dsn": postgres_dsn,
+                "schema": schema_name,
+                "store_content": True,
+                "text_search_config": "english",
+            },
+        )
+
+    store = VikingVectorIndexBackend(config(f"shared_{uuid.uuid4().hex[:10]}"))
+    store.set_vector_config_resolver(
+        _DedicatedVectorConfig(config(f"dedicated_{uuid.uuid4().hex[:10]}"))
+    )
+    try:
+        ctx = request_context()
+        dedicated = await store.get_account_backend(ctx.account_id)
+        assert dedicated._adapter is not store._shared_adapter
+        assert await dedicated.create_collection(COLLECTION, schema())
+        await store.upsert_many(
+            [
+                record("first", uri="viking://resources/first", vector=NEAR_A),
+                record("twin", uri="viking://resources/twin", vector=NEAR_A),
+                record("other", uri="viking://resources/other", vector=NEAR_B),
+            ],
+            ctx=ctx,
+        )
+
+        plain = await retrieve(
+            store, ctx, query="", limit=3, keyword_enabled=False, mmr_enabled=False
+        )
+        diverse = await retrieve(
+            store, ctx, query="", limit=3, keyword_enabled=False, mmr_lambda=0.5
+        )
+
+        assert [m.uri for m in plain][:2] == [
+            "viking://resources/first",
+            "viking://resources/twin",
+        ], "without MMR the twins hold both top slots"
+        assert diverse[1].uri.endswith("other"), "MMR must break the pair up"
+    finally:
+        await store.close()

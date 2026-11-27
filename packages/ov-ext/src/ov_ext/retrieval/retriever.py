@@ -247,7 +247,7 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
             )
 
         if settings.mmr_enabled and settings.mmr_lambda < 1.0:
-            contexts = await self._diversify(contexts, limit=limit)
+            contexts = await self._diversify(contexts, limit=limit, ctx=ctx)
 
         finished = self._finish(result, contexts, limit)
         annotate({"ov_ext.retrieval.results": len(finished.matched_contexts)})
@@ -583,7 +583,7 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
 
     @traced("ov_ext.retrieval.diversify")
     async def _diversify(
-        self, contexts: list[MatchedContext], *, limit: int
+        self, contexts: list[MatchedContext], *, limit: int, ctx: Any = None
     ) -> list[MatchedContext]:
         """Re-rank ``contexts`` so near-duplicates fall below novel results.
 
@@ -612,7 +612,7 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
         embedding = {
             (display_by_stored[left], display_by_stored[right]): score
             for (left, right), score in (
-                await self._embedding_similarity(list(display_by_stored))
+                await self._embedding_similarity(list(display_by_stored), ctx=ctx)
             ).items()
             if left in display_by_stored and right in display_by_stored
         }
@@ -653,9 +653,24 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
         )
         return selected
 
+    async def _account_adapter(self, ctx: Any) -> Any:
+        """Return the vector adapter that holds the requesting account's rows.
+
+        Resolved as OpenViking's own search paths resolve it, through the
+        store's ``get_account_backend``. A store without per-account backends,
+        or a request with no account, uses the shared adapter.
+        """
+        store = self.vector_store
+        account_id = getattr(ctx, "account_id", None)
+        resolve = getattr(store, "get_account_backend", None)
+        if account_id and resolve is not None:
+            backend = await resolve(account_id)
+            return getattr(backend, "_adapter", None)
+        return getattr(store, "_shared_adapter", None)
+
     @traced("ov_ext.retrieval.embedding_similarity")
     async def _embedding_similarity(
-        self, uris: list[str]
+        self, uris: list[str], *, ctx: Any = None
     ) -> dict[tuple[str, str], float]:
         """Return pairwise cosine similarity between candidates, if the backend can.
 
@@ -667,6 +682,11 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
         Runs off the event loop, since the backend method is synchronous and
         issues a query.
 
+        Asked of the requesting account's own adapter, which OpenViking 0.5
+        resolves per account: an account with a dedicated vector database keeps
+        its rows in a collection of its own, and the shared adapter would find
+        none of them.
+
         Returns
         -------
         dict[tuple[str, str], float]
@@ -674,7 +694,17 @@ class HybridRetriever(HierarchicalRetriever):  # type: ignore[misc]  # base is u
             backend offers no such method.
         """
         annotate({"ov_ext.retrieval.uris": len(uris)})
-        adapter = getattr(self.vector_store, "_shared_adapter", None)
+        try:
+            adapter = await self._account_adapter(ctx)
+        except Exception as exc:
+            # Not the shared adapter instead: for a dedicated account it holds
+            # none of the rows, so it would answer "nothing similar" wrongly.
+            logger.warning(
+                "hybrid: cannot resolve the account's backend; skipping diversity",
+                exc_info=True,
+            )
+            record_error(exc, "account_backend_failed", NAMESPACE)
+            return {}
         similarity = getattr(adapter, "pairwise_similarity", None)
         if similarity is None:
             annotate({"ov_ext.retrieval.outcome": "backend_lacks_similarity"})

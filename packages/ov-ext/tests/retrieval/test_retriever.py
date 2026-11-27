@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -584,4 +585,49 @@ async def test_a_scope_that_cannot_be_built_is_an_error_not_a_quiet_fallback(
         result = await retriever.retrieve(FakeQuery(), ctx=None, limit=2)
     assert [r.levelno for r in caplog.records] == [logging.ERROR]
     assert store.keyword_calls == 0
+    assert [c.uri for c in result.matched_contexts] == ["a", "b"]
+
+
+class AccountStore(FakeStore):
+    """A store resolving each account to a backend of its own, as 0.5 does."""
+
+    def __init__(self, account_similarity: dict[tuple[str, str], float], **kwargs: Any):
+        super().__init__(similarity={}, **kwargs)
+        self.account = _FakeAdapter(account_similarity)
+        self.resolved: list[str] = []
+
+    async def get_account_backend(self, account_id: str) -> Any:
+        self.resolved.append(account_id)
+        return SimpleNamespace(_adapter=self.account)
+
+
+async def test_similarity_comes_from_the_requesting_accounts_own_backend() -> None:
+    """A dedicated account's rows are not in the shared collection."""
+    store = AccountStore({("a", "b"): 1.0, ("b", "a"): 1.0})
+    retriever = make_retriever(
+        store, [ctx("a"), ctx("b"), ctx("c")], keyword_enabled=False, mmr_lambda=0.5
+    )
+    request = SimpleNamespace(account_id="acme")
+    result = await retriever.retrieve(FakeQuery(), ctx=request, limit=3)
+    assert store.resolved == ["acme"]
+    assert store.account.calls, "the account's adapter must be asked"
+    assert store._shared_adapter.calls == []
+    assert [c.uri for c in result.matched_contexts][1] == "c"
+
+
+async def test_an_account_that_cannot_be_resolved_skips_diversity() -> None:
+    """Never the shared adapter in its place: it would find no rows and say so."""
+
+    class Unresolvable(AccountStore):
+        async def get_account_backend(self, account_id: str) -> Any:
+            raise RuntimeError("resolver not ready")
+
+    store = Unresolvable({})
+    retriever = make_retriever(
+        store, [ctx("a"), ctx("b")], keyword_enabled=False, mmr_lambda=0.5
+    )
+    result = await retriever.retrieve(
+        FakeQuery(), ctx=SimpleNamespace(account_id="acme"), limit=2
+    )
+    assert store._shared_adapter.calls == []
     assert [c.uri for c in result.matched_contexts] == ["a", "b"]
