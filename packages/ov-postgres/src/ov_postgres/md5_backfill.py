@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from collections.abc import Callable
 from typing import Protocol
@@ -41,8 +42,9 @@ logger = logging.getLogger(__name__)
 # Rows fingerprinted per round trip to the database.
 BATCH_SIZE = 200
 
-# How long a run holds the lease without renewing it. A run renews it after
-# every batch, so this bounds how long a crashed run blocks the next one.
+# How long a run holds the lease without renewing it, which bounds how long a
+# crashed run blocks the next one. A run renews it after every batch, and
+# within a batch once a third of it has passed, so slow reads cannot outlast it.
 LEASE_SECONDS = 120.0
 
 # The sidecar file that carries each directory level's embedding source.
@@ -215,9 +217,25 @@ async def _fill(
     filled = 0
     skipped = 0
     after: object = None
+    renewed = time.monotonic()
+
+    async def still_held() -> bool:
+        nonlocal renewed
+        if not await asyncio.to_thread(collection.renew_md5_lease, owner, lease_seconds):
+            logger.warning(
+                "ov_postgres: md5 backfill lost its lease to another process; "
+                "stopping after %d row(s)",
+                filled,
+            )
+            return False
+        renewed = time.monotonic()
+        return True
+
     while True:
         batch = await asyncio.to_thread(collection.md5_backfill_batch, after, batch_size)
         for key, stored_uri, level, account_id in batch:
+            if time.monotonic() - renewed >= lease_seconds / 3 and not await still_held():
+                return filled
             uri = str(decode_uri(stored_uri))
             md5 = await md5_for(viking_fs, uri, level, account_id) if account_id else None
             if md5 is None:
@@ -225,12 +243,7 @@ async def _fill(
                 continue
             if await asyncio.to_thread(collection.record_md5, key, md5):
                 filled += 1
-        if not await asyncio.to_thread(collection.renew_md5_lease, owner, lease_seconds):
-            logger.warning(
-                "ov_postgres: md5 backfill lost its lease to another process; "
-                "stopping after %d row(s)",
-                filled,
-            )
+        if not await still_held():
             return filled
         if len(batch) < batch_size:
             break

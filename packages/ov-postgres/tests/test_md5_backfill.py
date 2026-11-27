@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import tempfile
-import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -19,6 +18,7 @@ from typing import Any
 import pytest
 
 from ov_postgres.adapter import PgVectorCollectionAdapter
+from ov_postgres.md5_backfill import run_md5_backfill
 
 from .test_integration import make_adapter
 from .test_schema_reconcile import NEW, OLD, create, resource
@@ -220,18 +220,21 @@ def test_record_md5_keeps_an_md5_written_meanwhile(dsn: str, test_schema: str) -
 
 
 class CountingReader:
-    """A VikingFS stand-in that counts reads and can act on the first one."""
+    """A VikingFS stand-in that counts reads and can act on one of them."""
 
-    def __init__(self, inner: Any, on_first: Any = None, delay: float = 0.0) -> None:
+    def __init__(
+        self, inner: Any, on_first: Any = None, delay: float = 0.0, at: int = 1
+    ) -> None:
         self.inner = inner
         self.reads = 0
         self.on_first = on_first
         self.delay = delay
+        self.at = at
 
     async def read_file_bytes(self, uri: str, ctx: object = None) -> bytes:
-        """Count the read, run the hook on the first, then read for real."""
+        """Count the read, run the hook on read number ``at``, then read for real."""
         self.reads += 1
-        if self.reads == 1 and self.on_first is not None:
+        if self.reads == self.at and self.on_first is not None:
             await asyncio.to_thread(self.on_first)
         if self.delay:
             await asyncio.sleep(self.delay)
@@ -302,14 +305,16 @@ def test_a_lease_left_by_a_crashed_process_expires(
         assert adapter.collection_exists()
         inner = adapter._pg_collection
         assert inner is not None
-        assert inner.take_md5_lease("crashed-worker", 1.0)
+        assert inner.take_md5_lease("crashed-worker", 3600.0)
         with caplog.at_level(logging.INFO, logger="ov_postgres.md5_backfill"):
             assert asyncio.run(adapter.run_md5_backfill(viking_fs)) == 0
         assert any(
             r.levelno == logging.INFO and "holds the lease" in r.getMessage()
             for r in caplog.records
         )
-        time.sleep(1.5)
+        # Its owner alone may rewrite it: an expiry in the past stands in for
+        # the hour passing.
+        assert inner.take_md5_lease("crashed-worker", -1.0)
         assert asyncio.run(adapter.run_md5_backfill(viking_fs)) == 4
         assert not inner.md5_backfill_pending()
     finally:
@@ -358,5 +363,34 @@ def test_a_run_that_loses_its_lease_stops_without_clearing_the_mark(
         reader = CountingReader(viking_fs, on_first=steal)
         asyncio.run(adapter.run_md5_backfill(reader, batch_size=1))
         assert inner.md5_backfill_pending()
+        assert not inner.take_md5_lease("third", 60.0), "the new owner keeps it"
+    finally:
+        adapter.close()
+
+
+def test_a_long_batch_renews_its_lease_before_it_lapses(
+    dsn: str, test_schema: str, viking_fs: Any
+) -> None:
+    """Slow reads within one batch do not let the lease expire under the run."""
+    reconciled_old_table(dsn, test_schema, viking_fs)
+    adapter = make_adapter(dsn, test_schema)
+    try:
+        assert adapter.collection_exists()
+        inner = adapter._pg_collection
+        assert inner is not None
+        taken: list[bool] = []
+        reader = CountingReader(
+            viking_fs,
+            on_first=lambda: taken.append(inner.take_md5_lease("other", 60.0)),
+            delay=0.4,
+            at=5,
+        )
+        filled = asyncio.run(
+            run_md5_backfill(
+                inner, reader, adapter._decode_uri_field_value, lease_seconds=1.0
+            )
+        )
+        assert taken == [False], "the run still held its lease on the fifth read"
+        assert filled == 4
     finally:
         adapter.close()
