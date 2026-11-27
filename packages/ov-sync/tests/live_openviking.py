@@ -35,7 +35,7 @@ import os
 import shutil
 import socket
 import subprocess
-import threading
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -123,7 +123,7 @@ def _stub_vector(text: str) -> list[float]:
 class _ModelHandler(BaseHTTPRequestHandler):
     """Embeddings and chat completions, OpenAI-shaped, with fixed answers."""
 
-    def log_message(self, format: str, *args: Any) -> None:
+    def log_message(self, format: str, *args: object) -> None:
         """Stay quiet; pytest captures nothing useful from request logs."""
 
     def _answer(self, payload: dict[str, Any]) -> None:
@@ -183,15 +183,27 @@ class _ModelHandler(BaseHTTPRequestHandler):
 
 @contextmanager
 def _model_server() -> Iterator[int]:
-    # 0.0.0.0, not loopback: the container reaches it through the host gateway.
-    server = ThreadingHTTPServer(("0.0.0.0", 0), _ModelHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    """Run the stub in a child process, and yield its port.
+
+    A child rather than a thread: ovx's tests fork a pty, and forking a
+    process that has threads running can deadlock the child.
+    """
+    port = _free_port()
+    child = subprocess.Popen([sys.executable, "-I", __file__, str(port)])
     try:
-        yield int(server.server_address[1])
+        deadline = time.monotonic() + 20
+        while True:
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                break
+            except OSError:
+                if time.monotonic() > deadline or child.poll() is not None:
+                    raise RuntimeError("the stub model server did not start") from None
+                time.sleep(0.1)
+        yield port
     finally:
-        server.shutdown()
-        server.server_close()
+        child.terminate()
+        child.wait(timeout=10)
 
 
 def _http(
@@ -410,3 +422,8 @@ def openviking_stack(prefix: str) -> Iterator[LiveOpenViking]:
             subprocess.run(
                 ["docker", "rm", "-f", ov_name, vault_name], capture_output=True
             )
+
+
+if __name__ == "__main__":
+    # 0.0.0.0, not loopback: the container reaches it through the host gateway.
+    ThreadingHTTPServer(("0.0.0.0", int(sys.argv[1])), _ModelHandler).serve_forever()
