@@ -1,0 +1,1 @@
+{"ask":"Fix the loop's lint and format gates, which run uv run ruff (0.16.5) and fail on main while prek and CI pin ruff 0.14.2: run them through prek instead, and add the go-ov-sync-queue gate the ov-sync-go ticket needs."}
