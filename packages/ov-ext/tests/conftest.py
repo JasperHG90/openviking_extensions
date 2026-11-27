@@ -8,7 +8,9 @@ which is the behaviour ``test_observability.py`` also checks for directly.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from typing import Any
 
 import pytest
 from opentelemetry import trace
@@ -49,3 +51,70 @@ def spans(_tracer_provider: InMemorySpanExporter) -> Iterator[InMemorySpanExport
     _tracer_provider.clear()
     yield _tracer_provider
     _tracer_provider.clear()
+
+
+@dataclass(frozen=True)
+class _VectorDBSettings:
+    """The one VectorDB setting OpenViking reads for a shared collection."""
+
+    dimension: int
+
+
+@dataclass(frozen=True)
+class _AccountVectorSettings:
+    """What ``AccountVectorConfigResolver.resolve`` hands back, reduced to its use."""
+
+    vectordb: _VectorDBSettings
+    dedicated_vectordb: bool = False
+
+
+class SharedVectorConfig:
+    """Resolve every account to the shared collection, as a default server does.
+
+    OpenViking 0.5 resolves vector settings per account, and the backend
+    refuses any per-account call until ``OpenVikingService.initialize`` has
+    set a resolver. The real one reads account settings through the runtime
+    config manager and AGFS, which a test that builds a bare backend has none
+    of.
+
+    Parameters
+    ----------
+    dimension :
+        The embedding dimension of the test collection.
+    """
+
+    def __init__(self, dimension: int) -> None:
+        self._settings = _AccountVectorSettings(_VectorDBSettings(dimension))
+
+    async def resolve(self, account_id: str) -> _AccountVectorSettings:
+        """Return the shared-collection settings for any account."""
+        return self._settings
+
+
+@pytest.fixture
+def attach_vector_config() -> Callable[[Any, int], Any]:
+    """Return a function giving a bare backend the resolver the service would set."""
+
+    def attach(store: Any, dimension: int) -> Any:
+        store.set_vector_config_resolver(SharedVectorConfig(dimension))
+        return store
+
+    return attach
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _empty_openviking_config(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[None]:
+    """Point OpenViking at an empty config file for the whole session.
+
+    OpenViking 0.5's ``VikingVectorIndexBackend`` reads the global config on
+    construction, to set up its native logging. Left alone it would read the
+    developer's own ``~/.openviking/ov.conf``, or fail where there is none, as
+    on CI. An empty file gives OpenViking's defaults everywhere.
+    """
+    path = tmp_path_factory.mktemp("openviking") / "ov.conf"
+    path.write_text("{}")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("OPENVIKING_CONFIG_FILE", str(path))
+        yield

@@ -797,6 +797,12 @@ re-running against the same container is fine. Point it elsewhere with
 `VAULT_TEST_ADDR` and `VAULT_TEST_ROOT_TOKEN`. Kept out of `npm test` because
 that runs on every commit and has to stay offline.
 
+The same command runs `tests/openviking-live.integration.ts` when docker is
+available. It starts OpenViking 0.5.6 in `oidc` mode trusting that Vault, the
+way the lab runs it, signs in both ways (password and redirect), and drives
+every API route the pages call against it. `OV_TEST_IMAGE` picks another
+OpenViking image. Without docker that file skips.
+
 Biome is scoped to TypeScript; Svelte components are type-checked by
 `svelte-check`, since Biome 1.x only half-parses `.svelte` and wants to reformat
 every script block.

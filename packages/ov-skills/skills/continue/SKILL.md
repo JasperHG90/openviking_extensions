@@ -36,10 +36,9 @@ If `$ARGUMENTS` names a different project, search the whole tree instead —
 ## 2. List them
 
 <critical_constraint name="glob_not_list">
-Use `glob`, not `list`. `list` with `recursive=true` returns **only
-directories** — it will report the project folders and none of the handoffs in
-them, which reads exactly like "no handoffs found". `glob` returns full file
-URIs.
+Use `glob`, not `list`. `glob` returns exactly the handoff files, as full
+URIs, which is the set you sort. `list` with `recursive=true` mixes the
+directories in with them, and its output differs between servers.
 </critical_constraint>
 
 ```text

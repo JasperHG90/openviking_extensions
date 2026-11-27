@@ -59,7 +59,7 @@ One workflow, [`ci.yaml`](.github/workflows/ci.yaml), covers the repo: repo-wide
 
 | Template | Packages | What it runs |
 | --- | --- | --- |
-| [`template-check.yaml`](.github/workflows/template-check.yaml) | `ov-postgres`, `ov-ext`, `ovx` | The suite on the floor its `requires-python` names and on the newest interpreter, then builds a wheel and checks it installs and imports on its own. |
+| [`template-check.yaml`](.github/workflows/template-check.yaml) | `ov-postgres`, `ov-ext`, `ovx`, `ov-sync` | The unit suite on the floor its `requires-python` names and on the newest interpreter, the integration suite (live containers) on the newest only, then builds a wheel and checks it installs and imports on its own. |
 | [`template-check-shell.yaml`](.github/workflows/template-check-shell.yaml) | `ov-skills` | The suite on both Ubuntu and macOS, since macOS still ships bash 3.2 and rejects syntax every other bash accepts. |
 | [`template-check-node.yaml`](.github/workflows/template-check-node.yaml) | `ov-dash`, `ov-clip` | Type-check, lint and tests against the `node_modules` it installs — the gates the repo-wide job cannot run — then builds whatever the package ships: a container where there is a `Dockerfile`, an extension where there is a `manifest.json`. |
 

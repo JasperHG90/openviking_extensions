@@ -19,9 +19,25 @@ from .diversity import (
 )
 from .fusion import RRF_K
 
-__all__ = ["ENV_PREFIX", "HybridSettings"]
+__all__ = ["ENV_PREFIX", "REMOVED_SETTINGS", "HybridSettings"]
 
 ENV_PREFIX = "OV_RETRIEVAL_"
+
+# Settings an earlier ov-ext read, and why each is gone. Setting one now stops
+# startup with this reason, rather than the generic unknown-setting error: an
+# operator who set it believed it was in effect.
+REMOVED_SETTINGS: dict[str, str] = {
+    "rerank_max_calls": (
+        "removed in ov-ext 0.8.0. OpenViking 0.4.23 and later rerank once per "
+        "search, so there is no per-directory call count left to cap. Use "
+        "OV_RETRIEVAL_RERANK_MAX_DOCUMENTS to bound what that one call sends."
+    ),
+    "rerank_final": (
+        "removed in ov-ext 0.8.0. OpenViking 0.4.23 and later rerank the whole "
+        "recalled pool in one pass, so a second rerank after fusion would "
+        "re-score the same texts and undo the keyword fusion."
+    ),
+}
 
 
 class HybridSettings(BaseSettings):
@@ -71,8 +87,16 @@ class HybridSettings(BaseSettings):
         Raises
         ------
         ValueError
-            Naming the unknown variables and the settings that do exist.
+            Naming the unknown variables and the settings that do exist, or,
+            for a setting an earlier version read, why it was removed.
         """
+        removed = sorted(
+            f"{ENV_PREFIX}{name}".upper() + f" was {reason}"
+            for name, reason in REMOVED_SETTINGS.items()
+            if any(key.upper() == f"{ENV_PREFIX}{name}".upper() for key in os.environ)
+        )
+        if removed:
+            raise ValueError(" ".join(removed))
         known = {f"{ENV_PREFIX}{name}".upper() for name in type(self).model_fields}
         unknown = sorted(
             name
@@ -136,46 +160,22 @@ class HybridSettings(BaseSettings):
         default=True,
         description=(
             "Route rerank calls through one pooled, trace-propagating "
-            "connection instead of a fresh one per call. OpenViking reranks "
-            "once per directory the descent visits, so a search opens hundreds "
-            "of connections and the TCP and TLS handshake costs more than the "
-            "inference."
-        ),
-    )
-    rerank_max_calls: int = Field(
-        default=0,
-        ge=0,
-        description=(
-            "Ceiling on rerank calls during hierarchical descent; 0 removes "
-            "the ceiling. Past it, candidates keep their vector scores -- the "
-            "same degradation OpenViking already applies when reranking "
-            "fails. Bounds the tail on a wide tree, where the descent has no "
-            "cap of its own on how many directories it visits. The "
-            "``rerank_final`` pass is not charged against it."
+            "connection instead of a fresh one per call. OpenViking's rerank "
+            "client opens a new connection for every call, so each search "
+            "pays a TCP and TLS handshake, which on a LAN service costs more "
+            "than the inference."
         ),
     )
     rerank_max_documents: int = Field(
         default=0,
         ge=0,
         description=(
-            "Documents sent to the reranker in any one call; 0 sends all of "
-            "them. The rest keep their vector scores and stay in the running. "
-            "Cost is near-linear in documents, because the service batches "
-            "them a few pairs at a time, so this is the knob that decides "
-            "what a search spends. Prefer it to a low ``rerank_max_calls``: "
-            "the same budget spread thinly over many directories reranks at "
-            "every level of the descent, where a low call ceiling reranks the "
-            "first few directories well and the rest not at all."
-        ),
-    )
-    rerank_final: bool = Field(
-        default=True,
-        description=(
-            "Rerank the pool once more, after fusion and before the diversity "
-            "pass. The descent scores candidates as it meets them, one "
-            "directory at a time, so nothing has ever scored the pool as a "
-            "whole -- not the candidates the keyword leg promoted, and not "
-            "the ones a spent call ceiling left on their vector scores. One "
-            "call, and the last word on relevance."
+            "Documents sent to the reranker in a search's one rerank call; 0 "
+            "sends all of them. OpenViking reranks twice the pool it is asked "
+            "for, and with a pass active the pool is ``pool_factor`` times the "
+            "answer: 80 documents for 10 results at the defaults. Past the "
+            "cap the weakest by vector score keep their vector scores and stay "
+            "in the running. Cost is near-linear in documents, so this is the "
+            "knob that decides what a search spends."
         ),
     )

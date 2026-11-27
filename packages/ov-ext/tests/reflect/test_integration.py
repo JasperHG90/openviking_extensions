@@ -25,7 +25,7 @@ import asyncio
 import os
 import tempfile
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from typing import Any
 
@@ -98,40 +98,6 @@ def schema() -> dict[str, Any]:
     }
 
 
-class _StubEmbedding:
-    """Just the dimension the adapter reads."""
-
-    def __init__(self, dimension: int) -> None:
-        self.dimension = dimension
-
-
-class _StubConfig:
-    """Just the embedding section the adapter reads."""
-
-    def __init__(self, embedding: _StubEmbedding) -> None:
-        self.embedding = embedding
-
-
-@pytest.fixture(autouse=True)
-def _fixed_embedding_dimension(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pin the embedding dimension the adapter reads from global config.
-
-    ``CollectionAdapter.query`` builds a placeholder vector for a filter-only
-    query, sized from ``get_openviking_config().embedding.dimension``. Left
-    alone it reads the developer's real ``~/.openviking/ov.conf`` -- which
-    says 512 -- and every filter fails against this suite's 8-dimension
-    collection with "different vector dimensions". Mirrors the fixture
-    ov-postgres's own suite uses for the same reason.
-    """
-    from openviking.storage.vectordb_adapters import base
-
-    monkeypatch.setattr(
-        base,
-        "get_openviking_config",
-        lambda: _StubConfig(embedding=_StubEmbedding(dimension=DIM)),
-    )
-
-
 @pytest.fixture(scope="module")
 def postgres_dsn() -> Iterator[str]:
     """A throwaway PostgreSQL with pgvector, shared by this module."""
@@ -162,7 +128,11 @@ def postgres_dsn() -> Iterator[str]:
 
 
 def _backend(dsn: str, *, store_content: bool) -> Any:
-    """A real OpenViking vector backend on a real PostgreSQL, in its own schema."""
+    """A real OpenViking vector backend on a real PostgreSQL, in its own schema.
+
+    Built bare, so it lacks the per-account vector resolver the service sets;
+    the fixtures below attach one.
+    """
     from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
 
     from openviking.storage.viking_vector_index_backend import VikingVectorIndexBackend
@@ -185,15 +155,19 @@ def _backend(dsn: str, *, store_content: bool) -> Any:
 
 
 @pytest.fixture
-def backend(postgres_dsn: str) -> Iterator[Any]:
+def backend(
+    postgres_dsn: str, attach_vector_config: Callable[[Any, int], Any]
+) -> Iterator[Any]:
     """A backend that stores row content, which reflection requires."""
-    yield _backend(postgres_dsn, store_content=True)
+    yield attach_vector_config(_backend(postgres_dsn, store_content=True), DIM)
 
 
 @pytest.fixture
-def contentless_backend(postgres_dsn: str) -> Iterator[Any]:
+def contentless_backend(
+    postgres_dsn: str, attach_vector_config: Callable[[Any, int], Any]
+) -> Iterator[Any]:
     """A backend configured the way OpenViking defaults: no stored content."""
-    yield _backend(postgres_dsn, store_content=False)
+    yield attach_vector_config(_backend(postgres_dsn, store_content=False), DIM)
 
 
 @pytest.fixture

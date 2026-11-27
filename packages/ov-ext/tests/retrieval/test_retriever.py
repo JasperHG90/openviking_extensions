@@ -8,12 +8,16 @@ fusion, the diversity pass, and above all the ways they decline to run.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from openviking.retrieve.hierarchical_retriever import HierarchicalRetriever
+from openviking.server.identity import RequestContext, Role, UserIdentifier
+from openviking.storage.viking_vector_index_backend import VikingVectorIndexBackend
 from openviking_cli.retrieve.types import MatchedContext, QueryResult
 
 from ov_ext.retrieval.config import HybridSettings
@@ -71,11 +75,29 @@ class FakeStore:
         self._keyword_error = keyword_error
         self.keyword_calls = 0
         self.keyword_queries: list[str] = []
+        self.scope_calls: list[dict[str, Any]] = []
+        self.acl_on = False
         if similarity is not None:
             self._shared_adapter = _FakeAdapter(similarity)
 
-    def _build_scope_filter(self, **kwargs: Any) -> object:
+    # Shaped like OpenViking 0.5's, so a call that omits `acl_enabled` fails
+    # here as it does there. A permissive `**kwargs` fake let ov-ext 0.7 ship
+    # a keyword leg that raised TypeError on every search.
+    def _build_scope_filter(
+        self,
+        ctx: Any,
+        context_type: Any,
+        target_directories: Any,
+        extra_filter: Any,
+        level: Any = None,
+        *,
+        acl_enabled: bool,
+    ) -> object:
+        self.scope_calls.append({"ctx": ctx, "acl_enabled": acl_enabled})
         return {"scope": "built"}
+
+    async def _acl_enabled(self, ctx: Any) -> bool:
+        return self.acl_on
 
     async def search_by_keywords(self, **kwargs: Any) -> list[dict[str, Any]]:
         self.keyword_calls += 1
@@ -149,12 +171,7 @@ def ctx(
     score: float = 0.0,
     abstract: str = "",
 ) -> MatchedContext:
-    """Build a matched context with the fields the retriever reads.
-
-    ``abstract`` defaults to empty, which is what the final rerank pass reads.
-    A pool of blank abstracts is refused before any call goes out, so tests
-    that are not about that pass are unaffected by it.
-    """
+    """Build a matched context with the fields the retriever reads."""
     return MatchedContext(
         uri=uri,
         context_type=None,
@@ -236,9 +253,7 @@ async def test_a_document_sized_query_is_clipped_before_the_keyword_leg() -> Non
     the ranking then follows document length rather than relevance.
     """
     store = FakeStore(keyword_uris=["b"])
-    retriever = make_retriever(
-        store, [ctx("a"), ctx("b")], mmr_enabled=False, rerank_final=False
-    )
+    retriever = make_retriever(store, [ctx("a"), ctx("b")], mmr_enabled=False)
     # Ten characters per word, so the 1024-character cut lands mid-word and
     # the boundary logic is actually exercised rather than skipped by luck.
     words = [f"w{n:04d}zzzz" for n in range(200)]
@@ -256,9 +271,7 @@ async def test_a_document_sized_query_is_clipped_before_the_keyword_leg() -> Non
 async def test_a_normal_query_reaches_the_keyword_leg_untouched() -> None:
     """The clip is a safety valve; every real query has to pass through whole."""
     store = FakeStore(keyword_uris=["b"])
-    retriever = make_retriever(
-        store, [ctx("a"), ctx("b")], mmr_enabled=False, rerank_final=False
-    )
+    retriever = make_retriever(store, [ctx("a"), ctx("b")], mmr_enabled=False)
 
     await retriever.retrieve(FakeQuery(query="vault policy rotation"), ctx=None, limit=5)
 
@@ -272,7 +285,6 @@ async def test_the_clip_can_be_turned_off() -> None:
         store,
         [ctx("a"), ctx("b")],
         mmr_enabled=False,
-        rerank_final=False,
         keyword_max_chars=0,
     )
     document = " ".join(f"word{n}" for n in range(500))
@@ -489,331 +501,160 @@ async def test_a_missing_upstream_suffix_table_degrades_rather_than_raising() ->
         HierarchicalRetriever.LEVEL_URI_SUFFIX = saved
 
 
-def rerank_by_abstract(monkeypatch: pytest.MonkeyPatch, best: str) -> list[list[str]]:
-    """Stub the base rerank to prefer one abstract, recording each batch.
-
-    Returns
-    -------
-    list
-        The documents of every call that reached the base implementation.
-    """
-    seen: list[list[str]] = []
-
-    async def base_rerank(
-        self: Any, query: str, documents: list[str], fallback_scores: list[float]
-    ) -> list[float]:
-        seen.append(list(documents))
-        # Neither value may coincide with a context's vector score. A score
-        # equal to the fallback is how upstream reports that it could not
-        # score that document at all, so a stub returning 0.0 against `ctx`'s
-        # default 0.0 would be claiming the opposite of what it means. Real
-        # cosines and sigmoid rerank scores do not collide exactly.
-        return [0.9 if document == best else 0.1 for document in documents]
-
-    monkeypatch.setattr(HierarchicalRetriever, "_rerank_scores", base_rerank)
-    return seen
+@pytest.mark.parametrize("acl_on", [False, True])
+async def test_the_keyword_scope_carries_the_accounts_acl_setting(acl_on: bool) -> None:
+    """The keyword leg asks the backend whether ACL is on and passes the answer."""
+    store = FakeStore(keyword_uris=["b"])
+    store.acl_on = acl_on
+    retriever = make_retriever(store, [ctx("a"), ctx("b")], mmr_enabled=False)
+    await retriever.retrieve(FakeQuery(), ctx="request", limit=2)
+    assert store.scope_calls == [{"ctx": "request", "acl_enabled": acl_on}]
+    assert store.keyword_calls == 1
 
 
-async def test_the_final_pass_reorders_the_fused_pool(
-    monkeypatch: pytest.MonkeyPatch,
+class _AclManager:
+    """Reports ACL as on or off for every account."""
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+    async def is_enabled(self, account_id: str) -> bool:
+        return self.enabled
+
+
+class RealScopeStore(FakeStore):
+    """A fake store running OpenViking's own scope builder, so its signature binds."""
+
+    _acl_enabled = VikingVectorIndexBackend._acl_enabled
+    _build_scope_filter = VikingVectorIndexBackend._build_scope_filter
+    _tenant_filter = VikingVectorIndexBackend._tenant_filter
+    _targets_within_visible_roots = staticmethod(
+        VikingVectorIndexBackend._targets_within_visible_roots
+    )
+    _merge_filters = staticmethod(VikingVectorIndexBackend._merge_filters)
+
+    def __init__(self, *, acl_enabled: bool, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.acl_manager = _AclManager(acl_enabled)
+        self.filters: list[Any] = []
+
+    async def search_by_keywords(self, **kwargs: Any) -> list[dict[str, Any]]:
+        self.filters.append(kwargs.get("filter"))
+        return await super().search_by_keywords(**kwargs)
+
+
+@pytest.mark.parametrize("acl_enabled", [False, True])
+async def test_the_keyword_leg_runs_against_openvikings_scope_builder(
+    caplog: pytest.LogCaptureFixture, acl_enabled: bool
 ) -> None:
-    """The pass exists to overrule the order the descent and fusion produced.
+    """With the real ``_build_scope_filter``, the leg runs and nothing is logged.
 
-    Both other passes are off, so nothing but the final rerank can move ``b``
-    ahead of ``a``.
+    ov-ext 0.7 called it without ``acl_enabled``; the TypeError was caught and
+    every search went vector-only with a WARNING. With ACL on, the scope must
+    carry the ACL filter, so a restricted resource cannot come back.
     """
-    rerank_by_abstract(monkeypatch, best="good")
+    store = RealScopeStore(
+        acl_enabled=acl_enabled, keyword_uris=["viking://resources/b.md"]
+    )
     retriever = make_retriever(
-        FakeStore(),
-        [ctx("a", abstract="dull"), ctx("b", abstract="good")],
-        keyword_enabled=False,
+        store,
+        [ctx("viking://resources/a.md"), ctx("viking://resources/b.md")],
         mmr_enabled=False,
     )
+    request = RequestContext(user=UserIdentifier("acme", "bob"), role=Role.USER)
+    with caplog.at_level(logging.WARNING, logger="ov_ext.retrieval.retriever"):
+        await retriever.retrieve(FakeQuery(), ctx=request, limit=2)
+    assert store.keyword_calls == 1
+    assert caplog.records == []
+    scope = repr(store.filters[0])
+    assert ("acl_mode" in scope) is acl_enabled
 
-    result = await retriever.retrieve(FakeQuery(), ctx=None, limit=2)
 
-    assert [m.uri for m in result.matched_contexts] == ["b", "a"]
-
-
-async def test_the_final_pass_runs_before_the_diversity_pass(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_a_scope_that_cannot_be_built_is_an_error_not_a_quiet_fallback(
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Order matters and is invisible in the output.
+    """Failing to scope the leg is logged at ERROR, and no unscoped search runs."""
 
-    ``mmr_select`` reads relevance from a candidate's position, so a rerank
-    after it would quietly undo the diversification. Asserted by watching what
-    ``_diversify`` is handed, since a wrong order here still produces a
-    plausible-looking answer.
-    """
-    rerank_by_abstract(monkeypatch, best="good")
-    handed: list[str] = []
+    class BrokenScope(FakeStore):
+        def _build_scope_filter(self, *args: Any, **kwargs: Any) -> object:
+            raise TypeError("scope builder changed")
 
-    async def fake_diversify(
-        self: Any, contexts: list[MatchedContext], *, limit: int
-    ) -> list[MatchedContext]:
-        handed.extend(context.uri for context in contexts)
-        return contexts
+    store = BrokenScope(keyword_uris=["b"])
+    retriever = make_retriever(store, [ctx("a"), ctx("b")], mmr_enabled=False)
+    with caplog.at_level(logging.WARNING, logger="ov_ext.retrieval.retriever"):
+        result = await retriever.retrieve(FakeQuery(), ctx=None, limit=2)
+    assert [r.levelno for r in caplog.records] == [logging.ERROR]
+    assert store.keyword_calls == 0
+    assert [c.uri for c in result.matched_contexts] == ["a", "b"]
 
-    monkeypatch.setattr(HybridRetriever, "_diversify", fake_diversify)
+
+class AccountStore(FakeStore):
+    """A store resolving each account to a backend of its own, as 0.5 does."""
+
+    def __init__(self, account_similarity: dict[tuple[str, str], float], **kwargs: Any):
+        super().__init__(similarity={}, **kwargs)
+        self.account = _FakeAdapter(account_similarity)
+        self.resolved: list[str] = []
+
+    async def get_account_backend(self, account_id: str) -> Any:
+        self.resolved.append(account_id)
+        return SimpleNamespace(_adapter=self.account)
+
+
+async def test_similarity_comes_from_the_requesting_accounts_own_backend() -> None:
+    """A dedicated account's rows are not in the shared collection."""
+    store = AccountStore({("a", "b"): 1.0, ("b", "a"): 1.0})
     retriever = make_retriever(
-        FakeStore(),
-        [ctx("a", abstract="dull"), ctx("b", abstract="good")],
-        keyword_enabled=False,
-        mmr_enabled=True,
-        mmr_lambda=0.5,
+        store, [ctx("a"), ctx("b"), ctx("c")], keyword_enabled=False, mmr_lambda=0.5
     )
+    request = SimpleNamespace(account_id="acme")
+    result = await retriever.retrieve(FakeQuery(), ctx=request, limit=3)
+    assert store.resolved == ["acme"]
+    assert store.account.calls, "the account's adapter must be asked"
+    assert store._shared_adapter.calls == []
+    assert [c.uri for c in result.matched_contexts][1] == "c"
 
-    await retriever.retrieve(FakeQuery(), ctx=None, limit=2)
 
-    assert handed == ["b", "a"], (
-        "diversity must see the reranked order, not the fused one"
+async def test_an_account_that_cannot_be_resolved_skips_diversity() -> None:
+    """Never the shared adapter in its place: it would find no rows and say so."""
+
+    class Unresolvable(AccountStore):
+        async def get_account_backend(self, account_id: str) -> Any:
+            raise RuntimeError("resolver not ready")
+
+    store = Unresolvable({})
+    retriever = make_retriever(
+        store, [ctx("a"), ctx("b")], keyword_enabled=False, mmr_lambda=0.5
     )
-
-
-async def test_the_final_pass_is_not_charged_to_the_descent_ceiling(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A tight ceiling must not silently drop the pass that makes it affordable.
-
-    The budget is set to zero -- fully spent -- and the pass must still call.
-    """
-    from ov_ext.retrieval.retriever import _rerank_budget
-
-    seen = rerank_by_abstract(monkeypatch, best="good")
-
-    class _Stubbed(HybridRetriever):
-        def __init__(self) -> None:
-            self._settings = HybridSettings(rerank_max_calls=1)
-
-    token = _rerank_budget.set(0)
-    try:
-        await _Stubbed()._rerank_pool([ctx("a", abstract="good")], text="q")
-    finally:
-        _rerank_budget.reset(token)
-
-    assert seen == [["good"]], "the final pass must not consult the descent budget"
-
-
-async def test_the_final_pass_keeps_the_fused_order_when_scoring_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A short answer from the service must not reorder the pool by a wrong list."""
-
-    async def short_rerank(
-        self: Any, query: str, documents: list[str], fallback_scores: list[float]
-    ) -> list[float]:
-        return [1.0]
-
-    monkeypatch.setattr(HierarchicalRetriever, "_rerank_scores", short_rerank)
-
-    class _Stubbed(HybridRetriever):
-        def __init__(self) -> None:
-            self._settings = HybridSettings()
-
-    result = await _Stubbed()._rerank_pool(
-        [ctx("a", abstract="x"), ctx("b", abstract="y")], text="q"
+    result = await retriever.retrieve(
+        FakeQuery(), ctx=SimpleNamespace(account_id="acme"), limit=2
     )
-
-    assert [m.uri for m in result] == ["a", "b"]
-
-
-async def test_a_pool_of_blank_abstracts_costs_no_rerank_call(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Ordinary mid-backfill, and a round trip that could only learn nothing."""
-    seen = rerank_by_abstract(monkeypatch, best="good")
-
-    class _Stubbed(HybridRetriever):
-        def __init__(self) -> None:
-            self._settings = HybridSettings()
-
-    result = await _Stubbed()._rerank_pool([ctx("a"), ctx("b")], text="q")
-
-    assert seen == [], "a pool with nothing to judge must not reach the service"
-    assert [m.uri for m in result] == ["a", "b"]
+    assert store._shared_adapter.calls == []
+    assert [c.uri for c in result.matched_contexts] == ["a", "b"]
 
 
-def fused_pool() -> list[MatchedContext]:
-    """A pool in fused order whose vector scores run the opposite way.
+class _AccountAwareAdapter(_FakeAdapter):
+    """Supplies similarity the way ov-postgres does, scoped to one account."""
 
-    This is the shape fusion produces whenever the keyword leg promotes a
-    document the embedding ranked last, so sorting it by score is visibly
-    wrong rather than merely unjustified.
-    """
-    return [
-        ctx("buried", abstract="rotating the intermediate certificate", score=0.1),
-        ctx("decoy", abstract="nothing of interest", score=0.9),
-    ]
+    def pairwise_similarity(
+        self,
+        values: list[str],
+        *,
+        field: str | None = None,
+        account_id: str | None = None,
+    ) -> dict[tuple[str, str], float]:
+        self.calls.append(
+            {"values": list(values), "field": field, "account_id": account_id}
+        )
+        return self._similarity
 
 
-async def test_the_final_pass_keeps_the_fused_order_with_no_reranker_configured() -> None:
-    """Regression: the end-to-end keyword test caught this and the unit suite did not.
-
-    With no rerank client the base class hands ``fallback_scores`` straight
-    back -- the pool's *vector* scores. Sorting by those undoes the fusion
-    this pass runs after and puts the decoy back on top, which is exactly
-    what the keyword leg exists to prevent.
-    """
-
-    class _Stubbed(HybridRetriever):
-        def __init__(self) -> None:
-            self._settings = HybridSettings()
-            self._rerank_client = None
-
-    result = await _Stubbed()._rerank_pool(fused_pool(), text="intermediate certificate")
-
-    assert [m.uri for m in result] == ["buried", "decoy"], (
-        "fusion's order must survive a pass that scored nothing"
+async def test_similarity_is_scoped_to_the_requesting_account() -> None:
+    """A shared table holds a URI once per account; the account is passed through."""
+    store = FakeStore(similarity={})
+    store._shared_adapter = _AccountAwareAdapter({("a", "b"): 1.0, ("b", "a"): 1.0})
+    retriever = make_retriever(
+        store, [ctx("a"), ctx("b"), ctx("c")], keyword_enabled=False, mmr_lambda=0.5
     )
-
-
-async def test_the_final_pass_keeps_the_fused_order_when_the_service_declines(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Same bug, reached with a client configured.
-
-    The base returns ``fallback_scores`` unchanged on a service error or an
-    odd-length answer too, so a present-but-failing reranker must not reorder
-    either. Checked separately because the no-client guard would mask it.
-    """
-
-    async def declines(
-        self: Any, query: str, documents: list[str], fallback_scores: list[float]
-    ) -> list[float]:
-        return list(fallback_scores)
-
-    monkeypatch.setattr(HierarchicalRetriever, "_rerank_scores", declines)
-
-    class _Stubbed(HybridRetriever):
-        def __init__(self) -> None:
-            self._settings = HybridSettings()
-
-    result = await _Stubbed()._rerank_pool(fused_pool(), text="intermediate certificate")
-
-    assert [m.uri for m in result] == ["buried", "decoy"], (
-        "a declined rerank must not be read as a ranking"
-    )
-
-
-async def test_the_cap_does_not_let_the_final_pass_bury_what_it_held_back(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A partial rerank must not be sorted as though it were a whole one.
-
-    The cap picks by vector score, so what it holds back is precisely what the
-    keyword leg promoted. Sorting the whole pool by the merged list would then
-    compare a rerank score against a cosine: it buried ``promoted`` from first
-    to last and lifted ``d``, which nothing ever judged, from last to first.
-    Found by adversarial review.
-    """
-    seen: list[list[str]] = []
-
-    async def base_rerank(
-        self: Any, query: str, documents: list[str], fallback_scores: list[float]
-    ) -> list[float]:
-        seen.append(list(documents))
-        return [9.0] * len(documents)
-
-    monkeypatch.setattr(HierarchicalRetriever, "_rerank_scores", base_rerank)
-
-    class _Stubbed(HybridRetriever):
-        def __init__(self) -> None:
-            self._settings = HybridSettings(rerank_max_documents=2)
-
-    pool = [
-        ctx("promoted", abstract="the keyword hit", score=0.10),
-        ctx("b", abstract="b filler", score=0.80),
-        ctx("c", abstract="c filler", score=0.70),
-        ctx("d", abstract="d filler", score=0.60),
-    ]
-
-    result = await _Stubbed()._rerank_pool(pool, text="q")
-    order = [m.uri for m in result]
-
-    assert seen == [["b filler", "c filler"]], (
-        "the cap sends the strongest by vector score"
-    )
-    assert order[0] == "promoted", "what the cap held back must keep its fused place"
-    assert order[-1] == "d", (
-        "a candidate nothing judged must not be promoted over one judged"
-    )
-
-
-async def test_blank_abstracts_are_not_ranked_against_a_scored_candidate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Shipped defaults, and ordinary while a collection is backfilling.
-
-    Upstream scores only the non-blank documents and leaves the rest on their
-    cosines. Sorting the pool by that mixture made the answer depend on where
-    the cross-encoder's output range happened to sit against cosine -- here a
-    real match with a low rerank score fell below two candidates carrying no
-    text at all. Found by adversarial review.
-    """
-
-    async def base_rerank(
-        self: Any, query: str, documents: list[str], fallback_scores: list[float]
-    ) -> list[float]:
-        # Upstream scores only the non-blank documents and leaves the rest on
-        # their vector scores. Returning a flat constant for every document
-        # instead -- which this stub first did -- makes the buggy whole-pool
-        # sort stable, so the test passed against the bug it exists to catch.
-        return [
-            0.2 if document.strip() else fallback
-            for document, fallback in zip(documents, fallback_scores, strict=True)
-        ]
-
-    monkeypatch.setattr(HierarchicalRetriever, "_rerank_scores", base_rerank)
-
-    class _Stubbed(HybridRetriever):
-        def __init__(self) -> None:
-            self._settings = HybridSettings()
-
-    pool = [
-        ctx("relevant", abstract="a real abstract", score=0.10),
-        ctx("blank-a", abstract="", score=0.90),
-        ctx("blank-b", abstract="   ", score=0.80),
-    ]
-
-    result = await _Stubbed()._rerank_pool(pool, text="q")
-
-    assert [m.uri for m in result] == ["relevant", "blank-a", "blank-b"], (
-        "an unjudged blank must not outrank the one candidate that was judged"
-    )
-
-
-async def test_the_final_pass_applies_the_ranking_and_not_its_inverse(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Three scored candidates, so the permutation is not its own inverse.
-
-    Every other test of this pass scores at most two, and swapping two
-    elements looks the same whichever direction the permutation is applied.
-    Writing the placement backwards therefore passed all 293 tests while
-    producing a different order on 219 of 400 random pools. Found by
-    adversarial review.
-    """
-    by_document = {"a doc": 0.1, "b doc": 0.3, "c doc": 0.2}
-
-    async def base_rerank(
-        self: Any, query: str, documents: list[str], fallback_scores: list[float]
-    ) -> list[float]:
-        return [by_document[document] for document in documents]
-
-    monkeypatch.setattr(HierarchicalRetriever, "_rerank_scores", base_rerank)
-
-    class _Stubbed(HybridRetriever):
-        def __init__(self) -> None:
-            self._settings = HybridSettings()
-
-    pool = [
-        ctx("a", abstract="a doc", score=0.0),
-        ctx("b", abstract="b doc", score=0.0),
-        ctx("c", abstract="c doc", score=0.0),
-    ]
-
-    result = await _Stubbed()._rerank_pool(pool, text="q")
-
-    assert [m.uri for m in result] == ["b", "c", "a"], (
-        "best first by rerank score: b 0.3, c 0.2, a 0.1 -- the inverse gives c, a, b"
-    )
+    await retriever.retrieve(FakeQuery(), ctx=SimpleNamespace(account_id="acme"), limit=3)
+    assert store._shared_adapter.calls[0]["account_id"] == "acme"

@@ -46,9 +46,10 @@ For a local file, `add_resource` does **not** ingest anything. It returns an
 the bytes land.
 
 So: call `add_resource(path="/abs/path/file.pdf")`, then POST the file to the
-URL it returns — for example `curl -fsS -X POST --data-binary @/abs/path/file.pdf "<returned url>"`,
-matching whatever form the response asks for. Do **not** call `add_resource`
-again afterwards; that would queue a second copy.
+URL it returns as a multipart form field named `file`:
+`curl -fsS -X POST -F "file=@/abs/path/file.pdf" "<returned url>"`. A raw body
+(`--data-binary`) is refused. Do **not** call `add_resource` again afterwards;
+that would queue a second copy.
 
 Remote URLs and repos need none of this. They ingest from the one call.
 

@@ -262,14 +262,16 @@ def test_batch_write_omits_the_unused_content_field(client: OvClient) -> None:
 
 
 @respx.mock
-def test_rm_reports_whether_anything_was_removed(client: OvClient) -> None:
-    """Removing what is already gone is a no-op, not a failure."""
-    respx.delete(f"{BASE}/fs").mock(
+def test_rm_of_something_already_gone_is_not_a_failure(client: OvClient) -> None:
+    """A 404 on delete is the state the caller wanted, so it does not raise."""
+    route = respx.delete(f"{BASE}/fs").mock(
         side_effect=[ok({"uri": "x"}), error(404, "NOT_FOUND", "File not found")]
     )
 
-    assert client.rm("viking://resources/notes/a.md") is True
-    assert client.rm("viking://resources/notes/a.md") is False
+    client.rm("viking://resources/notes/a.md")
+    client.rm("viking://resources/notes/a.md")
+
+    assert route.call_count == 2
 
 
 @respx.mock

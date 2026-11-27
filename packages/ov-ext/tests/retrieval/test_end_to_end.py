@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import pytest
@@ -121,7 +121,9 @@ def postgres_dsn() -> Iterator[str]:
 
 
 @pytest.fixture
-def backend(postgres_dsn: str) -> Iterator[Any]:
+def backend(
+    postgres_dsn: str, attach_vector_config: Callable[[Any, int], Any]
+) -> Iterator[Any]:
     """A real OpenViking vector backend on a real PostgreSQL, per test."""
     from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
 
@@ -142,7 +144,7 @@ def backend(postgres_dsn: str) -> Iterator[Any]:
         },
     )
     store = VikingVectorIndexBackend(config)
-    yield store
+    yield attach_vector_config(store, DIM)
 
 
 def request_context() -> Any:
@@ -249,7 +251,7 @@ async def test_the_keyword_leg_promotes_a_document_the_vector_leg_ranks_last(
 async def test_hybrid_ranking_survives_a_downstream_re_sort_by_score(
     backend: Any,
 ) -> None:
-    """`/skills/search` re-sorts by `.score`, which must agree with the order.
+    """Consumers re-sort by `.score`, which must agree with the order.
 
     A ranking that lives only in list order is discarded by any consumer that
     sorts, which is how the fusion was being silently undone.
@@ -384,3 +386,218 @@ async def test_diversity_reaches_level_0_results(backend: Any) -> None:
     assert diverse[1].uri.endswith("other/.abstract.md"), "MMR must fire for L0 too"
 
     await backend.close()
+
+
+class _AclOn:
+    """An ACL manager reporting ACL as enabled for every account."""
+
+    async def is_enabled(self, account_id: str) -> bool:
+        return True
+
+
+async def test_the_keyword_leg_hides_a_restricted_resource_when_acl_is_on(
+    backend: Any,
+) -> None:
+    """With ACL on, the keyword leg finds what the user may read and nothing else.
+
+    The two documents match the query equally; one is restricted to another
+    user. Two layers keep it out: the scope ov-ext builds with OpenViking's
+    ``_build_scope_filter``, and the tenant filter OpenViking's own
+    ``search_by_keywords`` adds for ``ctx``. This proves the leg runs end to
+    end on OpenViking 0.5 and does not leak; ov-ext 0.7 raised on the missing
+    ``acl_enabled`` and the leg returned nothing at all. The scope's own ACL
+    filter is checked by ``test_the_keyword_leg_runs_against_openvikings_scope_builder``.
+    """
+    from openviking.storage.acl import EMPTY_ACL_GRANT, AclAction, acl_grant_tokens
+    from openviking.storage.collection_schemas import CollectionSchemas
+
+    from ov_ext.retrieval.config import HybridSettings
+    from ov_ext.retrieval.retriever import HybridRetriever
+
+    ctx = request_context()
+    assert await backend.create_collection(
+        COLLECTION, CollectionSchemas.context_collection(COLLECTION, DIM)
+    )
+    common = {
+        "account_id": "acct",
+        "context_type": "resource",
+        "level": 2,
+        "abstract": "intermediate certificate rotation",
+        "acl_inherited_grants": [EMPTY_ACL_GRANT],
+    }
+    # Written through the adapter: OpenViking's own write path resets the ACL
+    # fields, which only its ACL manager may set.
+    backend._shared_adapter.upsert(
+        [
+            {
+                **common,
+                "id": "open",
+                "uri": "viking://resources/open.md",
+                "vector": NEAR_A,
+                "acl_mode": "none",
+                "acl_direct_grants": [EMPTY_ACL_GRANT],
+            },
+            {
+                **common,
+                "id": "secret",
+                "uri": "viking://resources/secret.md",
+                "vector": NEAR_B,
+                "acl_mode": "restricted",
+                "acl_direct_grants": acl_grant_tokens(
+                    ["user:someone-else"], AclAction.READ
+                )[:1],
+            },
+        ]
+    )
+    backend.acl_manager = _AclOn()
+    retriever = HybridRetriever(
+        settings=HybridSettings(), storage=backend, embedder=StubEmbedder(NEAR_A)
+    )
+
+    found = await retriever._keyword_uris(
+        text="intermediate certificate",
+        ctx=ctx,
+        pool=10,
+        scope_dsl=None,
+        level=None,
+        context_type=None,
+        target_directories=None,
+    )
+
+    assert found == ["viking://resources/open.md"]
+    await backend.close()
+
+
+class _LowScoringReranker:
+    """A rerank client whose scores all sit below the held-back cosines."""
+
+    def __init__(self) -> None:
+        self.batches: list[list[str]] = []
+
+    def rerank_batch(self, query: str, documents: list[str]) -> list[float]:
+        self.batches.append(list(documents))
+        return [0.05 + 0.01 * index for index in range(len(documents))]
+
+
+async def test_with_a_document_cap_every_reranked_result_outranks_every_held_back_one(
+    backend: Any,
+) -> None:
+    """The cap must not let the weakest candidates jump the reranked ones.
+
+    Four documents with falling cosines; the cap sends the two strongest, and
+    the model scores them low. Held back on their cosines, the other two would
+    sort above them -- OpenViking ranks the whole list by score.
+    """
+    from openviking_cli.retrieve.types import TypedQuery
+
+    from ov_ext.retrieval.config import HybridSettings
+    from ov_ext.retrieval.retriever import HybridRetriever
+
+    ctx = request_context()
+    assert await backend.create_collection(COLLECTION, schema())
+    vectors = {
+        "d1": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "d2": [0.9, 0.44, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "d3": [0.8, 0.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "d4": [0.7, 0.71, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    }
+    await backend.upsert_many(
+        [
+            record(key, uri=f"viking://resources/{key}", vector=vector, name=f"doc {key}")
+            for key, vector in vectors.items()
+        ],
+        ctx=ctx,
+    )
+    retriever = HybridRetriever(
+        settings=HybridSettings(
+            keyword_enabled=False, mmr_enabled=False, rerank_max_documents=2
+        ),
+        storage=backend,
+        embedder=StubEmbedder(NEAR_A),
+    )
+    reranker = _LowScoringReranker()
+    retriever._rerank_client = reranker
+
+    result = await retriever.retrieve(
+        TypedQuery(query="doc", context_type=None, intent="", target_directories=[]),
+        ctx=ctx,
+        limit=4,
+    )
+
+    order = [context.uri.rsplit("/", 1)[-1] for context in result.matched_contexts]
+    assert reranker.batches == [["doc d1", "doc d2"]]
+    assert set(order[:2]) == {"d1", "d2"}, order
+    assert order[2:] == ["d3", "d4"], "held back, in their own vector order"
+    await backend.close()
+
+
+class _DedicatedVectorConfig:
+    """Resolve one account to a vector database of its own, as OpenViking 0.5 allows."""
+
+    def __init__(self, dedicated: Any) -> None:
+        self._dedicated = dedicated
+
+    async def resolve(self, account_id: str) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(dedicated_vectordb=True, vectordb=self._dedicated)
+
+
+async def test_diversity_works_for_an_account_with_a_dedicated_vector_database(
+    postgres_dsn: str,
+) -> None:
+    """Similarity comes from the account's own collection, not the shared one.
+
+    Looked up in the shared collection, which holds none of this account's
+    rows, the embedding signal is empty and MMR quietly does nothing.
+    """
+    from openviking.storage.viking_vector_index_backend import VikingVectorIndexBackend
+    from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
+
+    def config(schema_name: str) -> Any:
+        return VectorDBBackendConfig(
+            backend="ov_postgres.adapter.PgVectorCollectionAdapter",
+            name=COLLECTION,
+            index_name="default",
+            dimension=DIM,
+            distance_metric="cosine",
+            custom_params={
+                "dsn": postgres_dsn,
+                "schema": schema_name,
+                "store_content": True,
+                "text_search_config": "english",
+            },
+        )
+
+    store = VikingVectorIndexBackend(config(f"shared_{uuid.uuid4().hex[:10]}"))
+    store.set_vector_config_resolver(
+        _DedicatedVectorConfig(config(f"dedicated_{uuid.uuid4().hex[:10]}"))
+    )
+    try:
+        ctx = request_context()
+        dedicated = await store.get_account_backend(ctx.account_id)
+        assert dedicated._adapter is not store._shared_adapter
+        assert await dedicated.create_collection(COLLECTION, schema())
+        await store.upsert_many(
+            [
+                record("first", uri="viking://resources/first", vector=NEAR_A),
+                record("twin", uri="viking://resources/twin", vector=NEAR_A),
+                record("other", uri="viking://resources/other", vector=NEAR_B),
+            ],
+            ctx=ctx,
+        )
+
+        plain = await retrieve(
+            store, ctx, query="", limit=3, keyword_enabled=False, mmr_enabled=False
+        )
+        diverse = await retrieve(
+            store, ctx, query="", limit=3, keyword_enabled=False, mmr_lambda=0.5
+        )
+
+        assert [m.uri for m in plain][:2] == [
+            "viking://resources/first",
+            "viking://resources/twin",
+        ], "without MMR the twins hold both top slots"
+        assert diverse[1].uri.endswith("other"), "MMR must break the pair up"
+    finally:
+        await store.close()

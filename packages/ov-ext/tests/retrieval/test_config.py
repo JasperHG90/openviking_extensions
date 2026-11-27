@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from ov_ext.retrieval.config import ENV_PREFIX, HybridSettings
+from ov_ext.retrieval.config import ENV_PREFIX, REMOVED_SETTINGS, HybridSettings
 
 
 def test_defaults_have_both_passes_on() -> None:
@@ -92,3 +92,22 @@ def test_explicit_arguments_beat_the_environment(
     monkeypatch.setenv(f"{ENV_PREFIX}MMR_LAMBDA", "0.4")
 
     assert HybridSettings(mmr_lambda=0.9).mmr_lambda == 0.9
+
+
+@pytest.mark.parametrize("name", sorted(REMOVED_SETTINGS))
+def test_a_removed_setting_stops_startup_and_says_why(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """An operator who set a removed variable believes it is in effect."""
+    variable = f"{ENV_PREFIX}{name}".upper()
+    monkeypatch.setenv(variable, "1")
+
+    with pytest.raises(ValueError, match=f"{variable} was removed in ov-ext 0.8.0"):
+        HybridSettings()
+
+
+@pytest.mark.parametrize("name", ["rerank_max_calls", "rerank_final"])
+def test_a_removed_setting_is_refused_in_code_too(name: str) -> None:
+    """Passed directly, the old names fail rather than being ignored."""
+    with pytest.raises(ValueError):
+        HybridSettings.model_validate({name: 1})

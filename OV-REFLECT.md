@@ -13,6 +13,11 @@ primitives.
 > note about a package rename contradicted a line from a README, and it
 > answered because it was asked to. Every pair it returned was an artifact of
 > the question. The rest of the document still describes the shipped design.
+> File and line references point at the OpenViking it was written against. The
+> hooks it relies on (`MemoryUpdater.apply_operations`,
+> `refresh_file_embedding`, `refresh_schema_overview`,
+> `OpenVikingService.initialize`) were re-checked on OpenViking 0.5.6 for
+> ov-ext 0.8.0, and the reflect integration suite passes there.
 
 ## Why
 
