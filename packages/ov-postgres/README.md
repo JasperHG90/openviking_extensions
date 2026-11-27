@@ -621,7 +621,12 @@ against both (`tests/test_downgrade.py`). Upgrading again finds the table
 current. One thing a downgrade cannot keep: OpenViking 0.4 has no ACL, so
 while it runs, every user it serves can read every resource in the account,
 restricted ones included. The restrictions are still on the rows when you
-upgrade again.
+upgrade again — on rows the old stack updated in place. A row it deletes and
+then writes anew is a new row to the trigger, and comes back with the default,
+unrestricted. That covers moving or renaming a resource, re-adding one after
+removing it, and the stale-level deletes OpenViking 0.4.17's reindex makes. After
+upgrading again, set ACL once more on anything that was restricted and touched
+that way while downgraded.
 
 **md5 on existing rows.** OpenViking fingerprints each indexed file with the md5
 of its stored bytes, and each directory's abstract and overview with the md5 of
