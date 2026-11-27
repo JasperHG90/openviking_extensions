@@ -327,6 +327,49 @@ describe("search", () => {
     expect(body.hits[0]?.match.exact).toEqual(["vault"]);
   });
 
+  it("searches the person's own tree when the shared scope does not exist yet", async () => {
+    // A deployment nobody has put anything shared into has no
+    // `viking://resources` at all, and OpenViking answers a search of it with
+    // NOT_FOUND. That is no hits from that scope, not a failed search.
+    const mine = "viking://user/jasper/notes/vault.md";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const body = JSON.parse(typeof init?.body === "string" ? init.body : "{}") as {
+          uri?: string;
+          target_uri?: string;
+        };
+        if ((body.uri ?? body.target_uri) === "viking://resources") {
+          return new Response(
+            JSON.stringify({
+              status: "error",
+              error: { code: "NOT_FOUND", message: "File not found: viking://resources" },
+            }),
+            { status: 404, headers: { "content-type": "application/json" } },
+          );
+        }
+        const result = url.includes("/search/grep")
+          ? { matches: [{ uri: mine, line: 1, content: "vault" }], count: 1 }
+          : {
+              memories: [],
+              resources: [{ uri: mine, score: 0.5, abstract: "", overview: null }],
+              skills: [],
+              total: 1,
+            };
+        return new Response(JSON.stringify({ status: "ok", result }), {
+          headers: { "content-type": "application/json" },
+        });
+      }),
+    );
+
+    const response = await appFor().request("/api/search?q=vault&mode=hybrid");
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { hits: { uri: string }[] };
+    expect(body.hits.map((hit) => hit.uri)).toEqual([mine]);
+  });
+
   it("does not caption a hit with a template that failed to render", async () => {
     // OpenViking prints a missing field into the text instead of raising, so
     // an abstract can arrive as its own error message. A result line reading

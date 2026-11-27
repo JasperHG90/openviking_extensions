@@ -562,7 +562,9 @@ export class OvClient {
    * body is the part anybody edits, and it is the part this replaces.
    */
   async write(uri: string, content: string): Promise<void> {
-    await this.guard(`writing ${uri}`, () => this.sdk.write(uri, content));
+    await this.guard(`writing ${uri}`, () =>
+      waitOutBusy(() => this.sdk.write(uri, content)),
+    );
   }
 
   /**
@@ -768,8 +770,9 @@ export class OvClient {
       this.searchRoots,
       MAX_CONCURRENT_UPSTREAM,
       async (root) => {
-        const result = await this.guard("searching", () =>
-          this.sdk.find(query, { targetUri: root, limit }),
+        const result = await emptyWhenMissing(
+          this.guard("searching", () => this.sdk.find(query, { targetUri: root, limit })),
+          { resources: [], memories: [], skills: [] },
         );
         return [result.resources, result.memories, result.skills];
       },
@@ -820,11 +823,14 @@ export class OvClient {
       capped.map((term) => ({ root, term })),
     );
     const results = await inBatches(jobs, MAX_CONCURRENT_UPSTREAM, async (job) => {
-      const raw = await this.guard(`grepping ${job.term}`, () =>
-        this.sdk.grep(job.root, escapeRegex(job.term), {
-          caseInsensitive: true,
-          nodeLimit: limit,
-        }),
+      const raw = await emptyWhenMissing<unknown>(
+        this.guard(`grepping ${job.term}`, () =>
+          this.sdk.grep(job.root, escapeRegex(job.term), {
+            caseInsensitive: true,
+            nodeLimit: limit,
+          }),
+        ),
+        { matches: [], count: 0 },
       );
       const parsed = grepResultSchema.safeParse(raw);
       return { term: job.term, matches: parsed.success ? parsed.data.matches : [] };
@@ -856,8 +862,55 @@ export class OvClient {
  */
 export const MAX_GREP_TERMS = 8;
 
+/**
+ * Answer a search of a scope that does not exist yet as finding nothing there.
+ *
+ * A deployment nobody has put anything shared into has no `viking://resources`,
+ * and OpenViking answers a search of it with NOT_FOUND, 0.4.17.1 and 0.5.6
+ * alike. Failing the whole search for that hid the person's own hits.
+ */
+async function emptyWhenMissing<T>(search: Promise<T>, empty: T): Promise<T> {
+  try {
+    return await search;
+  } catch (error) {
+    if (error instanceof OvError && error.status === 404) return empty;
+    throw error;
+  }
+}
+
 /** Most upstream calls in flight at once for one dashboard request. */
 export const MAX_CONCURRENT_UPSTREAM = 6;
+
+/**
+ * How long a write keeps trying while the file is locked by its last write.
+ *
+ * OpenViking 0.5 holds a file's lock until the previous write's indexing is
+ * done, and refuses a write that arrives meanwhile with a `CONFLICT` it marks
+ * `retryable`. 0.4.17.1 accepted it. Measured against 0.5.6 with a stub model,
+ * the window is about a second; a real model on a long document takes longer,
+ * and past this bound the refusal reaches the person as it is.
+ */
+export const BUSY_RETRY_MS = 20_000;
+
+/**
+ * Run a write, trying again while OpenViking says the path is busy.
+ *
+ * Only a conflict the server itself calls retryable is retried. Any other
+ * refusal, a stale edit or a name already taken, would come back the same.
+ */
+export async function waitOutBusy<T>(write: () => Promise<T>): Promise<T> {
+  const deadline = Date.now() + BUSY_RETRY_MS;
+  for (let delay = 250; ; delay = Math.min(delay * 2, 2000)) {
+    try {
+      return await write();
+    } catch (error) {
+      const busy =
+        isOpenVikingError(error, "CONFLICT") && error.details?.retryable === true;
+      if (!busy || Date.now() + delay > deadline) throw error;
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+}
 
 /**
  * Map over items with a bound on how many run at once.

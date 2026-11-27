@@ -939,6 +939,58 @@ describe("saving a file's text", () => {
     });
   });
 
+  it("waits out the lock a save still indexing holds, then saves", async () => {
+    // OpenViking 0.5 refuses a write to a file whose last write is still being
+    // indexed, as a retryable CONFLICT. Typing on after a save and saving again
+    // lands in exactly that window, so a refusal here was the editor failing on
+    // its own previous save.
+    let refusals = 1;
+    const calls = stubOv((url) => {
+      if (url.includes("/content/write")) {
+        if (refusals-- > 0) {
+          return new Response(
+            JSON.stringify({
+              status: "error",
+              error: {
+                code: "CONFLICT",
+                message: `resource is busy and cannot be written now: ${URI}`,
+                details: { conflict_type: "path_busy", retryable: true },
+              },
+            }),
+            { status: 409, headers: { "content-type": "application/json" } },
+          );
+        }
+        return { uri: URI, mode: "replace" };
+      }
+      return statting({ [URI]: { isDir: false } })(url);
+    });
+
+    const response = await save(URI, { content: "second save" });
+
+    expect(response.status).toBe(200);
+    expect(calls.filter((call) => call.url.includes("/content/write"))).toHaveLength(2);
+  });
+
+  it("does not retry a conflict that will not clear on its own", async () => {
+    const calls = stubOv((url) => {
+      if (url.includes("/content/write")) {
+        return new Response(
+          JSON.stringify({
+            status: "error",
+            error: { code: "CONFLICT", message: "refused", details: {} },
+          }),
+          { status: 409, headers: { "content-type": "application/json" } },
+        );
+      }
+      return statting({ [URI]: { isDir: false } })(url);
+    });
+
+    const response = await save(URI, { content: "x" });
+
+    expect(response.status).toBe(409);
+    expect(calls.filter((call) => call.url.includes("/content/write"))).toHaveLength(1);
+  });
+
   it("lets a file be emptied, which is a thing somebody may mean", async () => {
     // `body.content || ""` would read an absent field as a deliberate clear.
     // These are different requests and the route has to tell them apart.
