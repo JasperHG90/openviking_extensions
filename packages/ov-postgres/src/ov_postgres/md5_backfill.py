@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from typing import Protocol
 
 __all__ = ["BATCH_SIZE", "SIDECAR_NAMES", "FileReader", "md5_for", "run_md5_backfill"]
@@ -62,8 +63,12 @@ class _Collection(Protocol):
         """Set one row's md5 if it is still empty."""
         ...
 
-    def finish_md5_backfill(self) -> None:
-        """Clear the pending mark."""
+    def md5_backfill_run(self) -> AbstractContextManager[int | None]:
+        """Hold the right to backfill; yield the starting generation, or None."""
+        ...
+
+    def finish_md5_backfill(self, generation: int) -> bool:
+        """Clear the pending mark unless it was queued again since ``generation``."""
         ...
 
 
@@ -131,9 +136,12 @@ async def run_md5_backfill(
 ) -> int:
     """Fingerprint every row left with an empty md5, then clear the mark.
 
-    Does nothing when no reconcile has marked the table. A row whose source
-    cannot be read keeps its empty md5. A row written meanwhile with an md5 of
-    its own keeps that one.
+    Does nothing when no reconcile has marked the table, or when another
+    process is already running the backfill -- several uvicorn workers start
+    it together, and one run is enough. A row whose source cannot be read
+    keeps its empty md5. A row written meanwhile with an md5 of its own keeps
+    that one. If the backfill is queued again while this run works, the mark
+    stays for the next run.
 
     Parameters
     ----------
@@ -153,6 +161,27 @@ async def run_md5_backfill(
     """
     if not await asyncio.to_thread(collection.md5_backfill_pending):
         return 0
+    run = collection.md5_backfill_run()
+    generation = await asyncio.to_thread(run.__enter__)
+    try:
+        if generation is None:
+            logger.debug("ov_postgres: md5 backfill already running elsewhere")
+            return 0
+        return await _fill(collection, viking_fs, decode_uri, batch_size, generation)
+    finally:
+        await asyncio.to_thread(run.__exit__, None, None, None)
+
+
+async def _fill(
+    collection: _Collection,
+    viking_fs: FileReader,
+    decode_uri: Callable[[str], object],
+    batch_size: int,
+    generation: int,
+) -> int:
+    """Run one backfill pass while holding the run lock."""
+    if not await asyncio.to_thread(collection.md5_backfill_pending):
+        return 0
     filled = 0
     skipped = 0
     after: object = None
@@ -169,7 +198,9 @@ async def run_md5_backfill(
         if len(batch) < batch_size:
             break
         after = batch[-1][0]
-    await asyncio.to_thread(collection.finish_md5_backfill)
+    cleared = await asyncio.to_thread(collection.finish_md5_backfill, generation)
+    if not cleared:
+        logger.info("ov_postgres: md5 backfill queued again during the run; runs again")
     logger.info(
         "ov_postgres: md5 backfill done; %d row(s) filled, %d left empty because "
         "their source could not be read or has no body",

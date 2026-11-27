@@ -214,3 +214,76 @@ def test_record_md5_keeps_an_md5_written_meanwhile(dsn: str, test_schema: str) -
         assert adapter.get(["a"])[0]["md5"] == "written-by-openviking"
     finally:
         adapter.close()
+
+
+class CountingReader:
+    """A VikingFS stand-in that counts reads and can act on the first one."""
+
+    def __init__(self, inner: Any, on_first: Any = None, delay: float = 0.0) -> None:
+        self.inner = inner
+        self.reads = 0
+        self.on_first = on_first
+        self.delay = delay
+
+    async def read_file_bytes(self, uri: str, ctx: object = None) -> bytes:
+        """Count the read, run the hook on the first, then read for real."""
+        self.reads += 1
+        if self.reads == 1 and self.on_first is not None:
+            await asyncio.to_thread(self.on_first)
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        data: bytes = await self.inner.read_file_bytes(uri, ctx=ctx)
+        return data
+
+
+def reconciled_old_table(dsn: str, schema: str, viking_fs: Any) -> None:
+    """Old rows, the files they index, and a reconcile that marks the backfill."""
+    asyncio.run(write_tree(viking_fs))
+    old = make_adapter(dsn, schema)
+    create(old, OLD)
+    old.upsert(old_rows())
+    old.close()
+    reconciling = make_adapter(dsn, schema)
+    create(reconciling, NEW)
+    reconciling.close()
+
+
+def test_only_one_process_backfills_at_a_time(
+    dsn: str, test_schema: str, viking_fs: Any
+) -> None:
+    """Several workers starting together share one run, not one each."""
+    reconciled_old_table(dsn, test_schema, viking_fs)
+    adapters = [make_adapter(dsn, test_schema) for _ in range(3)]
+    reader = CountingReader(viking_fs, delay=0.2)
+
+    async def all_at_once() -> list[int]:
+        return list(await asyncio.gather(*(a.run_md5_backfill(reader) for a in adapters)))
+
+    try:
+        for adapter in adapters:
+            assert adapter.collection_exists()
+        filled = asyncio.run(all_at_once())
+        assert sorted(filled) == [0, 0, 4]
+        assert reader.reads == 5, "each row read once: a, b, gone and two sidecars"
+    finally:
+        for adapter in adapters:
+            adapter.close()
+
+
+def test_a_backfill_queued_again_during_a_run_stays_queued(
+    dsn: str, test_schema: str, viking_fs: Any
+) -> None:
+    """A re-queue from another server mid-run is not cleared by the run ending."""
+    reconciled_old_table(dsn, test_schema, viking_fs)
+    adapter = make_adapter(dsn, test_schema)
+    try:
+        assert adapter.collection_exists()
+        inner = adapter._pg_collection
+        assert inner is not None
+        reader = CountingReader(viking_fs, on_first=inner.queue_md5_backfill)
+        asyncio.run(adapter.run_md5_backfill(reader))
+        assert inner.md5_backfill_pending(), "queued during the run: still pending"
+        asyncio.run(adapter.run_md5_backfill(viking_fs))
+        assert not inner.md5_backfill_pending()
+    finally:
+        adapter.close()

@@ -7,9 +7,11 @@ import json
 import logging
 import math
 import threading
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from typing import Any, Literal, overload
 
+import psycopg
 from opentelemetry.util.types import AttributeValue
 from openviking.storage.acl import ACL_CONTEXT_FIELDS
 from openviking.storage.vectordb.collection.collection import ICollection
@@ -46,6 +48,20 @@ from .schema import (
 # OpenViking reads. OpenViking ignores keys it does not know.
 MAINTENANCE_KEY = "OvPostgresMaintenance"
 MD5_BACKFILL = "md5_backfill"
+# Bumped every time the backfill is queued, so a run clears the mark only if
+# nobody queued it again while it ran.
+MD5_GENERATION = "md5_backfill_generation"
+
+
+def _queued(maintenance: dict[str, Any]) -> dict[str, Any]:
+    """Return ``maintenance`` with the md5 backfill queued and its generation bumped."""
+    return {
+        **maintenance,
+        MD5_BACKFILL: "pending",
+        MD5_GENERATION: int(maintenance.get(MD5_GENERATION) or 0) + 1,
+    }
+
+
 # The fields a reconcile added, which the extra-guard trigger watches.
 EXTRA_GUARD = "extra_guard"
 
@@ -2787,10 +2803,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 # Every existing row now has an empty md5, and OpenViking's
                 # maintenance reindex treats an empty md5 as stale. Mark the
                 # table so the backfill runs; see `ov_postgres.md5_backfill`.
-                stored[MAINTENANCE_KEY] = {
-                    **stored.get(MAINTENANCE_KEY, {}),
-                    MD5_BACKFILL: "pending",
-                }
+                stored[MAINTENANCE_KEY] = _queued(dict(stored.get(MAINTENANCE_KEY) or {}))
             with conn.cursor() as plain:
                 built = self._create_new_indexes(
                     plain, before=current, after=CollectionSchema.from_meta(stored)
@@ -2917,26 +2930,129 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             )
             return bool(cur.rowcount)
 
+    def md5_backfill_generation(self) -> int:
+        """Return how many times the md5 backfill has been queued."""
+        maintenance = self.get_meta_data().get(MAINTENANCE_KEY) or {}
+        return int(maintenance.get(MD5_GENERATION) or 0)
+
+    @traced("ov_postgres.queue_md5_backfill")
+    def queue_md5_backfill(self) -> None:
+        """Queue the md5 backfill, bumping its generation."""
+        annotate({"db.operation.name": "UPDATE"})
+        self._check_open()
+        self._execute(
+            sql.SQL(
+                "UPDATE {} SET meta = jsonb_set(meta, %s, "
+                "coalesce(meta->%s, '{{}}'::jsonb) || jsonb_build_object("
+                "%s::text, 'pending', %s::text, "
+                "coalesce((meta->%s->>%s)::bigint, 0) + 1)) WHERE name = %s"
+            ).format(self._registry(ddl.REGISTRY_COLLECTIONS)),
+            (
+                [MAINTENANCE_KEY],
+                MAINTENANCE_KEY,
+                MD5_BACKFILL,
+                MD5_GENERATION,
+                MAINTENANCE_KEY,
+                MD5_GENERATION,
+                self._name,
+            ),
+        )
+
+    @contextmanager
+    def md5_backfill_run(self) -> Iterator[int | None]:
+        """Hold the right to backfill, or yield ``None`` if another process has it.
+
+        A session-level advisory lock on a connection held for the whole run,
+        so of several servers -- or several uvicorn workers -- starting
+        together, one backfills and the rest skip at once. Yields the
+        generation the run started from, for :meth:`finish_md5_backfill`.
+        """
+        key = (
+            int.from_bytes(
+                hashlib.sha256(
+                    f"ov_postgres.md5_backfill.{self._db_schema}.{self._table}".encode()
+                ).digest()[:8],
+                "big",
+            )
+            >> 1
+        )
+        # Read before taking the lock: a re-queue in between bumps the
+        # generation past this one, and the run then leaves the mark set.
+        generation = self.md5_backfill_generation()
+        # A connection of its own rather than one from the pool: the run holds
+        # it for minutes while its own queries need the pool, which may be a
+        # single connection.
+        conninfo = self._pool.conninfo
+        kwargs = self._pool.kwargs
+        with psycopg.connect(
+            conninfo() if callable(conninfo) else conninfo,
+            autocommit=True,
+            **((kwargs() if callable(kwargs) else kwargs) or {}),
+        ) as conn:
+            if not self._take_md5_run_lock(conn, key):
+                yield None
+                return
+            try:
+                yield generation
+            finally:
+                self._release_md5_run_lock(conn, key)
+
+    @traced("ov_postgres.take_md5_run_lock")
+    def _take_md5_run_lock(self, conn: psycopg.Connection[Any], key: int) -> bool:
+        """Try the backfill's session lock on ``conn``; never wait for it."""
+        annotate({"db.operation.name": "SELECT"})
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s)", (key,))
+            row = cur.fetchone()
+        return bool(row and row[0])
+
+    @traced("ov_postgres.release_md5_run_lock")
+    def _release_md5_run_lock(self, conn: psycopg.Connection[Any], key: int) -> None:
+        """Release the backfill's session lock on ``conn``."""
+        annotate({"db.operation.name": "SELECT"})
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_unlock(%s)", (key,))
+
     @traced("ov_postgres.finish_md5_backfill")
-    def finish_md5_backfill(self) -> None:
-        """Clear the pending-backfill mark in the registry."""
+    def finish_md5_backfill(self, generation: int) -> bool:
+        """Clear the pending mark, unless the backfill was queued again since.
+
+        Parameters
+        ----------
+        generation :
+            The generation the run started from.
+
+        Returns
+        -------
+        bool
+            Whether the mark was cleared. False means it was queued again
+            during the run, and the next run picks it up.
+        """
         annotate({"db.operation.name": "UPDATE"})
         self._check_open()
         with self._lock:
-            self._execute(
+            row = self._execute(
                 sql.SQL(
                     "UPDATE {} SET meta = jsonb_set(meta, %s, "
-                    "coalesce(meta->%s, '{{}}'::jsonb) - %s) WHERE name = %s"
+                    "coalesce(meta->%s, '{{}}'::jsonb) - %s) WHERE name = %s "
+                    "AND coalesce((meta->%s->>%s)::bigint, 0) = %s RETURNING meta"
                 ).format(self._registry(ddl.REGISTRY_COLLECTIONS)),
-                ([MAINTENANCE_KEY], MAINTENANCE_KEY, MD5_BACKFILL, self._name),
+                (
+                    [MAINTENANCE_KEY],
+                    MAINTENANCE_KEY,
+                    MD5_BACKFILL,
+                    self._name,
+                    MAINTENANCE_KEY,
+                    MD5_GENERATION,
+                    generation,
+                ),
+                fetch="one",
             )
-            raw = dict(self._schema.raw)
-            raw[MAINTENANCE_KEY] = {
-                key: value
-                for key, value in (raw.get(MAINTENANCE_KEY) or {}).items()
-                if key != MD5_BACKFILL
-            }
-            self._schema.raw = raw
+            if row is None:
+                return False
+            meta = row["meta"]
+            self._schema.raw = dict(meta if isinstance(meta, dict) else json.loads(meta))
+            return True
 
     def _add_column(self, cur: Cursor[Any], spec: FieldSpec) -> None:
         """Add the column(s) for one field, holding its default on every row.
@@ -3079,7 +3195,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 )
                 unmarked = cur.fetchone() is not None
                 if unmarked and self._schema.by_name("md5") is not None:
-                    maintenance[MD5_BACKFILL] = "pending"
+                    maintenance = _queued(maintenance)
                 if changed or unmarked:
                     stored[MAINTENANCE_KEY] = maintenance
                     cur.execute(

@@ -377,7 +377,10 @@ class TestSpansFromRealQueries:
             collection.ensure_extra_guard()
             collection.md5_backfill_batch(None, 10)
             collection.record_md5("b", "probe")
-            collection.finish_md5_backfill()
+            with collection.md5_backfill_run():
+                pass
+            collection.queue_md5_backfill()
+            collection.finish_md5_backfill(collection.md5_backfill_generation())
             collection.create_index("probe_index", {})
             collection.update_index("probe_index", description="probe")
             collection.drop_index("probe_index")
@@ -436,6 +439,9 @@ class TestSpansFromRealQueries:
             "ov_postgres.ensure_extra_guard": "SELECT",
             "ov_postgres.md5_backfill_batch": "SELECT",
             "ov_postgres.record_md5": "UPDATE",
+            "ov_postgres.take_md5_run_lock": "SELECT",
+            "ov_postgres.release_md5_run_lock": "SELECT",
+            "ov_postgres.queue_md5_backfill": "UPDATE",
             "ov_postgres.finish_md5_backfill": "UPDATE",
             "ov_postgres.list_indexes": "SELECT",
             "ov_postgres.has_index": "SELECT",
