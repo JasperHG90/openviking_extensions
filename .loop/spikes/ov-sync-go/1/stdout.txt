@@ -1,0 +1,12 @@
+seaweedfs image sha256:92e8a2755d9ce667b8bd0f65d62a048901eb74f48bf650d7b15ac41ce2028f7d created 2026-11-23T06:02:15.289984759Z
+PASS admin MakeBucket
+PASS PutObject small (ci identity)
+PASS PutObject 6MB single PUT (ci identity)
+PASS GetObject 6MB matches
+PASS GetObject missing manifest -> NoSuchKey
+PASS PutObject manifest
+PASS GetObject manifest round-trip
+PASS RemoveObject small
+PASS StatObject removed -> NoSuchKey
+INFO ci identity ListObjects denied as intended: AccessDenied
+ALL PASS

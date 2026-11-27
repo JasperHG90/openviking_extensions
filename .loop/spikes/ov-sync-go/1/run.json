@@ -1,0 +1,26 @@
+{
+  "schema_version": "1.0",
+  "slug": "ov-sync-go",
+  "n": 1,
+  "command": "/private/tmp/claude-502/-Users-jasperginn-Documents-code-projects-openviking-extensions/38afc982-80df-4d50-bb9c-7efed4cd88b4/scratchpad/spike-r1/run.sh",
+  "scripts": [
+    {
+      "source": "/private/tmp/claude-502/-Users-jasperginn-Documents-code-projects-openviking-extensions/38afc982-80df-4d50-bb9c-7efed4cd88b4/scratchpad/spike-r1/run.sh",
+      "copy": "files/run.sh"
+    }
+  ],
+  "where": "worktree",
+  "head": "f37f50cf77db07327d90f76a352c0c2e7dd6e3ec",
+  "fingerprint": "f80e36358f6131dc80044bd8bcdc9f6002ed19bdd52a6a39e83d219c40be4234",
+  "started_at": "2026-11-27T08:45:54+00:00",
+  "finished_at": "2026-11-27T08:46:06+00:00",
+  "duration_seconds": 12.038,
+  "timeout_seconds": 240.0,
+  "exit": 0,
+  "timed_out": false,
+  "stdout": "stdout.txt",
+  "stderr": "stderr.txt",
+  "truncated": false,
+  "by": "process:loopctl/2.3.1.dev65+g93b143856",
+  "moved_from": null
+}
