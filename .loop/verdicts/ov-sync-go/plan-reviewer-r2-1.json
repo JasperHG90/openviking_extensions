@@ -1,0 +1,46 @@
+{
+  "schema_version": "1.0",
+  "placeholder": false,
+  "verdict": "pass",
+  "findings": [
+    {
+      "id": "p1",
+      "disposition": "resolved",
+      "claim": "The localstack prefix-map entry and the laptop write credential are now named as outside this ticket and documented in the README. G1 and P1 are narrowed to delivery into the bucket.",
+      "anchor": ".loop/plans/ov-sync-go/README.md (Intent, Goals G1, Problems P1)",
+      "category": "premise",
+      "blocking": true,
+      "invalidates_plan": false,
+      "repeats": null,
+      "eval_row": null
+    },
+    {
+      "id": "p2",
+      "disposition": "resolved",
+      "claim": "Each source owns <prefix>/_state/ovsq-<source>.json and never touches manifest.json. Manifest paths include subdir, so a delete targets exactly <prefix>/<path>. The action only deletes paths in its own manifest, so CI no longer removes ovsq's files unless both write the same key, which the plan names as operator error.",
+      "anchor": ".loop/plans/ov-sync-go/README.md (Intent, manifest bullet)",
+      "category": "design",
+      "blocking": true,
+      "invalidates_plan": false,
+      "repeats": null,
+      "eval_row": null
+    },
+    {
+      "id": "p3",
+      "disposition": "resolved",
+      "claim": "O4 now fixes the new P4 (no Go gates), which it does fix.",
+      "anchor": ".loop/plans/ov-sync-go/README.md (O4)",
+      "category": "premise",
+      "blocking": true,
+      "invalidates_plan": false,
+      "repeats": null,
+      "eval_row": null
+    }
+  ],
+  "binds": {
+    "fingerprint": null,
+    "plan_hash": "1acce95aca04fb38055f362bdc3d0e4f7a18237ad7532b3a234c04ccc9528959"
+  },
+  "by": "process:loopctl/2.3.1.dev65+g93b143856",
+  "at": "2026-11-27T08:50:58+00:00"
+}
