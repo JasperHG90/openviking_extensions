@@ -21,7 +21,8 @@
   "branch": "loop/ov-sync-go",
   "stamps": [
     "4b6a7664d80565510840c5b0ba1e37791a56abdf97b0a642975210c930717cff",
-    "b0158192c2d66ac00583062738aa5a596ff035d5835078a7bbf37a4b5548612a"
+    "b0158192c2d66ac00583062738aa5a596ff035d5835078a7bbf37a4b5548612a",
+    "5136f734bac7ba8fb97608c5bfc9f54ab08e2677b0d851d77b12245b4bfdae24"
   ],
   "signoff": {
     "signer": "delegated:jasperginn@gmail.com/claude",
@@ -207,5 +208,5 @@
     }
   ],
   "by": "process:loopctl/2.3.1.dev65+g93b143856",
-  "at": "2026-11-27T09:14:17+00:00"
+  "at": "2026-11-27T09:15:54+00:00"
 }
