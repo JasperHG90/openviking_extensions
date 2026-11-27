@@ -49,6 +49,13 @@ MD5_BACKFILL = "md5_backfill"
 # The fields a reconcile added, which the extra-guard trigger watches.
 EXTRA_GUARD = "extra_guard"
 
+# Set for the length of each write transaction this version makes, so the
+# extra-guard trigger can tell its writes from an older writer's. A setting
+# local to the transaction survives a transaction-mode connection pooler,
+# where a per-connection option would not.
+WRITER_SETTING = "ov_postgres.writer"
+WRITER_CURRENT = "current"
+
 # How the extra-guard trigger tests a JSON value from `extra` for each column
 # type, and converts it. `v` is the value. A type absent here is left in
 # `extra`, as before; none of the fields OpenViking has added is one.
@@ -975,6 +982,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 # the check would commit before the insert begins, and a
                 # concurrent DELETE in that window would let a vectorless row
                 # through.
+                self._mark_writer(cur)
                 if vectorless:
                     self._lock_rows_and_reject_new_vectorless(cur, ids, vectorless)
                 cur.executemany(self._upsert_statement(columns), rows)
@@ -1060,6 +1068,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
 
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
+                self._mark_writer(cur)
                 # Sorted by primary key for the same reason upsert sorts:
                 # every writer must take row locks in one order or two batches
                 # touching the same rows deadlock. Upsert sorting alone was not
@@ -1235,6 +1244,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         total = 0
         while True:
             with self._pool.connection() as conn, conn.cursor() as cur:
+                self._mark_writer(cur)
                 cur.execute(statement, params)
                 repaired = int(cur.rowcount)
             total += repaired
@@ -2653,6 +2663,16 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         )
         return stored
 
+    @staticmethod
+    def _mark_writer(cur: Cursor[Any]) -> None:
+        """Mark the current transaction as a write by this version.
+
+        See :data:`WRITER_SETTING`: without the mark, the extra-guard trigger
+        treats an update as an older writer's and keeps the row's guarded
+        fields.
+        """
+        cur.execute("SELECT set_config(%s, %s, true)", (WRITER_SETTING, WRITER_CURRENT))
+
     def md5_backfill_pending(self) -> bool:
         """Return whether a reconcile added ``md5`` and its backfill has not finished."""
         maintenance = self.get_meta_data().get(MAINTENANCE_KEY) or {}
@@ -2714,6 +2734,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         self._check_open()
         pk = sql.Identifier(self._schema.primary_key.name)
         with self._pool.connection() as conn, conn.cursor() as cur:
+            self._mark_writer(cur)
             cur.execute(
                 sql.SQL(
                     "UPDATE {table} SET md5 = %s "
@@ -2825,7 +2846,10 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         trigger moves such a value into its column, and gives a column left
         NULL its default. An ACL value that does not fit its column fails the
         write, rather than leave the row unrestricted; any other misfit stays
-        in ``extra``, as it did before.
+        in ``extra``, as it did before. And on an update by a writer other than
+        this version, a field it did not supply through ``extra`` keeps the
+        row's value: such a writer fills in defaults for fields it knows
+        nothing about, which would erase an ACL restriction.
 
         Parameters
         ----------
@@ -2834,7 +2858,15 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         fields :
             The fields to guard.
         """
-        branches: list[str] = []
+        branches: list[str] = [
+            # An update by a writer that is not this version: one that knows
+            # nothing of these fields, and would write their defaults over the
+            # row's -- erasing an ACL restriction for good, since OpenViking
+            # keeps ACL on the rows themselves.
+            "unaware := TG_OP = 'UPDATE' AND coalesce(current_setting("
+            f"{sql.Literal(WRITER_SETTING).as_string(cur)}, true), '') <> "
+            f"{sql.Literal(WRITER_CURRENT).as_string(cur)};"
+        ]
         for spec in fields:
             if spec is None or spec.ov_type not in _GUARD_CONVERSIONS:
                 continue
@@ -2855,6 +2887,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 f"    NEW.{column} := {convert};\n"
                 f"    NEW.extra := NEW.extra - {key};\n"
                 f"  ELSE\n    {refuse}\n  END IF;\n"
+                f"ELSIF unaware THEN\n  NEW.{column} := OLD.{column};\n"
                 "END IF;"
             )
             default = default_for(spec)
@@ -2866,13 +2899,17 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                     f"IF NEW.{column} IS NULL THEN "
                     f"NEW.{column} := {literal.as_string(cur)}; END IF;"
                 )
-        if not branches:
+        if len(branches) == 1:
             return
         function = sql.Identifier(
             self._db_schema, ddl.index_name(self._table, "extra_guard")
         )
         trigger = sql.Identifier(ddl.index_name(self._table, "extra_guard"))
-        body = "DECLARE v jsonb;\nBEGIN\n" + "\n".join(branches) + "\nRETURN NEW;\nEND;"
+        body = (
+            "DECLARE v jsonb; unaware boolean;\nBEGIN\n"
+            + "\n".join(branches)
+            + "\nRETURN NEW;\nEND;"
+        )
         cur.execute(
             sql.SQL(
                 "CREATE OR REPLACE FUNCTION {}() RETURNS trigger LANGUAGE plpgsql AS {}"

@@ -657,3 +657,42 @@ def test_an_acl_value_a_stale_writer_cannot_store_is_refused(
     finally:
         stale.close()
         current.close()
+
+
+def test_a_writer_that_knows_nothing_of_acl_cannot_erase_a_restriction(
+    dsn: str, test_schema: str
+) -> None:
+    """A whole-row rewrite by an ACL-unaware writer keeps the row's ACL and md5.
+
+    OpenViking keeps ACL on the vector rows themselves. An older ov-postgres on
+    an OpenViking without ACL rewrites a row with the defaults -- unrestricted
+    -- and the restriction would be gone for good. This version's own writes
+    still change ACL as asked.
+    """
+    adapter = make_adapter(dsn, test_schema)
+    try:
+        create(adapter, OLD)
+        adapter.close()
+        adapter = reopen(dsn, test_schema, NEW)
+        grants = acl_grant_tokens(["user:alice"], AclAction.READ)
+        adapter.upsert(
+            resource("doc", acl_mode="restricted", acl_direct_grants=grants[:1], md5="m1")
+        )
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            conn.execute(
+                f'UPDATE "{test_schema}".ov_context SET acl_mode = %s, '
+                "acl_direct_grants = %s, md5 = '' WHERE id = 'doc'",
+                ("none", [EMPTY_ACL_GRANT]),
+            )
+        kept = adapter.get(["doc"])[0]
+        assert (kept["acl_mode"], kept["acl_direct_grants"], kept["md5"]) == (
+            "restricted",
+            grants[:1],
+            "m1",
+        )
+
+        adapter.upsert(resource("doc", acl_mode="none", md5="m2"))
+        lifted = adapter.get(["doc"])[0]
+        assert (lifted["acl_mode"], lifted["md5"]) == ("none", "m2")
+    finally:
+        adapter.close()

@@ -72,7 +72,9 @@ def old_rows() -> list[dict[str, Any]]:
     ]
 
 
-async def reindex_states(adapter: PgVectorCollectionAdapter, viking_fs: Any) -> dict[str, str]:
+async def reindex_states(
+    adapter: PgVectorCollectionAdapter, viking_fs: Any
+) -> dict[str, str]:
     """Return what OpenViking's reindex planner decides for each node."""
     from openviking.storage.resource_rfv import build_rfv_snapshot, resolve_rfv_state
     from openviking.storage.resource_rnfv import RequestIntent
