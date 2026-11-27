@@ -1,56 +1,14 @@
 {
   "schema_version": "1.0",
   "slug": "ov-sync-go",
-  "stage": "verifying",
+  "stage": "fixing",
   "attempts": 1,
   "plan_rounds": 2,
   "review_rounds": 2,
   "extra_plan_rounds": 0,
   "extra_review_rounds": 0,
   "blocker": null,
-  "fix": {
-    "round": 1,
-    "fingerprint": "5136f734bac7ba8fb97608c5bfc9f54ab08e2677b0d851d77b12245b4bfdae24",
-    "tree": "2c970c46c4e80358c5057162b2cfd741be6a93c9",
-    "decisions": [
-      {
-        "finding": "reviewer:f1",
-        "outcome": "sent-back",
-        "by": "blocking",
-        "judgement": null,
-        "paths": [
-          ".okf/architecture/ov-sync-queue.md",
-          "docs/reference/ovsq-commands-and-config.md",
-          "packages/ov-sync-queue/README.md",
-          "packages/ov-sync-queue/internal/scan/scan.go",
-          "packages/ov-sync-queue/internal/scan/scan_test.go",
-          "packages/ov-sync-queue/internal/syncer/syncer.go",
-          "packages/ov-sync-queue/internal/syncer/syncer_test.go",
-          "packages/ov-sync-queue/main_test.go"
-        ]
-      },
-      {
-        "finding": "reviewer:f2",
-        "outcome": "sent-back",
-        "by": "fallback",
-        "judgement": "j-20261127T091630+0000-3be2e13b",
-        "paths": [
-          "packages/ov-sync-queue/main_test.go"
-        ]
-      },
-      {
-        "finding": "reviewer:f3",
-        "outcome": "sent-back",
-        "by": "fallback",
-        "judgement": "j-20261127T091630+0000-521e4a40",
-        "paths": [
-          "docs/reference/ovsq-commands-and-config.md",
-          "packages/ov-sync-queue/main.go"
-        ]
-      }
-    ],
-    "at": "2026-11-27T09:16:30+00:00"
-  },
+  "fix": null,
   "ask": "j-20261127T070006+0000-1b9166b7",
   "split": "j-20261127T084940+0000-1beeeb5d",
   "split_plan_hash": "1acce95aca04fb38055f362bdc3d0e4f7a18237ad7532b3a234c04ccc9528959",
@@ -208,8 +166,8 @@
     "returned": {},
     "chosen": {},
     "skipped": [],
-    "closed": false,
-    "outcome": null
+    "closed": true,
+    "outcome": "fail"
   },
   "plan_hash": "1acce95aca04fb38055f362bdc3d0e4f7a18237ad7532b3a234c04ccc9528959",
   "intent": {
@@ -253,8 +211,14 @@
       "to": "verifying",
       "at": "2026-11-27T09:16:30+00:00",
       "by": "review fixed"
+    },
+    {
+      "from": "verifying",
+      "to": "fixing",
+      "at": "2026-11-27T09:18:46+00:00",
+      "by": "review close"
     }
   ],
   "by": "process:loopctl/2.3.1.dev65+g93b143856",
-  "at": "2026-11-27T09:16:38+00:00"
+  "at": "2026-11-27T09:18:46+00:00"
 }
