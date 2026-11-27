@@ -8,3 +8,4 @@
 - Added `decisions/0003-each-ovsq-source-owns-its-own-manifest-in-the-bucket` with `kmctl new decision`.
 - Added `decisions/0004-ovsq-is-written-in-go` with `kmctl new decision`.
 - Added `decisions/0005-ship-ovsq-as-stamped-static-binaries-from-the-release-workflow` with `kmctl new decision`.
+- Accepted `decisions/0005-ship-ovsq-as-stamped-static-binaries-from-the-release-workflow` (human:JasperHG90).

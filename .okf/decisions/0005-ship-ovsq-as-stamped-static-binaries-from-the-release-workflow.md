@@ -6,7 +6,7 @@ tags: [decision]
 generated:
   by: claude-opus/5.5
   at: 2026-11-27T14:51:12Z
-status: draft
+status: stable
 sources:
   - resource: ".github/workflows/release.yaml"
   - resource: "packages/ov-sync-queue/main.go"
