@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 
+from . import maintenance
 from .compat import check_openviking_version
 from .reflect.config import ReflectSettings
 from .reflect.patch import install as install_reflect_ticker
@@ -84,6 +85,9 @@ def install(
     install_retrieval(retrieval_settings)
     register_reflect(reflect_settings)
     install_reflect_ticker(reflect_settings)
+    # Backend upkeep that needs the started server, such as ov-postgres's md5
+    # backfill. Wraps the same method as the ticker, so it is removed first.
+    maintenance.install()
     # Everything above patched *this* process. With more than one uvicorn
     # worker the process serving requests is a spawned child that has run none
     # of it, so this arranges for the children to install too.
@@ -107,6 +111,7 @@ def uninstall() -> None:
     was never installed is skipped rather than treated as an error.
     """
     uninstall_worker_bridge()
+    maintenance.uninstall()
     uninstall_reflect_ticker()
     unregister_reflect()
     uninstall_retrieval()
