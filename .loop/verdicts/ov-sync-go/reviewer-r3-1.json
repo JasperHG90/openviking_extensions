@@ -1,0 +1,68 @@
+{
+  "schema_version": "1.0",
+  "placeholder": false,
+  "verdict": "pass",
+  "findings": [
+    {
+      "id": "f1",
+      "disposition": "resolved",
+      "claim": "a symlinked folder selected no files, so run --delete wiped the prefix",
+      "anchor": "packages/ov-sync-queue/internal/scan/scan.go:37",
+      "category": "bug",
+      "blocking": true,
+      "invalidates_plan": false,
+      "repeats": null,
+      "eval_row": null
+    },
+    {
+      "id": "f2",
+      "disposition": "resolved",
+      "claim": "no CLI-level assertion that ovsq run exits 1 on a failed upload",
+      "anchor": "packages/ov-sync-queue/main_test.go:305",
+      "category": "test-strength",
+      "blocking": false,
+      "invalidates_plan": false,
+      "repeats": null,
+      "eval_row": null
+    },
+    {
+      "id": "f3",
+      "disposition": "resolved",
+      "claim": "docs said Prepare errors exit differently than they do",
+      "anchor": "docs/reference/ovsq-commands-and-config.md:31",
+      "category": "docs",
+      "blocking": false,
+      "invalidates_plan": false,
+      "repeats": null,
+      "eval_row": null
+    },
+    {
+      "id": "f4",
+      "disposition": "resolved",
+      "claim": "the final manifest write used the cancelled context",
+      "anchor": "packages/ov-sync-queue/internal/syncer/syncer.go:189",
+      "category": "hardening",
+      "blocking": false,
+      "invalidates_plan": false,
+      "repeats": null,
+      "eval_row": null
+    },
+    {
+      "id": "f5",
+      "disposition": "resolved",
+      "claim": "the main.go usage text's exit-status paragraph did not list the refused --delete as an exit-1 case",
+      "anchor": "packages/ov-sync-queue/main.go:41",
+      "category": "docs",
+      "blocking": false,
+      "invalidates_plan": false,
+      "repeats": null,
+      "eval_row": null
+    }
+  ],
+  "binds": {
+    "fingerprint": "3018ea4bdd2cb5b04c6faa64a5c2e042522cfef0844441140d62662252f25b04",
+    "plan_hash": null
+  },
+  "by": "process:loopctl/2.3.1.dev65+g93b143856",
+  "at": "2026-11-27T09:21:04+00:00"
+}
