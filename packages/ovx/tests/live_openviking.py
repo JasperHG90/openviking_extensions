@@ -6,12 +6,13 @@ mode, trusting a dev-mode Vault whose identity tokens carry ``ov_account`` and
 ``ov_user`` the way the lab's ``openviking`` role does. The client then holds a
 Vault identity token, which is what every caller in the lab sends.
 
-Three containers' worth of setup, each for a reason found by watching the
-server refuse to start or refuse a request:
+Two containers and a stub, each shaped by watching the server refuse to
+start or refuse a request:
 
 - OpenViking will not boot without an embedding provider, so a stub
-  OpenAI-compatible endpoint runs in this process. It answers embeddings and
-  chat completions with fixed output; nothing here depends on their meaning.
+  OpenAI-compatible endpoint runs in a child process. It answers embeddings
+  and chat completions with fixed output; nothing here depends on their
+  meaning.
 - The token's ``iss`` is the address Vault was told it lives at, which is
   ``127.0.0.1`` from this process. The container cannot fetch anything there,
   so the server is given the issuer as Vault states it and the key set at
@@ -23,7 +24,9 @@ The image is ``$OV_TEST_IMAGE``, defaulting to the version this package is
 checked against. Set ``OV_TEST_KEEP=1`` to leave the containers running.
 
 This file is copied, not shared, between ov-sync, ovx and ov-skills: each is a
-standalone uv project and cannot import from the others.
+standalone uv project and cannot import from the others. It uses ``urllib``
+rather than httpx for the same reason: two of the three have no httpx, and the
+copies stay identical.
 """
 
 from __future__ import annotations
@@ -419,8 +422,10 @@ def openviking_stack(prefix: str) -> Iterator[LiveOpenViking]:
                 [
                     "--add-host",
                     "host.docker.internal:host-gateway",
+                    # Loopback only. Vault cannot be: the container fetches
+                    # its keys through the host gateway.
                     "-p",
-                    f"{ov_port}:1933",
+                    f"127.0.0.1:{ov_port}:1933",
                     "-e",
                     "OPENVIKING_WITH_BOT=0",
                     "-e",

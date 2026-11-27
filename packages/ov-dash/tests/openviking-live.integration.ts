@@ -237,6 +237,11 @@ describe.skipIf(!docker)("the dashboard against a real OpenViking", () => {
   it("offers the scopes and the folders a save can go to", async () => {
     const scopes = await api("/api/scopes");
     expect(scopes.status).toBe(200);
+    const offered = (await scopes.json()) as { id: string; uri: string }[];
+    expect(offered.map((scope) => scope.uri)).toEqual([
+      `${ROOT}/resources`,
+      "viking://resources",
+    ]);
     const destinations = await json(await api("/api/destinations"), destinationsSchema);
     expect(JSON.stringify(destinations)).toContain(folder);
   });
@@ -338,7 +343,7 @@ describe.skipIf(!docker)("the dashboard against a real OpenViking", () => {
       await api(`/api/search?q=${NEEDLE}&mode=meaning`),
       searchResponseSchema,
     );
-    expect(meaning.counts.meaning).toBeGreaterThanOrEqual(0);
+    expect(meaning.counts.meaning).toBeGreaterThan(0);
 
     const hybrid = await json(
       await api(`/api/search?q=${NEEDLE}&mode=hybrid`),

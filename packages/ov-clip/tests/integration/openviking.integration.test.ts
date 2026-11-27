@@ -77,13 +77,16 @@ describe("talking to a real OpenViking", () => {
     if (needsServer()) return;
     // The client sends the credential as both X-API-Key and a bearer. A user
     // OpenViking has only met through a token has no tree until their first
-    // write, so the listing may be a 404 — but never the refusal a token the
-    // server will not take gets.
+    // write, so the listing may be a NOT_FOUND 404, and nothing else.
     const outcome = await listFolders(session, "viking://~").then(
       () => null,
       (error: OvError) => error,
     );
-    expect(outcome?.needsLogin ?? false).toBe(false);
+    if (outcome)
+      expect({ status: outcome.status, code: outcome.code }).toEqual({
+        status: 404,
+        code: "NOT_FOUND",
+      });
   });
 
   it("rejects a bad token rather than answering anyway", async () => {

@@ -203,7 +203,8 @@ def test_saving_a_handoff_again_replaces_it(mcp: Mcp, tmp_path: Path) -> None:
     mcp.ok("write", uri=uri, content="first version", mode="replace")
     failed, said = eventually(
         lambda: mcp.call("write", uri=uri, content="second version", mode="replace"),
-        lambda answer: not answer[0],
+        # Only the refusal the skill tells an agent to wait out is waited out.
+        lambda answer: not answer[0] or "busy" not in answer[1],
     )
     assert not failed, said
 
@@ -308,7 +309,8 @@ def test_the_learnings_tools_store_find_correct_and_remove(mcp: Mcp) -> None:
     assert mcp.ok("read", uris=[uri]).strip() == "prefer uv add"
 
     failed, said = eventually(
-        lambda: mcp.call("forget", uri=uri), lambda answer: not answer[0]
+        lambda: mcp.call("forget", uri=uri),
+        lambda answer: not answer[0] or "busy" not in answer[1],
     )
     assert not failed, said
     # Through the listing: a read of a removed file is an error on 0.5.6 and an

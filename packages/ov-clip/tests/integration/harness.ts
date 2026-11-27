@@ -315,7 +315,7 @@ export async function startOpenViking(): Promise<Live | null> {
     "--add-host",
     "host.docker.internal:host-gateway",
     "-p",
-    `${ovPort}:1933`,
+    `127.0.0.1:${ovPort}:1933`,
     "-e",
     "OPENVIKING_WITH_BOT=0",
     "-e",

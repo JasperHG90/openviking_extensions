@@ -149,7 +149,9 @@ async function vault(
     body: init.body === undefined ? undefined : JSON.stringify(init.body),
   });
   const text = await response.text();
-  if (!response.ok && response.status !== 400) {
+  // The one refusal let through: enabling an auth mount that is already there.
+  const remount = response.status === 400 && path.startsWith("sys/auth/");
+  if (!response.ok && !remount) {
     throw new Error(`Vault ${path} failed: ${response.status} ${text}`);
   }
   return text ? (JSON.parse(text) as Record<string, unknown>) : {};
@@ -346,7 +348,7 @@ export async function startOpenViking(vaultAddr: string): Promise<LiveOpenViking
     "--add-host",
     "host.docker.internal:host-gateway",
     "-p",
-    `${port}:1933`,
+    `127.0.0.1:${port}:1933`,
     "-e",
     "OPENVIKING_WITH_BOT=0",
     "-e",
