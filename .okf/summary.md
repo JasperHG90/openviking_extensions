@@ -42,7 +42,8 @@ queue, `ov-sync-consumer`, OpenViking) lives in JasperHG90/localstack.
 
 ## Where it stands
 
-`ovsq` has `init`, `status` and `run`; `watch` is not built. Reaching
+`ovsq` has `init`, `status`, `run` and `version`, and the release workflow
+ships it as stamped static binaries; `watch` is not built. Reaching
 OpenViking still needs each prefix added to the consumer's prefix map and a
 write credential, both outside this repo. The other packages have no
 architecture pages or decision records yet.

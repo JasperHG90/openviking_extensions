@@ -16,6 +16,7 @@ on:
           - ov-skills
           - ov-clip
           - ov-dash
+          - ov-sync-queue
       increment:
         description: "Bump of the package's newest tag; ignored when version is set."
         type: choice
@@ -65,13 +66,17 @@ jobs:
   # in both. ovx used to be on the shell list; it is a Python package now and
   # builds a wheel like ov-postgres.
   #
+  # ov-sync-queue is the one Go package. Its gate is check.sh (gofmt, vet,
+  # tests), the same script the pre-commit hook and the loop run, so it gets
+  # a job of its own rather than a template.
+  #
   # The node template runs ov-dash's integration suite too, because a release
   # is a workflow_dispatch. That is deliberate: the suite signs in against a
   # real Vault, and sign-in is the one thing a broken dashboard release would
   # take down.
   test:
     needs: guard
-    if: ${{ !contains(fromJSON('["ov-skills", "ov-clip", "ov-dash"]'), inputs.package) }}
+    if: ${{ !contains(fromJSON('["ov-skills", "ov-clip", "ov-dash", "ov-sync-queue"]'), inputs.package) }}
     uses: ./.github/workflows/template-check.yaml
     with:
       package: ${{ inputs.package }}
@@ -90,9 +95,23 @@ jobs:
     with:
       package: ${{ inputs.package }}
 
+  test-go:
+    name: ov-sync-queue
+    needs: guard
+    if: ${{ inputs.package == 'ov-sync-queue' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: packages/ov-sync-queue/go.mod
+          cache-dependency-path: packages/ov-sync-queue/go.sum
+      - run: bash packages/ov-sync-queue/check.sh
+
   release:
     name: plan and tag
-    needs: [guard, test, test-shell, test-node]
+    needs: [guard, test, test-shell, test-node, test-go]
     # All but one of the test jobs always skips, and a skipped need would block
     # this job under the default rule. Proceed unless something actually
     # failed or was cancelled.
@@ -241,18 +260,18 @@ jobs:
           fetch-depth: 0
 
       - uses: astral-sh/setup-uv@v6
-        if: ${{ !contains(fromJSON('["ov-skills", "ov-clip", "ov-dash"]'), inputs.package) }}
+        if: ${{ !contains(fromJSON('["ov-skills", "ov-clip", "ov-dash", "ov-sync-queue"]'), inputs.package) }}
         with:
           version: ${{ env.UV_VERSION }}
 
       - name: Build package
-        if: ${{ !contains(fromJSON('["ov-skills", "ov-clip", "ov-dash"]'), inputs.package) }}
+        if: ${{ !contains(fromJSON('["ov-skills", "ov-clip", "ov-dash", "ov-sync-queue"]'), inputs.package) }}
         # By path, not --package: --package resolves workspace members only,
         # and a standalone project like ovx is excluded from the workspace.
         run: uv build packages/${{ inputs.package }} --out-dir dist
 
       - name: Verify the built version matches the tag
-        if: ${{ !contains(fromJSON('["ov-skills", "ov-clip", "ov-dash"]'), inputs.package) }}
+        if: ${{ !contains(fromJSON('["ov-skills", "ov-clip", "ov-dash", "ov-sync-queue"]'), inputs.package) }}
         env:
           VERSION: ${{ needs.release.outputs.version }}
           PACKAGE: ${{ inputs.package }}
@@ -320,6 +339,77 @@ jobs:
           # Then install from it, so the stamped installer is exercised too.
           bash dist/install.sh --local "$RUNNER_TEMP/unpack" --to "$RUNNER_TEMP/verify"
           test -f "$RUNNER_TEMP/verify/handoff/SKILL.md"
+
+      # ovsq ships as one static binary per platform, stamped with the version
+      # through -ldflags, since a Go binary has no metadata hatch-vcs could
+      # fill. Built here rather than in a matrix: cross-compiling pure Go is
+      # quick and needs no emulation.
+      - uses: actions/setup-go@v5
+        if: ${{ inputs.package == 'ov-sync-queue' }}
+        with:
+          go-version-file: packages/ov-sync-queue/go.mod
+          cache-dependency-path: packages/ov-sync-queue/go.sum
+
+      - name: Build the ovsq binaries
+        if: ${{ inputs.package == 'ov-sync-queue' }}
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          dist="$PWD/dist"
+          mkdir -p "$dist"
+          cd packages/ov-sync-queue
+          for target in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64; do
+            os=${target%/*} arch=${target#*/}
+            stage="$RUNNER_TEMP/ovsq-$os-$arch"
+            mkdir -p "$stage"
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X main.version=$VERSION" -o "$stage/ovsq" .
+            tar -czf "$dist/ovsq-$VERSION-$os-$arch.tar.gz" -C "$stage" ovsq
+          done
+          cd "$dist" && sha256sum ovsq-*.tar.gz > SHA256SUMS
+
+          # Check the stamp rather than trust it: unpack the runner's own
+          # build and ask it.
+          mkdir -p "$RUNNER_TEMP/verify"
+          tar -xzf "ovsq-$VERSION-linux-amd64.tar.gz" -C "$RUNNER_TEMP/verify"
+          got=$("$RUNNER_TEMP/verify/ovsq" version)
+          echo "$got"
+          test "$got" = "ovsq $VERSION"
+
+      - name: Write ovsq's install notes
+        if: ${{ inputs.package == 'ov-sync-queue' }}
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          TAG: ${{ needs.release.outputs.tag }}
+          REPO: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## ovsq $VERSION"
+            echo
+            echo "Mirrors a local folder into the \`ov-sync\` bucket, so OpenViking"
+            echo "gets it through the ov-sync queue. Runs on your laptop, not in CI."
+            echo
+            echo "### Install"
+            echo
+            echo "Pick your platform (\`darwin-arm64\`, \`darwin-amd64\`,"
+            echo "\`linux-amd64\` or \`linux-arm64\`):"
+            echo
+            echo '```bash'
+            echo "platform=darwin-arm64"
+            echo "mkdir -p ~/.local/bin"
+            echo "curl -fsSL $REPO/releases/download/$TAG/ovsq-$VERSION-\$platform.tar.gz | tar -xz -C ~/.local/bin ovsq"
+            echo "ovsq version   # needs ~/.local/bin on your PATH"
+            echo '```'
+            echo
+            echo "\`SHA256SUMS\` lists each archive's checksum; check a download with"
+            echo "\`shasum -a 256 -c SHA256SUMS --ignore-missing\`." On macOS, a binary"
+            echo "downloaded in a browser is quarantined; the \`curl\` route above is not."
+            echo
+            echo "Then follow [Set up ovsq]($REPO/blob/$TAG/docs/how-to/set-up-ovsq.md)"
+            echo "for the prefix map, the S3 key and the config."
+          } > NOTES.md
 
       # A Firefox extension is neither a wheel nor a script: it is a directory
       # with a manifest, stamped with the version and zipped. Signing turns

@@ -81,7 +81,7 @@ with a no-list identity. It needs docker and is not a gate.
 
 ## Depicts
 
-- Entry point: `packages/ov-sync-queue/main.go` (`ovsq init`, `status`, `run`)
+- Entry point: `packages/ov-sync-queue/main.go` (`ovsq init`, `status`, `run`, `version`)
 - Modules: `internal/config`, `internal/scan`, `internal/state`,
   `internal/syncer`, `internal/s3store` under `packages/ov-sync-queue/`
 - Invariants: the table above

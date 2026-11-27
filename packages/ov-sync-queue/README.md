@@ -20,7 +20,23 @@ $ ovsq run ~/notes --delete          # also remove keys whose file is gone
 
 ## Install
 
-Needs Go 1.26 or later.
+Download the archive for your platform from the newest
+`ov-sync-queue-v*` release on
+[the releases page](https://github.com/JasperHG90/openviking_extensions/releases).
+Each holds one `ovsq` binary, for `darwin-arm64`, `darwin-amd64`,
+`linux-amd64` or `linux-arm64`:
+
+```bash
+# version: the newest ov-sync-queue-v* tag on the releases page.
+# platform: darwin-arm64, darwin-amd64, linux-amd64 or linux-arm64.
+version=0.1.0 platform=darwin-arm64
+mkdir -p ~/.local/bin
+curl -fsSL "https://github.com/JasperHG90/openviking_extensions/releases/download/ov-sync-queue-v$version/ovsq-$version-$platform.tar.gz" |
+    tar -xz -C ~/.local/bin ovsq
+ovsq version                 # needs ~/.local/bin on your PATH
+```
+
+Or build it from source with Go 1.26 or later:
 
 ```bash
 git clone https://github.com/JasperHG90/openviking_extensions
@@ -115,6 +131,10 @@ The standard chain, first match wins: `AWS_ACCESS_KEY_ID`,
 picks the profile). Short-lived STS credentials work through the first.
 
 ## Development
+
+Release it with the `release` workflow (package `ov-sync-queue`). It runs
+`check.sh`, tags `ov-sync-queue-vX.Y.Z`, and attaches an archive per
+platform holding the binary with the version stamped in, plus `SHA256SUMS`.
 
 ```console
 $ ./check.sh          # gofmt, go vet, go test: the same gate CI and the loop run

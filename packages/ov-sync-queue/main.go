@@ -28,6 +28,7 @@ Usage:
   ovsq status [FOLDER]            show what the next run would do; writes nothing
   ovsq run    [FOLDER] [--delete] upload what changed; --delete also removes
                                   keys whose file is gone
+  ovsq version                    print the version (or --version)
 
 FOLDER defaults to the current folder and must hold ov-sync-queue.toml (except
 for init). Every config key can be overridden by OVSQ_<SECTION>__<KEY>, e.g.
@@ -42,6 +43,9 @@ write failed (re-run to retry exactly those), the folder, an include folder,
 git or the manifest could not be read, or --delete was refused because no
 files were selected; 2 on a usage or config file error.
 `
+
+// version is stamped by the release build (-ldflags "-X main.version=1.2.3").
+var version = "dev"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -65,6 +69,14 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, newStore 
 		if len(args) == 0 {
 			return 2
 		}
+		return 0
+	}
+	if args[0] == "version" || args[0] == "--version" {
+		if len(args) > 1 {
+			fmt.Fprintf(stderr, "ovsq %s takes no arguments\n", args[0])
+			return 2
+		}
+		fmt.Fprintln(stdout, "ovsq", version)
 		return 0
 	}
 	cmd, rest := args[0], args[1:]
@@ -106,7 +118,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, newStore 
 		return initCmd(folder, stdout, stderr)
 	case "status", "run":
 	default:
-		fmt.Fprintf(stderr, "unknown command %q: use init, status or run\n", cmd)
+		fmt.Fprintf(stderr, "unknown command %q: use init, status, run or version\n", cmd)
 		return 2
 	}
 

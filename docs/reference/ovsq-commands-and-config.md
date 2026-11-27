@@ -24,6 +24,7 @@ to OpenViking.
 |---|---|
 | `ovsq init [FOLDER]` | Writes a starter `ov-sync-queue.toml`. Refuses when one exists. |
 | `ovsq status [FOLDER]` | Prints what the next run would upload and delete. Writes nothing, not even the local cache. |
+| `ovsq version` | Prints `ovsq` and its version: the release's, or `dev` for a source build. `--version` does the same. |
 | `ovsq run [FOLDER] [--delete]` | Uploads new and changed files and writes the manifest. Without `--delete`, it reports files gone from the folder; with it, it removes their keys. When the scan selects no files at all, `--delete` removes nothing and the run exits 1, since that is likelier a wrong folder than an emptied one. |
 
 `FOLDER` defaults to the current folder and may be a symlink. Flags may come before or after it.

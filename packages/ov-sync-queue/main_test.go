@@ -362,3 +362,18 @@ func TestDeleteSafety(t *testing.T) {
 		}
 	})
 }
+
+func TestVersion(t *testing.T) {
+	for _, arg := range []string{"version", "--version"} {
+		var out, errOut bytes.Buffer
+		if code := run(context.Background(), []string{arg}, &out, &errOut, nil); code != 0 {
+			t.Fatalf("%s: exit %d, stderr %q", arg, code, errOut.String())
+		}
+		if got := out.String(); got != "ovsq dev\n" {
+			t.Errorf("%s: got %q, want %q", arg, got, "ovsq dev\n")
+		}
+		if code := run(context.Background(), []string{arg, "extra"}, &out, &errOut, nil); code != 2 {
+			t.Errorf("%s extra: exit %d, want 2", arg, code)
+		}
+	}
+}

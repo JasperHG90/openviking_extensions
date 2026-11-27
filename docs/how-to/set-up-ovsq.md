@@ -5,6 +5,8 @@ sources:
   - resource: packages/ov-sync-queue/README.md
   - resource: packages/ov-sync-queue/e2e/pipeline.sh
   - resource: packages/ov-sync-queue/internal/s3store/s3store.go
+  - resource: packages/ov-sync-queue/main.go
+  - resource: .github/workflows/release.yaml
 ---
 
 # Set up ovsq
@@ -27,15 +29,33 @@ own.
 
 ## Before you start
 
-- Go 1.26 or later, to build `ovsq`.
 - A clone of JasperHG90/localstack you can apply Terraform from, and Vault
   access to read the key back.
-- For the local check at the end: Docker, `jq` and `terraform` on PATH, and
+- For the local check at the end: Docker, Go 1.26 or later, `jq` and
+  `terraform` on PATH, and
   the localstack clone beside this repo (or `LOCALSTACK_DIR` pointing at it).
 
 ## Steps
 
-### 1. Build ovsq
+### 1. Install ovsq
+
+Download the archive for your platform from the newest
+`ov-sync-queue-v*` release on
+[the releases page](https://github.com/JasperHG90/openviking_extensions/releases).
+Each holds one `ovsq` binary, for `darwin-arm64`, `darwin-amd64`,
+`linux-amd64` or `linux-arm64`:
+
+```bash
+# version: the newest ov-sync-queue-v* tag on the releases page.
+# platform: darwin-arm64, darwin-amd64, linux-amd64 or linux-arm64.
+version=0.1.0 platform=darwin-arm64
+mkdir -p ~/.local/bin
+curl -fsSL "https://github.com/JasperHG90/openviking_extensions/releases/download/ov-sync-queue-v$version/ovsq-$version-$platform.tar.gz" |
+    tar -xz -C ~/.local/bin ovsq
+ovsq version                 # needs ~/.local/bin on your PATH
+```
+
+Or build it from source with Go 1.26 or later:
 
 ```bash
 cd packages/ov-sync-queue
@@ -120,6 +140,28 @@ prefix = "JasperHG90/notes"
 
 `subdir`, `source` and the `[sync]` filters are optional. Every key is in
 [the reference](../reference/ovsq-commands-and-config.md).
+
+#### Several folders without a new prefix each
+
+Each new prefix means another localstack change: a map entry and a key.
+To skip that, map one broad prefix once, scope one key to it, and let each
+folder pick its place with `subdir`:
+
+```hcl
+"JasperHG90/local/" = "viking://user/jasper/resources/"
+```
+
+```toml
+[target]
+prefix = "JasperHG90/local"
+subdir = "projects/notes"   # lands in viking://user/jasper/resources/projects/notes/
+source = "notes"
+```
+
+Give every folder its own `subdir` and `source`, or they overwrite and
+delete each other's files. Scope the step 3 key to the broad prefix
+(`ov-sync/JasperHG90/local/*`). The trade-off: that one key can write
+anywhere under `resources/`.
 
 ### 5. Give ovsq the key
 
