@@ -1,0 +1,3 @@
+reason: revert .loop/config.toml on loop/ov-sync-go so it can land
+by: human:jasperginn@gmail.com
+at: 2026-11-27T10:32:04+00:00
