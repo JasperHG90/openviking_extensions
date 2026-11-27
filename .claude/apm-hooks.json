@@ -1,0 +1,51 @@
+{
+  "SessionStart": [
+    {
+      "matcher": "*",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "command -v kmctl >/dev/null 2>&1 || { echo '{}'; exit 0; }; out=$(kmctl briefing --format antigravity 2>/dev/null) && printf '%s\\n' \"$out\" || echo '{}'; exit 0",
+          "timeout": 10
+        }
+      ],
+      "_apm_source": "antigravity"
+    },
+    {
+      "matcher": "*",
+      "hooks": [
+        {
+          "type": "command",
+          "description": "kmctl: print the knowledge briefing (where knowledge lives, the skills, what is due, one reading rule). Never blocks.",
+          "command": "command -v kmctl >/dev/null 2>&1 || { echo '[kmctl] kmctl is not installed, so there is no knowledge briefing. Install it with: uv tool install git+https://github.com/JasperHG90/kmctl@v0.18.0#subdirectory=packages/kmctl'; exit 0; }; kmctl briefing || echo '[kmctl] kmctl briefing failed; run kmctl briefing in a terminal to see why, or upgrade with uv tool install --force git+https://github.com/JasperHG90/kmctl@v0.18.0#subdirectory=packages/kmctl.'; exit 0",
+          "timeout": 10
+        }
+      ],
+      "_apm_source": "claude"
+    }
+  ],
+  "Stop": [
+    {
+      "matcher": "*",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "in=$(cat); printf '%s' \"$in\" | grep -Eq '\"executionNum\"[[:space:]]*:[[:space:]]*0([^0-9]|$)' || { echo '{}'; exit 0; }; cd .. 2>/dev/null && [ -f .agents/hooks/okf-skills/hooks/okf-stop-check.sh ] || { echo '{}'; exit 0; }; out=$(printf '{}' | bash .agents/hooks/okf-skills/hooks/okf-stop-check.sh 2>/dev/null); case \"$out\" in *'\"decision\":\"block\"'*) printf '%s\\n' \"$out\" | sed 's/\"decision\":\"block\"/\"decision\":\"continue\"/';; *) echo '{}';; esac; exit 0",
+          "timeout": 10
+        }
+      ],
+      "_apm_source": "antigravity"
+    },
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "bash \".claude/hooks/okf-skills/hooks/okf-stop-check.sh\"",
+          "timeout": 15,
+          "statusMessage": "Checking OKF bundle..."
+        }
+      ],
+      "_apm_source": "okf-skills"
+    }
+  ]
+}

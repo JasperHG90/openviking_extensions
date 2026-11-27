@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "bundle": {
+      "type": "stdio",
+      "command": "sh",
+      "args": [
+        "-c",
+        "for d in \"$PWD\"; do [ -n \"$d\" ] || continue; d=$(cd \"$d\" 2>/dev/null && pwd -P) || continue; while :; do if [ -d \"$d/.okf\" ]; then exec uv run https://raw.githubusercontent.com/scaccogatto/okf-skills/a8b96420de90d102c43cda1693d01ec4f925f2ab/servers/okf_mcp.py \"$d/.okf\"; fi; [ \"$d\" = / ] && break; d=$(dirname \"$d\"); done; done; exec uv run https://raw.githubusercontent.com/scaccogatto/okf-skills/a8b96420de90d102c43cda1693d01ec4f925f2ab/servers/okf_mcp.py .okf"
+      ]
+    }
+  }
+}

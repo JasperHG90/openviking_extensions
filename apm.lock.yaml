@@ -1,0 +1,210 @@
+lockfile_version: '1'
+generated_at: '2026-11-27T06:54:00.466900+00:00'
+apm_version: 0.21.0
+dependencies:
+- repo_url: JasperHG90/kmctl
+  host: github.com
+  resolved_commit: 559040f966494713e5abdeacf4dc65f7d4671110
+  resolved_ref: v0.18.0
+  virtual_path: packages/kmctl/apm
+  is_virtual: true
+  package_type: apm_package
+  deployed_files:
+  - .claude/agents/kmctl-auditor.md
+  - .claude/skills/architecture-review
+  - .claude/skills/architecture-review/SKILL.md
+  - .claude/skills/audit
+  - .claude/skills/audit/SKILL.md
+  - .claude/skills/audit/evals/evals.json
+  - .claude/skills/audit/evals/results.md
+  - .claude/skills/audit/evals/sample-findings.json
+  - .claude/skills/continue
+  - .claude/skills/continue/SKILL.md
+  - .claude/skills/continue/evals/evals.json
+  - .claude/skills/continue/evals/results.md
+  - .claude/skills/decision-gaps
+  - .claude/skills/decision-gaps/SKILL.md
+  - .claude/skills/decision-gaps/evals/default-range-recent/case.yaml
+  - .claude/skills/decision-gaps/evals/default-range-recent/graders/01-the-agent-ran-kmctl-decision.md
+  - .claude/skills/decision-gaps/evals/default-range-recent/graders/02-the-report-treats-the-change.md
+  - .claude/skills/decision-gaps/evals/default-range-recent/graders/03-the-report-gives-a-count.md
+  - .claude/skills/decision-gaps/evals/default-range-recent/graders/04-no-file-under-okf-was.md
+  - .claude/skills/decision-gaps/evals/default-range-recent/prompt.md
+  - .claude/skills/decision-gaps/evals/known-range-finds-labelled-gaps/case.yaml
+  - .claude/skills/decision-gaps/evals/known-range-finds-labelled-gaps/graders/01-the-report-lists-choosing-the.md
+  - .claude/skills/decision-gaps/evals/known-range-finds-labelled-gaps/graders/02-the-report-lists-pinning-the.md
+  - .claude/skills/decision-gaps/evals/known-range-finds-labelled-gaps/graders/03-the-report-lists-keeping-mains.md
+  - .claude/skills/decision-gaps/evals/known-range-finds-labelled-gaps/graders/04-the-report-does-not-list.md
+  - .claude/skills/decision-gaps/evals/known-range-finds-labelled-gaps/graders/05-the-report-does-not-list.md
+  - .claude/skills/decision-gaps/evals/known-range-finds-labelled-gaps/graders/06-no-file-under-okf-was.md
+  - .claude/skills/decision-gaps/evals/known-range-finds-labelled-gaps/graders/07-the-report-says-nothing-was.md
+  - .claude/skills/decision-gaps/evals/known-range-finds-labelled-gaps/prompt.md
+  - .claude/skills/decision-gaps/evals/results.md
+  - .claude/skills/decision-gaps/evals/trigger-queries.json
+  - .claude/skills/decision-gaps/evals/write-named-record-no-scan/case.yaml
+  - .claude/skills/decision-gaps/evals/write-named-record-no-scan/graders/01-the-agent-did-not-run.md
+  - .claude/skills/decision-gaps/evals/write-named-record-no-scan/graders/02-a-new-decision-record-about.md
+  - .claude/skills/decision-gaps/evals/write-named-record-no-scan/prompt.md
+  - .claude/skills/decision-gaps/references/judging.md
+  - .claude/skills/decision-log-review
+  - .claude/skills/decision-log-review/SKILL.md
+  - .claude/skills/handoff
+  - .claude/skills/handoff/SKILL.md
+  - .claude/skills/handoff/evals/evals.json
+  - .claude/skills/handoff/evals/results.md
+  - .claude/skills/practices-review
+  - .claude/skills/practices-review/SKILL.md
+  - .claude/skills/write-docs
+  - .claude/skills/write-docs/SKILL.md
+  - .claude/skills/write-docs/evals/evals.json
+  - .claude/skills/write-docs/evals/grade.py
+  - .claude/skills/write-docs/evals/results.md
+  - .claude/skills/write-docs/references/explanation.md
+  - .claude/skills/write-docs/references/how-to.md
+  - .claude/skills/write-docs/references/reference.md
+  - .claude/skills/write-docs/references/tutorial.md
+  deployed_file_hashes:
+    .claude/agents/kmctl-auditor.md: sha256:0535bfc2dd74ee376aa206691a2378084aed55859c6b0450dd3aa7f9dc139b7e
+    .claude/skills/architecture-review/SKILL.md: sha256:1be1cd4eda5332c9c564cf975b2effb7df72f9d3e35b5fca826c97152a875f0e
+    .claude/skills/audit/SKILL.md: sha256:618d221c438ef2e5037876f689375dacfd3a9492fb2cd3039125785beff25ca5
+    .claude/skills/audit/evals/evals.json: sha256:009ef54cbe2d7ca9748dfda690995f591867202d2a569e2b4014e70e26835747
+    .claude/skills/audit/evals/results.md: sha256:fe417e4939ab18d2ccdec1d56e0bd2526139a237221c352ff207694ed7762f0d
+    .claude/skills/audit/evals/sample-findings.json: sha256:0c09ca8ecf2986bb7c2b39034d5d0dbba5053aa908bba551d4b1c4159de532de
+    .claude/skills/continue/SKILL.md: sha256:4288732e935a4f896f111e1c6c5095d2a7e25fc9bbbea1f1260c592c8fcaee28
+    .claude/skills/continue/evals/evals.json: sha256:da44ddfbdea5ae8f46da34d0e5b93be51d88f153ccebba91aac7a52b8c2645a7
+    .claude/skills/continue/evals/results.md: sha256:bc65cd91a41d9d45df17def1ef0cb60805f333ad4ff7fe132d249a4725cd996f
+    .claude/skills/decision-gaps/SKILL.md: sha256:5f6ef1480f39394ac75e8b3e675d64e68b0bcd8074b8dcb137d5a2dd834bbb6f
+    .claude/skills/decision-gaps/evals/default-range-recent/case.yaml: sha256:ba0ade7652a818458a4dd2810cdfdffb7ca1331401d6dbf8e0c7656871532438
+    .claude/skills/decision-gaps/evals/default-range-recent/graders/01-the-agent-ran-kmctl-decision.md: sha256:d7aac4e0a0d31fe210af953fb11c317b1f103ba010a6faa251ae1a0c19c9efce
+    .claude/skills/decision-gaps/evals/default-range-recent/graders/02-the-report-treats-the-change.md: sha256:4e1d2762e99fc5de1e17e0081219da67e87c1e61c5d054d410bd0aad2758b530
+    .claude/skills/decision-gaps/evals/default-range-recent/graders/03-the-report-gives-a-count.md: sha256:e310f0a98ff4353d6895164cbd25f4bb630eb3f1867d31d7b8157af06c0d945b
+    .claude/skills/decision-gaps/evals/default-range-recent/graders/04-no-file-under-okf-was.md: sha256:e8d308824e8c11131505b29eb70cf874760d887fe48a58b9ea34a006e9a12c5f
+    .claude/skills/decision-gaps/evals/default-range-recent/prompt.md: sha256:7691df26c7bba36ba275b88bfa4e2030b4d1c15eff33b684e94aaa11ea30f054
+    .claude/skills/decision-gaps/evals/known-range-finds-labelled-gaps/case.yaml: sha256:8849d6cce61728806086705fb6ec25b8665e4a9b90161cf4cdbfa174f805fc41
+    .claude/skills/decision-gaps/evals/known-range-finds-labelled-gaps/graders/01-the-report-lists-choosing-the.md: sha256:544998084136ea1ac81dfee327ae3a7a746575c6b261015da38999317e48b2b7
+    .claude/skills/decision-gaps/evals/known-range-finds-labelled-gaps/graders/02-the-report-lists-pinning-the.md: sha256:40ff0d08c18b8741e33a91985f9691d1a6137796dc6f819c174aab3a5ad15b38
+    .claude/skills/decision-gaps/evals/known-range-finds-labelled-gaps/graders/03-the-report-lists-keeping-mains.md: sha256:da47d0714d768d379fb34210002c69cec5a21703f5f25bddaa9c07aec7c4b246
+    .claude/skills/decision-gaps/evals/known-range-finds-labelled-gaps/graders/04-the-report-does-not-list.md: sha256:c073053c2d063a268439b2c20a1152bfbf60989a0a55f200fccce65b92dc38b5
+    .claude/skills/decision-gaps/evals/known-range-finds-labelled-gaps/graders/05-the-report-does-not-list.md: sha256:da6b5d41472ed75f204de99aac410bcecacb5f932fd908a2d29e6807123bd38c
+    .claude/skills/decision-gaps/evals/known-range-finds-labelled-gaps/graders/06-no-file-under-okf-was.md: sha256:e8d308824e8c11131505b29eb70cf874760d887fe48a58b9ea34a006e9a12c5f
+    .claude/skills/decision-gaps/evals/known-range-finds-labelled-gaps/graders/07-the-report-says-nothing-was.md: sha256:0f6983d1bbed2b28604de203a47d273d3a70184a9b75e68957113e2fb33227e2
+    .claude/skills/decision-gaps/evals/known-range-finds-labelled-gaps/prompt.md: sha256:e477c2dde0a94ba8552e2faa66e537c7ee7f68e507b2dda76ed205ce6dfbdc2e
+    .claude/skills/decision-gaps/evals/results.md: sha256:c186c34ad25dcf64720911ba52576110bb509351122fe3bcb01e2af2108be0dd
+    .claude/skills/decision-gaps/evals/trigger-queries.json: sha256:7624a833744ee240b5092aecddfe5f4a9b3b550b6c93f2f818f8d06ecb26095f
+    .claude/skills/decision-gaps/evals/write-named-record-no-scan/case.yaml: sha256:f87bb8e8bb9b9071c7dfd126f304b9406c54e3904891cf0ee4551702950c3c75
+    .claude/skills/decision-gaps/evals/write-named-record-no-scan/graders/01-the-agent-did-not-run.md: sha256:ca5ee2d049be23b0bba547c7862ffa363eff477e3934e6a67f1ebbdc7ed3a5ed
+    .claude/skills/decision-gaps/evals/write-named-record-no-scan/graders/02-a-new-decision-record-about.md: sha256:d52ad9dca200ba746092662bf0a223d19b25233884c447e6bdfc75b843ea5007
+    .claude/skills/decision-gaps/evals/write-named-record-no-scan/prompt.md: sha256:06a8d391167ccd99d76e5b97f958eba3be23d41e2017a594ecd595c85ba50243
+    .claude/skills/decision-gaps/references/judging.md: sha256:07348408b7211aeabe7f22a8b26fd87df91af228b57a5a55782aa1dd3d429201
+    .claude/skills/decision-log-review/SKILL.md: sha256:6dc2940b976b994885101a5394cdabd681186a1c1b056278db7cdbcdc4257c72
+    .claude/skills/handoff/SKILL.md: sha256:eda5c0c866a3c64573a53fc09bf0085497fa7821fc7290554f124365d3c79355
+    .claude/skills/handoff/evals/evals.json: sha256:6605a45113967a0405cbe702174382b361a4037362d17298b263be3faecc7992
+    .claude/skills/handoff/evals/results.md: sha256:e3c3bd370664372ab6f57ab9ca4c9d5658606693a90c660433933f9d7dcfa410
+    .claude/skills/practices-review/SKILL.md: sha256:0062630ff549dceda3aa7d7c99da1f1f72fb9d9beb5b5f453caec56ac4120825
+    .claude/skills/write-docs/SKILL.md: sha256:6ca5d3414b3627c17a5f581fbd75b68e026d617d947b2c759de87eed373bfaf1
+    .claude/skills/write-docs/evals/evals.json: sha256:0bcad5edbb511faa32773513bf3cc7b8b89fa51d0da0bed92da4f0d8b8c8081c
+    .claude/skills/write-docs/evals/grade.py: sha256:5f2fd6a560ad3df2761854729150567189f6068b8c164780c3682e7c6204b6e8
+    .claude/skills/write-docs/evals/results.md: sha256:b031f7ff5e8c79df57e59ec25d1b879bb748291359dd21f7175ea6b03e662657
+    .claude/skills/write-docs/references/explanation.md: sha256:527dbf013240c8931892724388cb0325f6fed530063b0b36603d60946258f8ef
+    .claude/skills/write-docs/references/how-to.md: sha256:abd80091df06213d1df0836e993743ef23602b9ce5f8c9da6dad0db21c42889e
+    .claude/skills/write-docs/references/reference.md: sha256:f58b9d594333d5782b081ac3e236a062b7b6239ab197c486806e0a5b65e1596f
+    .claude/skills/write-docs/references/tutorial.md: sha256:3d252e1372d60a7822d8af4ad35e14df02bff1da4853f0927c21bf222c3883f9
+  content_hash: sha256:7545f83e7529cacd23066287211b5bc61cf15c4bc857b00e6b8507eeb351406e
+- repo_url: JasperHG90/kmctl
+  host: github.com
+  resolved_commit: 559040f966494713e5abdeacf4dc65f7d4671110
+  resolved_ref: v0.18.0
+  virtual_path: packages/kmctl/apm/antigravity
+  is_virtual: true
+  package_type: apm_package
+  deployed_files:
+  - .claude/rules/diagrams-stay-current.md
+  - .claude/rules/docs-layout.md
+  - .claude/rules/manifesto-invariants.md
+  - .claude/rules/okf-bundle.md
+  deployed_file_hashes:
+    .claude/rules/diagrams-stay-current.md: sha256:dbb76cd547e7d80115296ba4fd780a38aa3ff001d2c7220e204e24da07ab5073
+    .claude/rules/docs-layout.md: sha256:f85e07b4529cfd2fed47adee3b5404ca8b72d7734de002d0d02e27fd5114ce9f
+    .claude/rules/manifesto-invariants.md: sha256:65e1937175cea3039037906e5eb70e81c030f4f8c2394394c572ad474b2ac69b
+    .claude/rules/okf-bundle.md: sha256:1a0d8b6ce5c23cda565ca2798bd726c661ab11860bead9d44e94a2625e2fb1b2
+  content_hash: sha256:dadcce31d4245e1282a431224e2507c9151b573301b45b9ca9837b2ba6ea39a3
+- repo_url: JasperHG90/kmctl
+  host: github.com
+  resolved_commit: 559040f966494713e5abdeacf4dc65f7d4671110
+  resolved_ref: v0.18.0
+  virtual_path: packages/kmctl/apm/claude
+  is_virtual: true
+  package_type: apm_package
+  deployed_files:
+  - .claude/rules/diagrams-stay-current.md
+  - .claude/rules/docs-layout.md
+  - .claude/rules/manifesto-invariants.md
+  - .claude/rules/okf-bundle.md
+  deployed_file_hashes:
+    .claude/rules/diagrams-stay-current.md: sha256:dbb76cd547e7d80115296ba4fd780a38aa3ff001d2c7220e204e24da07ab5073
+    .claude/rules/docs-layout.md: sha256:f85e07b4529cfd2fed47adee3b5404ca8b72d7734de002d0d02e27fd5114ce9f
+    .claude/rules/manifesto-invariants.md: sha256:65e1937175cea3039037906e5eb70e81c030f4f8c2394394c572ad474b2ac69b
+    .claude/rules/okf-bundle.md: sha256:1a0d8b6ce5c23cda565ca2798bd726c661ab11860bead9d44e94a2625e2fb1b2
+  content_hash: sha256:33c47d02ee5b5d857dbc21149128c55d423bcedd2430aebbb4c867bae058c69b
+- repo_url: scaccogatto/okf-skills
+  host: github.com
+  resolved_commit: a8b96420de90d102c43cda1693d01ec4f925f2ab
+  resolved_ref: a8b96420de90d102c43cda1693d01ec4f925f2ab
+  package_type: marketplace_plugin
+  deployed_files:
+  - .claude/agents/bundle-weaver.md
+  - .claude/agents/event-analyzer.md
+  - .claude/hooks/okf-skills/hooks/okf-stop-check.sh
+  - .claude/skills/backfill
+  - .claude/skills/backfill/SKILL.md
+  - .claude/skills/backfill/scripts/okf_backfill_events.py
+  - .claude/skills/okf
+  - .claude/skills/okf/SKILL.md
+  - .claude/skills/okf/agents/openai.yaml
+  - .claude/skills/okf/reference/APACHE-2.0.txt
+  - .claude/skills/okf/reference/SPEC.md
+  - .claude/skills/okf/scripts/okf_init.py
+  - .claude/skills/okf/templates/concept.md
+  - .claude/skills/okf/templates/index.md
+  - .claude/skills/okf/templates/log.md
+  - .claude/skills/validate
+  - .claude/skills/validate/SKILL.md
+  - .claude/skills/validate/scripts/okf_validate.py
+  - .claude/skills/visualize
+  - .claude/skills/visualize/SKILL.md
+  - .claude/skills/visualize/scripts/okf_visualize.py
+  deployed_file_hashes:
+    .claude/agents/bundle-weaver.md: sha256:69146e7ba4481c54644dbfd61ab4c68438851f9a74d2f2651216c52109a1d584
+    .claude/agents/event-analyzer.md: sha256:c88c8bfe0ccf082407e830291e7f78e9e052683b6db19bcf27229c17ed008a77
+    .claude/hooks/okf-skills/hooks/okf-stop-check.sh: sha256:7d24353e2cedb35dbf6ff7ee0307a6f3f6dd2a767185bc72b071493e1bf361c9
+    .claude/skills/backfill/SKILL.md: sha256:b34ce8740f3ff55f55af713ed350aa595aa94dbe716e25af328cbe6e5917bd8a
+    .claude/skills/backfill/scripts/okf_backfill_events.py: sha256:12bceb5872a4c7375f863d97186f681278908bdc2052017cac37844f9a76ce27
+    .claude/skills/okf/SKILL.md: sha256:ad4a2d130643816d579f9c394ee1bffa8881a42ed6dc17e4ff75fa3cb0ff272a
+    .claude/skills/okf/agents/openai.yaml: sha256:0f5392a890abc6ffa33ab70cb393892986dab436112a27f000390eb450859bbc
+    .claude/skills/okf/reference/APACHE-2.0.txt: sha256:cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30
+    .claude/skills/okf/reference/SPEC.md: sha256:1bc532f0b1baa5d021af97c9ce3205c26c6c402076f1eaa2e37a0abdd8de43c3
+    .claude/skills/okf/scripts/okf_init.py: sha256:5a7fa4937399109dc908640d33c8a3348f867d5d5ec3a45b157143eec6236d49
+    .claude/skills/okf/templates/concept.md: sha256:0d70e0f313b2019c8c1a6deb591d3929b60690fa41c345145fb18de8eaf82c4d
+    .claude/skills/okf/templates/index.md: sha256:fca29f13b7ac2b3c455cdce19edf518392bb5fed15b1b903e05c8a715c772880
+    .claude/skills/okf/templates/log.md: sha256:f5e352d5c2d017ebe135d92684334905cf4797f82bb91765605552596cc81c55
+    .claude/skills/validate/SKILL.md: sha256:6544ba26a5fe504d5c7b28f1fc07b135ca5127859297eb562041d0ecb9cce610
+    .claude/skills/validate/scripts/okf_validate.py: sha256:d9ad6d4347233cd6402f0336b36c08d54662f2b05b1f46a206d28752bace58f0
+    .claude/skills/visualize/SKILL.md: sha256:7dea574f70a7f0b9afbe6be660f8961dfabe32439b61ab6266d8ac0af4e595b6
+    .claude/skills/visualize/scripts/okf_visualize.py: sha256:82d2b7955f58130d01e0012115fcc7b1dcac2bd72cbc8d49e353b7b676010795
+  content_hash: sha256:b466731253d25a51601062fb7c903ecd4d1272590fddbb7ebf4f650a3616998d
+  declared_license: MIT
+mcp_servers:
+- bundle
+mcp_configs:
+  bundle:
+    name: bundle
+    transport: stdio
+    args:
+    - -c
+    - for d in "$PWD"; do [ -n "$d" ] || continue; d=$(cd "$d" 2>/dev/null && pwd
+      -P) || continue; while :; do if [ -d "$d/.okf" ]; then exec uv run https://raw.githubusercontent.com/scaccogatto/okf-skills/a8b96420de90d102c43cda1693d01ec4f925f2ab/servers/okf_mcp.py
+      "$d/.okf"; fi; [ "$d" = / ] && break; d=$(dirname "$d"); done; done; exec uv
+      run https://raw.githubusercontent.com/scaccogatto/okf-skills/a8b96420de90d102c43cda1693d01ec4f925f2ab/servers/okf_mcp.py
+      .okf
+    registry: false
+    command: sh
