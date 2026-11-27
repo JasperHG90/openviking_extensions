@@ -1180,7 +1180,7 @@ def test_login_needs_no_vault_cli(
     for directory in (Path("/bin"), Path("/usr/bin")):
         for tool in directory.iterdir():
             link = system / tool.name
-            if tool.name != "vault" and not link.exists():
+            if tool.name != "vault" and not os.path.lexists(link):
                 link.symlink_to(tool)
     interpreter = str(Path(sys.executable).parent)
     path = os.pathsep.join([str(workspace / "bin"), interpreter, str(system)])
