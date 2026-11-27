@@ -316,26 +316,27 @@ def test_keyword_search_covers_array_fields(adapter: PgVectorCollectionAdapter) 
     assert [r["id"] for r in adapter.search_by_keywords(keywords=["kubernetes"])] == ["a"]
 
 
-def test_keyword_search_accepts_the_engine_arguments_openviking_sends(
+def test_keyword_search_searches_only_the_fields_asked_for(
     adapter: PgVectorCollectionAdapter,
 ) -> None:
-    """``mode`` and ``fields`` pass through the facade and change nothing.
+    """``fields`` narrows the search, as on OpenViking's other keyword backends.
 
-    OpenViking's own keyword callers send ``mode="bm25", fields=["content"]``.
-    This backend searches its configured keyword fields either way, so the
-    hits must match a plain call.
+    OpenViking's own keyword callers send ``mode="bm25", fields=["content"]``:
+    a match in another column is not a match in ``content``.
     """
     adapter.upsert(
         [
-            {"id": "a", "name": "postgres vector search", "vector": vec(1)},
-            {"id": "b", "name": "completely unrelated", "vector": vec(2)},
+            {"id": "named", "name": "postgres vector search", "vector": vec(1)},
+            {"id": "described", "description": "postgres replication", "vector": vec(2)},
+            {"id": "other", "name": "completely unrelated", "vector": vec(3)},
         ]
     )
-    plain = adapter.search_by_keywords(query="postgres", limit=10)
-    tuned = adapter.search_by_keywords(
-        query="postgres", limit=10, mode="bm25", fields=["content"]
-    )
-    assert [r["id"] for r in tuned] == [r["id"] for r in plain] == ["a"]
+    everywhere = adapter.search_by_keywords(query="postgres", limit=10, mode="bm25")
+    assert {r["id"] for r in everywhere} == {"named", "described"}
+    in_names = adapter.search_by_keywords(query="postgres", limit=10, fields=["name"])
+    assert [r["id"] for r in in_names] == ["named"]
+    # `content` is not declared on this schema, so nothing can match in it.
+    assert adapter.search_by_keywords(query="postgres", fields=["content"]) == []
 
 
 @pytest.mark.parametrize(

@@ -64,26 +64,6 @@ def test_the_mode_is_not_openvikings_own_pgvector_backend() -> None:
     assert adapter.mode != "pgvector"
 
 
-def test_event_time_decay_is_refused_by_name_before_any_query() -> None:
-    """Time decay fails up front, naming this backend, instead of reaching SQL.
-
-    Under ``mode == "pgvector"`` OpenViking passes the raw decay request on to
-    the collection, expecting its native backend to apply it; this adapter
-    would then try to connect. Refused here, nothing connects at all.
-    """
-    adapter = make_adapter()
-    with pytest.raises(NotImplementedError, match=f"not supported by {MODE}"):
-        adapter.query(
-            query_vector=[0.0] * 8,
-            advance={
-                "time_decay": {
-                    "protection": "7d",
-                    "origin": "2026-01-01T00:00:00+00:00",
-                }
-            },
-        )
-
-
 @pytest.mark.parametrize("advance", [None, {}])
 def test_no_advance_options_are_accepted(advance: dict[str, object] | None) -> None:
     """The facade passes ``advance=None``; that must not raise."""

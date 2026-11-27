@@ -150,6 +150,55 @@ _KEYWORD_QUERY_MODES = frozenset({"all", "any"})
 _ACCEPTED_KEYWORD_MODES = frozenset({None, "bm25"})
 
 
+# Candidates a time-decayed search re-ranks, at least: the nearest rows by
+# similarity, then reordered by the decayed score and paged. The same bounded
+# approximation, with the same default budget, as OpenViking's openGauss
+# backend.
+DECAY_CANDIDATES = 1000
+
+# The compiled time-decay request OpenViking's adapters pass on.
+_DECAY_KEYS = frozenset({"field", "origin_ms", "offset_ms", "scale_ms", "decay"})
+
+
+def _decay_spec(advance: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return the compiled time-decay request in ``advance``, refusing anything else.
+
+    Raises
+    ------
+    NotImplementedError
+        For an ``advance`` option other than ``time_decay``.
+    ValueError
+        For a ``time_decay`` that is not OpenViking's compiled form.
+    """
+    if not advance:
+        return None
+    rest = {key: value for key, value in advance.items() if key != "time_decay"}
+    _refuse_advance("search_by_vector", rest)
+    spec = advance.get("time_decay")
+    if not isinstance(spec, dict) or set(spec) != _DECAY_KEYS:
+        raise ValueError(
+            "time_decay must be OpenViking's compiled form, with "
+            + ", ".join(sorted(_DECAY_KEYS))
+        )
+    if float(spec["scale_ms"]) <= 0 or not 0 < float(spec["decay"]) < 1:
+        raise ValueError("time_decay needs a positive scale and a decay in (0, 1)")
+    return spec
+
+
+def _decay_factor(timestamp: object, spec: dict[str, Any]) -> float | None:
+    """Return OpenViking's decay factor for an epoch-ms timestamp, or ``None``.
+
+    ``None`` -- no timestamp -- leaves the score as it is, as on every other
+    backend.
+    """
+    if not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool):
+        return None
+    elapsed = max(
+        0.0, abs(float(spec["origin_ms"]) - float(timestamp)) - float(spec["offset_ms"])
+    )
+    return math.exp(math.log(float(spec["decay"])) * elapsed / float(spec["scale_ms"]))
+
+
 def _refuse_advance(method: str, advance: dict[str, Any] | None) -> None:
     """Raise when a caller asks for engine-side options this backend lacks.
 
@@ -1363,9 +1412,17 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         NotImplementedError
             If ``advance`` asks for anything.
         """
-        _refuse_advance("search_by_vector", advance)
+        decay = _decay_spec(advance)
         if dense_vector is None and sparse_vector is None:
             raise ValueError("search_by_vector requires a dense or sparse vector")
+        if decay is not None:
+            spec = self._schema.by_name(str(decay["field"]))
+            if spec is None or not spec.is_datetime:
+                raise ValueError(
+                    f"time_decay field {decay['field']!r} is not a date_time field"
+                )
+            page_limit, page_offset = limit, offset
+            limit, offset = max(limit + offset, DECAY_CANDIDATES), 0
 
         annotate(
             {
@@ -1381,6 +1438,10 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         predicate, filter_params = self._compiler.compile(filters)
         columns = self._output_columns(output_fields)
         include_extra = not output_fields
+        borrowed: str | None = None
+        if decay is not None and str(decay["field"]) not in columns:
+            borrowed = str(decay["field"])
+            columns = [*columns, borrowed]
 
         # A row with no vector scores NULL. It is sorted last rather than
         # filtered out: `CollectionAdapter.query` synthesises a random vector
@@ -1425,9 +1486,68 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         # embedding -- `coalesce(..., 0.0)` is the best possible value for l2
         # and ip, where every real term is negative -- so such a row could
         # outrank genuine matches on a score it did not earn.
-        return self._rows_to_search_result(
+        result = self._rows_to_search_result(
             rows, columns, floor_vectorless=dense_vector is not None
         )
+        if decay is None:
+            return result
+        return self._apply_decay(
+            result,
+            [row.get(str(decay["field"])) for row in rows or []],
+            decay,
+            page=(page_offset, page_limit),
+            detail=return_detail_info,
+            drop=borrowed,
+        )
+
+    @staticmethod
+    def _apply_decay(
+        result: SearchResult,
+        timestamps: list[object],
+        decay: dict[str, Any],
+        *,
+        page: tuple[int, int],
+        detail: bool,
+        drop: str | None,
+    ) -> SearchResult:
+        """Multiply each score by its decay factor, re-rank, and page.
+
+        Parameters
+        ----------
+        result :
+            The candidates, in similarity order.
+        timestamps :
+            Each candidate's raw epoch-ms timestamp, in the same order.
+        decay :
+            The compiled time-decay request.
+        page :
+            ``(offset, limit)`` of the page to return.
+        detail :
+            Whether to report the similarity and the factor separately, as
+            ``origin_score`` and ``addition_score``.
+        drop :
+            A field fetched only to read the timestamp, removed again.
+
+        Returns
+        -------
+        SearchResult
+            The requested page of the decayed ranking.
+        """
+        for item, timestamp in zip(result.data, timestamps, strict=True):
+            factor = _decay_factor(timestamp, decay)
+            origin = float(item.score or 0.0)
+            if factor is not None:
+                item.score = origin * factor
+            if detail:
+                item.origin_score = origin
+                item.addition_score = factor
+            if drop is not None and item.fields is not None:
+                item.fields.pop(drop, None)
+        ranked = sorted(
+            result.data, key=lambda item: (-float(item.score or 0.0), str(item.id))
+        )
+        offset, limit = page
+        return SearchResult(data=ranked[offset : offset + limit])
 
     @traced("ov_postgres.search_by_id")
     def search_by_id(
@@ -1532,9 +1652,11 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             ``None`` or ``"bm25"``. Either way rows are ranked with the
             configured ``keyword_rank``.
         fields :
-            Accepted and recorded, not applied. The search always covers the
-            configured ``keyword_fields``, which is what the full-text index is
-            built over; another set would scan the table instead.
+            Columns to search; ``None`` means the configured
+            ``keyword_fields``, which the full-text index covers. Another set
+            is answered without that index, by scanning the table. Names that
+            are undeclared or not text are ignored, and if none is left the
+            search matches nothing.
         bm25_k1, bm25_b :
             Must be ``None``: PostgreSQL's ranking has no such parameters.
         advance :
@@ -1621,6 +1743,15 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             )
 
         specs = self._fulltext_specs()
+        if fields is not None:
+            # Narrowed to what was asked for, as OpenViking's other keyword
+            # backends narrow it. A set other than `keyword_fields` matches
+            # no full-text index, so it is answered by scanning the table.
+            requested = [self._schema.by_name(str(name)) for name in fields]
+            specs = [spec for spec in requested if spec is not None and spec.is_textual]
+            if not specs:
+                annotate({"ov_postgres.outcome": "no_requested_text_fields"})
+                return SearchResult(data=[])
         if not specs:
             logger.warning(
                 "search_by_keywords: no text fields available on collection %s",
@@ -1890,7 +2021,8 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         -------
         SearchResult
             Rows in the requested order, with the sort value as the score.
-            NULLs sort last in both directions.
+            A NULL sorts as the smallest value: first ascending, last
+            descending.
 
         Raises
         ------
@@ -1911,7 +2043,9 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         if spec.is_vector or spec.is_sparse:
             raise ValueError(f"Cannot sort on a {spec.ov_type} field: {field!r}")
 
-        direction = sql.SQL("DESC") if str(order).lower() == "desc" else sql.SQL("ASC")
+        descending = str(order).lower() == "desc"
+        direction = sql.SQL("DESC") if descending else sql.SQL("ASC")
+        nulls = sql.SQL("NULLS LAST") if descending else sql.SQL("NULLS FIRST")
         # Same reason as the range comparisons: PostgreSQL's default collation
         # is not code-point order, so a text sort would disagree with the
         # built-in backend's Python sort.
@@ -1942,16 +2076,16 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         # inside a run of equal sort values returns rows twice and skips others
         # entirely, because PostgreSQL may order the run differently per query.
         #
-        # NULLS LAST in both directions. OpenViking's inventory scan walks
-        # `updated_at` ascending and probes for a NULL tail only on its native
-        # pgvector backend; its local engine leaves NULL rows out of ordered
-        # queries altogether, so last is no worse. Every Context OpenViking
-        # writes defaults `updated_at` to its creation time, so NULLs come only
-        # from writes that bypass it.
+        # A NULL sorts as the smallest value: first ascending, last
+        # descending. OpenViking's incremental inventory walks `updated_at`
+        # ascending, takes the leading pages without a timestamp by offset,
+        # and bounds every later page by the last timestamp it saw -- so a
+        # NULL sorted last is excluded by that bound and never listed.
         statement = sql.SQL(
             "SELECT {cols} FROM {table} WHERE {pred} "
-            "ORDER BY {sort} {dir} NULLS LAST, {pk} LIMIT %s OFFSET %s"
+            "ORDER BY {sort} {dir} {nulls}, {pk} LIMIT %s OFFSET %s"
         ).format(
+            nulls=nulls,
             cols=self._select_list(columns, include_extra=include_extra),
             table=self._qualified,
             pred=predicate,

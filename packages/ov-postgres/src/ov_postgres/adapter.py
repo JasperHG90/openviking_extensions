@@ -24,8 +24,12 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
+from openviking.storage.expr import FilterExpr
 from openviking.storage.vectordb.collection.collection import Collection
-from openviking.storage.vectordb_adapters.base import CollectionAdapter
+from openviking.storage.vectordb_adapters.base import (
+    CollectionAdapter,
+    _normalize_result_score,
+)
 from psycopg import sql
 from psycopg_pool import ConnectionPool
 
@@ -589,6 +593,95 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
                 f"reconcile failed ({type(exc).__name__}: {exc}). Without the "
                 "fields it adds, ACL filters would let restricted rows through."
             ) from exc
+
+    def query(
+        self,
+        *,
+        query_vector: list[float] | None = None,
+        sparse_query_vector: dict[str, float] | None = None,
+        filter: dict[str, Any] | FilterExpr | None = None,  # OpenViking's name
+        limit: int = 10,
+        offset: int = 0,
+        output_fields: list[str] | None = None,
+        order_by: str | None = None,
+        order_desc: bool = False,
+        advance: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Query as OpenViking's base adapter does, applying event time decay too.
+
+        OpenViking hands every backend an event-time-decay request as
+        ``advance={"time_decay": {"protection": ..., "origin": ...}}``, and
+        compiles it for the backends it knows by mode. This one it does not
+        know, so the request is compiled here, with OpenViking's own
+        ``build_time_decay_fusion_spec``, and applied by
+        :meth:`PgVectorCollection.search_by_vector`: each similarity is
+        multiplied by the fixed curve over ``updated_at``, and a row with no
+        timestamp keeps its score. Every other query is the base class's.
+
+        Parameters
+        ----------
+        query_vector, sparse_query_vector, filter, limit, offset, output_fields,
+        order_by, order_desc, advance :
+            As ``CollectionAdapter.query``.
+
+        Returns
+        -------
+        list[dict[str, Any]]
+            Matching records, with ``_origin_score`` and ``_time_score`` beside
+            ``_score`` when time decay applied.
+        """
+        request = (advance or {}).get("time_decay")
+        if request is None or not (query_vector or sparse_query_vector):
+            # Without a vector OpenViking ignores the request, as it does here.
+            records: list[dict[str, Any]] = super().query(
+                query_vector=query_vector,
+                sparse_query_vector=sparse_query_vector,
+                filter=filter,
+                limit=limit,
+                offset=offset,
+                output_fields=output_fields,
+                order_by=order_by,
+                order_desc=order_desc,
+                advance=None if request is not None else advance,
+            )
+            return records
+        from openviking.utils.time_decay import build_time_decay_fusion_spec
+        from openviking.utils.time_utils import parse_iso_datetime
+
+        spec = build_time_decay_fusion_spec(
+            protection=request["protection"],
+            origin=parse_iso_datetime(request["origin"]),
+        )
+        result = self.get_collection().search_by_vector(
+            index_name=self._index_name,
+            dense_vector=query_vector,
+            sparse_vector=sparse_query_vector,
+            limit=limit,
+            offset=offset,
+            filters=self._compile_filter(filter),
+            output_fields=output_fields,
+            advance={
+                "time_decay": {
+                    "field": spec.field,
+                    "origin_ms": spec.origin_ms,
+                    "offset_ms": spec.offset_ms,
+                    "scale_ms": spec.scale_ms,
+                    "decay": spec.decay,
+                }
+            },
+            return_detail_info=True,
+        )
+        decayed: list[dict[str, Any]] = []
+        for item in result.data:
+            record = dict(item.fields) if item.fields else {}
+            record["id"] = item.id
+            record["_score"] = _normalize_result_score(item.score)
+            if item.origin_score is not None:
+                record["_origin_score"] = _normalize_result_score(item.origin_score)
+            if item.addition_score is not None:
+                record["_time_score"] = _normalize_result_score(item.addition_score)
+            decayed.append(self._normalize_record_for_read(record))
+        return decayed
 
     def _table_exists(self, table_name: str) -> bool:
         """Return whether the named table is present in the configured schema."""

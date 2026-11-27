@@ -2002,11 +2002,13 @@ def test_update_data_writes_nothing_when_a_key_is_missing(
         adapter.close()
 
 
-def test_null_array_still_sorts_last(dsn: str, test_schema: str) -> None:
+def test_null_array_still_sorts_as_null(dsn: str, test_schema: str) -> None:
     """Collating a text array must not turn a NULL column into an empty one.
 
     ``array(SELECT unnest(NULL))`` is the empty array, so a NULL column stopped
-    sorting last and became indistinguishable from a row holding ``[]``.
+    sorting as NULL and became indistinguishable from a row holding ``[]``. A
+    NULL sorts as the smallest value, so it comes first ascending, ahead of
+    ``[]``.
     """
     adapter = build(dsn, test_schema)
     try:
@@ -2029,7 +2031,7 @@ def test_null_array_still_sorts_last(dsn: str, test_schema: str) -> None:
             r["id"]
             for r in adapter.query(order_by="search_tags", order_desc=False, limit=10)
         ]
-        assert ordered[-1] == "nullrow", ordered
+        assert ordered[:2] == ["nullrow", "empty"], ordered
         # And element order is code-point, so "_x" sorts before "a".
         assert ordered.index("under") < ordered.index("a"), ordered
     finally:
