@@ -394,3 +394,34 @@ def test_a_long_batch_renews_its_lease_before_it_lapses(
         assert filled == 4
     finally:
         adapter.close()
+
+
+def test_a_metadata_update_from_a_stale_cache_keeps_the_maintenance_state(
+    dsn: str, test_schema: str, viking_fs: Any
+) -> None:
+    """`update` merges onto the stored row, so it cannot drop a lease or the mark."""
+    from ov_postgres.collection import MAINTENANCE_KEY
+
+    reconciled_old_table(dsn, test_schema, viking_fs)
+    adapter = make_adapter(dsn, test_schema)
+    try:
+        assert adapter.collection_exists()
+        inner = adapter._pg_collection
+        assert inner is not None
+        stale = {k: v for k, v in inner.get_meta_data().items() if k != MAINTENANCE_KEY}
+        assert inner.take_md5_lease("running-worker", 3600.0)
+        stored = inner.get_meta_data()[MAINTENANCE_KEY]
+        inner._schema.raw = stale
+
+        inner.update(description="renamed")
+        inner.update(fields={"Extra": 1, MAINTENANCE_KEY: {}})
+
+        meta = inner.get_meta_data()
+        assert meta[MAINTENANCE_KEY] == stored
+        assert meta["Description"] == "renamed"
+        assert meta["Extra"] == 1
+        assert inner._schema.raw == meta, "the cache is refreshed from the row"
+        assert inner.md5_backfill_pending()
+        assert not inner.take_md5_lease("other", 60.0)
+    finally:
+        adapter.close()

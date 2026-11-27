@@ -634,6 +634,12 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
     ) -> bool:
         """Merge changes into the collection's stored metadata.
 
+        Applied onto the registry row as stored, locked for the length of the
+        write, not onto this process's cached copy: another process may have
+        queued the md5 backfill or taken its lease since that copy was read.
+        The maintenance state belongs to this package, so it is kept as stored
+        even when ``fields`` names it.
+
         Parameters
         ----------
         fields :
@@ -647,18 +653,37 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             Always ``True``; a failure raises instead.
         """
         annotate({"db.operation.name": "UPDATE"})
-        with self._lock:
-            meta = dict(self._schema.raw)
-            if description is not None:
-                meta["Description"] = description
-            if fields:
-                meta.update(fields)
-            self._execute(
-                sql.SQL("UPDATE {} SET meta = %s WHERE name = %s").format(
-                    self._registry(ddl.REGISTRY_COLLECTIONS)
-                ),
-                (json.dumps(meta), self._name),
-            )
+        self._check_open()
+        registry = self._registry(ddl.REGISTRY_COLLECTIONS)
+        with self._lock, self._pool.connection() as conn, conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    sql.SQL("SELECT meta FROM {} WHERE name = %s FOR UPDATE").format(
+                        registry
+                    ),
+                    (self._name,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    meta = dict(self._schema.raw)
+                else:
+                    stored = row["meta"]
+                    meta = dict(
+                        stored if isinstance(stored, dict) else json.loads(stored)
+                    )
+                maintenance = meta.get(MAINTENANCE_KEY)
+                if description is not None:
+                    meta["Description"] = description
+                if fields:
+                    meta.update(fields)
+                if maintenance is None:
+                    meta.pop(MAINTENANCE_KEY, None)
+                else:
+                    meta[MAINTENANCE_KEY] = maintenance
+                cur.execute(
+                    sql.SQL("UPDATE {} SET meta = %s WHERE name = %s").format(registry),
+                    (json.dumps(meta), self._name),
+                )
             self._schema.raw = meta
             if description is not None:
                 self._schema.description = description
