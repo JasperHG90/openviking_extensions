@@ -37,9 +37,12 @@ whether they go further, both in JasperHG90/localstack:
    `nomad_job.ov_sync_consumer` (`deployments/applications/services.tf`),
    mapped to a `viking://` folder. A prefix missing there reaches the bucket
    and goes no further.
-2. **A write credential.** The bucket has no writers by default. You need S3
-   credentials allowed to `GetObject`, `PutObject` and `DeleteObject` under
-   `ov-sync/<prefix>/*`. `ovsq` never lists the bucket, so it needs no List.
+2. **A write credential.** The bucket has no writers by default. You need a
+   static S3 key allowed to read and write `ov-sync/<prefix>/*`. `ovsq` never
+   lists the bucket, so it needs no List.
+
+[Set up ovsq](../../docs/how-to/set-up-ovsq.md) walks through both, the key
+included.
 
 ## How it works
 
@@ -128,8 +131,13 @@ only: CI has no clone, and it is not a gate.
   jobspec's own args, webhook config and `master.toml`, read from
   `seaweedfs.hcl`, inside the receiver's network namespace, so its webhook
   reaches the receiver on 127.0.0.1 as in production.
-- The receiver and the consumer are the real `ov-sync-consumer` binary,
-  built from the clone and run with the jobspec's environment.
+- The receiver and the consumer run the `ov-sync-consumer` image
+  `services.tf` deploys, at the tag it pins, with the jobspec's environment.
+  That image is linux/arm64, so an amd64 host needs Docker's emulation.
+  `OVSQ_E2E_CONSUMER=source` builds them from the clone instead, to test a
+  change before it is released.
+- ovsq writes with a static key scoped to its prefix, shaped like the one
+  the how-to sets up, and the test checks the key is refused outside it.
 - The consumer gets S3 credentials the production way: SeaweedFS's STS trades
   a Nomad-style workload token for the role `ov-sync-consumer.hcl` names,
   with `defaultEffect` Deny. SeaweedFS's `iam.json` is built as production

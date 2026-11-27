@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # LOCAL ONLY: not in CI and not a gate. It needs docker, Go, jq, terraform
 # and a clone of JasperHG90/localstack (LOCALSTACK_DIR, default ../localstack
-# beside this repo), because it builds ov-sync-consumer from that clone and
-# reads the production set-up from its jobspecs and Terraform.
+# beside this repo), because it reads the production set-up from that clone's
+# jobspecs and Terraform.
 #
 # Runs ovsq through the whole ov-sync pipeline, each piece in a container:
 #
@@ -14,8 +14,13 @@
 #   jobspec's own args, webhook config and master.toml, read from
 #   seaweedfs.hcl. As in production, SeaweedFS shares the receiver's network
 #   namespace and posts its webhook to the receiver on 127.0.0.1.
-# - The receiver and consumer are the real ov-sync-consumer binary, run with
-#   the jobspec's environment. The consumer gets its S3 credentials the
+# - The receiver and consumer run the ov-sync-consumer image services.tf
+#   deploys, with the jobspec's environment. OVSQ_E2E_CONSUMER=source builds
+#   them from the clone's applications/ov-sync-consumer instead, to test a
+#   change before it is released.
+# - ovsq writes with a static S3 key scoped to its prefix, as the how-to
+#   docs/how-to/set-up-ovsq.md sets one up, and the test checks the key is
+#   refused outside that prefix. The consumer gets its S3 credentials the
 #   production way: SeaweedFS's STS trades a Nomad-style workload token for
 #   its role. SeaweedFS's iam.json is built the way production builds it:
 #   terraform evaluates services.tf's own iam_members expression over its
@@ -34,7 +39,7 @@ app=$localstack/applications/ov-sync-consumer
 infra=$localstack/deployments/infrastructure
 seaweed_hcl=$infra/services/seaweedfs.hcl
 consumer_hcl=$localstack/deployments/applications/services/ov-sync-consumer.hcl
-for f in "$app/go.mod" "$seaweed_hcl" "$infra/services.tf" "$consumer_hcl"; do
+for f in "$seaweed_hcl" "$infra/services.tf" "$consumer_hcl"; do
     [ -f "$f" ] || { echo "missing $f: set LOCALSTACK_DIR to a localstack clone" >&2; exit 2; }
 done
 
@@ -52,6 +57,21 @@ aud=$(grep -E '^[[:space:]]*aud[[:space:]]*=' "$consumer_hcl" | head -1 | sed -E
 
 pin() { grep -Eo 'docker\.io/[a-z0-9/._-]+:[A-Za-z0-9._-]+' "$1" | head -1; }
 seaweed_image=$(pin "$seaweed_hcl")
+# deployed_image TF: the ov-sync-consumer image a services.tf deploys.
+deployed_image() { hcl_value "$1" ov_sync_consumer_image; }
+receiver_image=$(deployed_image "$infra/services.tf")
+consumer_image=$(deployed_image "$localstack/deployments/applications/services.tf")
+case ${OVSQ_E2E_CONSUMER:-deployed} in
+deployed)
+    [ -n "$receiver_image" ] && [ -n "$consumer_image" ] ||
+        fail "could not read ov_sync_consumer_image from the services.tf files"
+    ;;
+source)
+    [ -f "$app/go.mod" ] || fail "missing $app/go.mod: OVSQ_E2E_CONSUMER=source builds from it"
+    receiver_image=alpine:3 consumer_image=alpine:3
+    ;;
+*) fail "OVSQ_E2E_CONSUMER must be deployed or source, not ${OVSQ_E2E_CONSUMER}" ;;
+esac
 nats_image=$(pin "$infra/services/nats.hcl")
 s3_port=${OVSQ_E2E_S3_PORT:-18335}
 ov_port=${OVSQ_E2E_OV_PORT:-18080}
@@ -79,12 +99,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
-step "building ovsq, ov-sync-consumer and the fakes"
+step "building ovsq and the fakes"
 arch=$(docker version --format '{{.Server.Arch}}')
 mkdir -p "$work/bin" "$work/secrets" "$work/tokens"
 (cd "$here/.." && go build -o "$work/ovsq" . &&
     CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -o "$work/bin/fakes" ./e2e/pipeline)
-(cd "$app" && CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -o "$work/bin/ov-sync-consumer" .)
+if [ "${OVSQ_E2E_CONSUMER:-deployed}" = source ]; then
+    step "building ov-sync-consumer from $app"
+    (cd "$app" && CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -o "$work/bin/ov-sync-consumer" .)
+    consumer_cmd=/bin-e2e/ov-sync-consumer
+else
+    step "pulling $receiver_image and $consumer_image"
+    docker pull -q "$receiver_image" >/dev/null && docker pull -q "$consumer_image" >/dev/null ||
+        fail "could not pull the deployed ov-sync-consumer images"
+    consumer_cmd= # the image's entrypoint is the binary
+fi
 
 step "rendering SeaweedFS's config from seaweedfs.hcl and services.tf"
 seaweed_args=() # a loop, not mapfile: macOS ships bash 3.2
@@ -122,7 +151,16 @@ jq -e --arg issuer "$issuer" --arg role "$role_arn" '
     any(.providers[]; .name == "nomad" and .config.issuer == $issuer) and any(.roles[]; .roleArn == $role)' \
     "$work/secrets/iam.json" >/dev/null ||
     fail "the rendered iam.json has no nomad provider or no role $role_arn"
-cp "$here/s3.json" "$work/secrets/s3.json"
+# Production's s3.json holds only the admin key; ovsq's identity is the one
+# docs/how-to/set-up-ovsq.md adds, scoped to its prefix.
+cat > "$work/secrets/s3.json" <<'EOF'
+{"identities": [
+  {"name": "admin", "credentials": [{"accessKey": "adminkey", "secretKey": "adminsecret"}],
+   "actions": ["Admin", "Read", "Write", "List", "Tagging"]},
+  {"name": "ovsq-e2e", "credentials": [{"accessKey": "ovsqkey", "secretKey": "ovsqsecret"}],
+   "actions": ["Read:ov-sync/JasperHG90/e2e/*", "Write:ov-sync/JasperHG90/e2e/*"]}
+]}
+EOF
 echo hook-token > "$work/secrets/webhook_token"
 echo ov-token > "$work/secrets/ov_token"
 echo '{"JasperHG90/e2e/": "viking://user/jasper/resources/projects/e2e"}' > "$work/secrets/prefixes.json"
@@ -141,7 +179,7 @@ docker run -d --name "$run_id-nats" --network "$run_id" -p "$mon_port:8222" \
 docker run -d --name "$run_id-receiver" --network "$run_id" -p "$s3_port:8333" \
     -v "$work/bin:/bin-e2e:ro" -v "$work/secrets/webhook_token:/secrets/webhook_token:ro" \
     -e NATS_URL="nats://$run_id-nats:4222" -e RECEIVER_TOKEN_FILE=/secrets/webhook_token \
-    alpine:3 /bin-e2e/ov-sync-consumer receiver >/dev/null
+    "$receiver_image" $consumer_cmd receiver >/dev/null
 for _ in $(seq 30); do [ -s "$work/tokens/nomad_seaweedfs.jwt" ] && break; sleep 1; done
 docker run -d --name "$run_id-consumer" --network "$run_id" \
     -v "$work/bin:/bin-e2e:ro" -v "$work/tokens:/secrets/tokens:ro" \
@@ -153,7 +191,7 @@ docker run -d --name "$run_id-consumer" --network "$run_id" \
     -e AWS_WEB_IDENTITY_TOKEN_FILE=/secrets/tokens/nomad_seaweedfs.jwt \
     -e AWS_ROLE_ARN="$role_arn" \
     -e RATE_PER_SECOND=50 -e MAX_TRIES=3 -e CATCHUP_INTERVAL=24h \
-    alpine:3 /bin-e2e/ov-sync-consumer consumer >/dev/null
+    "$consumer_image" $consumer_cmd consumer >/dev/null
 
 stream_up() {
     curl -sf "http://127.0.0.1:$mon_port/jsz?streams=true" |
@@ -208,6 +246,26 @@ sed -i.bak -e 's#^prefix = ""#prefix = "JasperHG90/e2e"#' -e 's#^subdir = ""#sub
 rm ov-sync-queue.toml.bak
 grep -q '^subdir = "notes"' ov-sync-queue.toml || fail "could not set target.subdir in the starter config"
 export AWS_ACCESS_KEY_ID=ovsqkey AWS_SECRET_ACCESS_KEY=ovsqsecret
+
+step "ovsq's key is refused outside its prefix"
+mkdir -p "$work/other" && printf 'x\n' > "$work/other/x.md"
+"$work/ovsq" init "$work/other" >/dev/null
+sed -i.bak -e 's#^prefix = ""#prefix = "JasperHG90/other"#' \
+    -e "s#^endpoint = .*#endpoint = \"http://127.0.0.1:$s3_port\"#" "$work/other/ov-sync-queue.toml"
+grep -q '^prefix = "JasperHG90/other"' "$work/other/ov-sync-queue.toml" || fail "could not set target.prefix in the starter config"
+denied=$("$work/ovsq" run "$work/other" 2>&1) && fail "ovsq wrote outside its prefix: $denied"
+grep -qF 'Access Denied' <<<"$denied" || fail "ovsq failed outside its prefix, but not with Access Denied: $denied"
+# ovsq stops at its manifest read, so try a write and a delete directly.
+for method in PUT DELETE; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' --aws-sigv4 "aws:amz:us-east-1:s3" --user ovsqkey:ovsqsecret \
+        -X "$method" --data-binary x "http://127.0.0.1:$s3_port/ov-sync/JasperHG90/other/x.md")
+    [ "$code" = 403 ] || fail "ovsq's key got HTTP $code for a $method outside its prefix, want 403"
+done
+code=$(curl -s -o /dev/null -w '%{http_code}' --aws-sigv4 "aws:amz:us-east-1:s3" --user ovsqkey:ovsqsecret \
+    -X PUT --data-binary x "http://127.0.0.1:$s3_port/ov-sync/JasperHG90/e2e/_probe.md")
+[ "$code" = 200 ] || fail "ovsq's key got HTTP $code for a PUT inside its prefix, want 200: the curl check is broken"
+curl -s -o /dev/null --aws-sigv4 "aws:amz:us-east-1:s3" --user ovsqkey:ovsqsecret \
+    -X DELETE "http://127.0.0.1:$s3_port/ov-sync/JasperHG90/e2e/_probe.md"
 
 step "ovsq run: three text files and an image reach OpenViking under notes/"
 "$work/ovsq" run . | tail -1
@@ -270,5 +328,6 @@ msgs=$(curl -sf "http://127.0.0.1:$mon_port/jsz?streams=true" |
 out=$("$work/ovsq" status .)
 grep -qF "0 to upload, 0 to delete, 1 unchanged" <<<"$out" || fail "ovsq status after the runs: $out"
 
-echo "PASS: ovsq -> SeaweedFS -> receiver (loopback) -> NATS ($msgs events on OV_SYNC) -> ov-sync-consumer (STS role) -> OpenViking"
+echo "PASS: ovsq (scoped key) -> SeaweedFS -> receiver (loopback) -> NATS ($msgs events on OV_SYNC) -> ov-sync-consumer (STS role) -> OpenViking"
+echo "      receiver: $receiver_image, consumer: $consumer_image${consumer_cmd:+ running the binary built from $app}"
 echo "      calls: $(jq -c . <<<"$all")"
