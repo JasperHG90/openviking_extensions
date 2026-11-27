@@ -31,6 +31,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       versions: ${{ steps.pick.outputs.versions }}
+      newest: ${{ steps.pick.outputs.newest }}
     steps:
       - uses: actions/checkout@v4
       - id: pick
@@ -59,6 +60,7 @@ jobs:
             versions="[\"$floor\", \"$newest\"]"
           fi
           echo "versions=$versions" >> "$GITHUB_OUTPUT"
+          echo "newest=$newest" >> "$GITHUB_OUTPUT"
           echo "Testing $PACKAGE on $versions (floor from requires-python)"
 
   check:
@@ -98,10 +100,29 @@ jobs:
           uv run --directory packages/${{ inputs.package }}
           pytest -v -m "not integration" --color=yes --tb=short
 
-      # Integration suites may start containers through testcontainers.
-      # ubuntu-latest ships a running Docker daemon, so no service container is
-      # needed; a suite skips itself if it needs one and none is present.
+      # Integration suites start containers: PostgreSQL through
+      # testcontainers, and OpenViking (a 2.4 GB image) and Vault for the live
+      # suites. ubuntu-latest ships a running Docker daemon, so no service
+      # container is needed. They run on the newest interpreter only: what they
+      # check is agreement with a real server, which does not vary by Python
+      # version, and the unit suite already covers both ends. Running them on
+      # each interpreter would pull the image once per job and put a cold pull
+      # inside every job's time limit.
+      #
+      # The images are pulled in a step of their own first, so a slow registry
+      # shows up as a slow pull rather than as a test that timed out.
+      - name: Pull the integration images
+        if: matrix.python-version == needs.interpreters.outputs.newest
+        run: |
+          set -euo pipefail
+          images=$(grep -rhoE '(ghcr\.io/volcengine/openviking|hashicorp/vault|pgvector/pgvector):[A-Za-z0-9._-]+' \
+            packages/${{ inputs.package }}/tests 2>/dev/null | grep -v ':latest$' | sort -u || true)
+          for image in $images; do
+            docker pull --quiet "$image"
+          done
+
       - name: Run integration tests
+        if: matrix.python-version == needs.interpreters.outputs.newest
         run: >
           uv run --directory packages/${{ inputs.package }}
           pytest -v -m "integration" --color=yes --tb=short
