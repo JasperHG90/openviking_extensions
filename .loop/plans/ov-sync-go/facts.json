@@ -1,0 +1,110 @@
+{
+  "schema_version": "1.0",
+  "slug": "ov-sync-go",
+  "plan_hash": "9f24e7b0e4ec4b6ad2d91423a754436b4bb73e42f3e0f134aaf8c4e87b39a3bb",
+  "problems": [
+    {
+      "id": "P1",
+      "text": "ov-sync writes straight to OpenViking, so a local folder's documents skip the queue that paces, retries and dead-letters writes, and only CI repos reach that pipeline today."
+    },
+    {
+      "id": "P2",
+      "text": "There is no way to choose which local files go to the bucket and under which prefix, short of copying `sync.py` and its folder list."
+    },
+    {
+      "id": "P3",
+      "text": "Nothing records which local files were sent to the bucket, so deletes cannot be mirrored and unchanged files would be re-sent."
+    }
+  ],
+  "goals": [
+    {
+      "id": "G1",
+      "text": "Any local folder reaches OpenViking through the ov-sync bucket and its queue, with the same manifest the CI action keeps."
+    },
+    {
+      "id": "G2",
+      "text": "A config file decides what is synced and where in the bucket it lands."
+    }
+  ],
+  "outcomes": [
+    {
+      "id": "O1",
+      "change": "`ovsq run` mirrors a folder into a bucket prefix using the action's manifest logic",
+      "kind": "behaviour",
+      "goal": "G1",
+      "goal_index": 0,
+      "fixes": "P1",
+      "fixes_index": 0,
+      "needs": [
+        "O2",
+        "O3"
+      ],
+      "needs_index": [
+        1,
+        2
+      ],
+      "touches": [
+        "new:packages/ov-sync-queue/main.go",
+        "ovsq run"
+      ],
+      "checked_by": "Go tests against an in-process fake S3 (upload, unchanged second run, `--delete`, failed upload keeps its old manifest entry, manifest written after each batch, keys under `_state/` never uploaded)",
+      "seen_by": "operator"
+    },
+    {
+      "id": "O2",
+      "change": "`ov-sync-queue.toml` selects files and the target prefix",
+      "kind": "support",
+      "goal": "G2",
+      "goal_index": 1,
+      "fixes": "P2",
+      "fixes_index": 1,
+      "needs": [],
+      "needs_index": [],
+      "touches": [
+        "ov-sync-queue.toml",
+        "ovsq init"
+      ],
+      "checked_by": "Go tests for loading, defaults, `OVSQ_` overrides, and refusing a prefix that is not `<owner>/<name>`",
+      "seen_by": "operator"
+    },
+    {
+      "id": "O3",
+      "change": "A local cache and the bucket manifest record what was sent",
+      "kind": "support",
+      "goal": "G1",
+      "goal_index": 0,
+      "fixes": "P3",
+      "fixes_index": 2,
+      "needs": [],
+      "needs_index": [],
+      "touches": [
+        ".ov-sync-queue.db",
+        "ovsq status"
+      ],
+      "checked_by": "Go tests showing a file with matching size and mtime is not re-hashed, a lost cache costs no re-upload when the manifest matches, and `status` makes no write",
+      "seen_by": "operator"
+    },
+    {
+      "id": "O4",
+      "change": "The Go gates run with the repo's other gates, and the package is documented",
+      "kind": "support",
+      "goal": "G1",
+      "goal_index": 0,
+      "fixes": "P1",
+      "fixes_index": 0,
+      "needs": [
+        "O1"
+      ],
+      "needs_index": [
+        0
+      ],
+      "touches": [
+        ".pre-commit-config.yaml",
+        ".loop/config.toml",
+        "new:packages/ov-sync-queue/README.md"
+      ],
+      "checked_by": "`prek run --all-files` and `loopctl gate stamp` run `go vet` and `go test` for the module",
+      "seen_by": "calling code"
+    }
+  ]
+}
