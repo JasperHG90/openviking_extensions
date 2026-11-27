@@ -50,10 +50,16 @@
       "command": "go -C packages/ov-sync-queue test ./... -run '^TestCacheSkipsUnchanged$' -count=1"
     },
     {
+      "id": "r11",
+      "behavior": "A selected file over 16 MiB is skipped and reported, never uploaded, and its absence does not fail the run.",
+      "fails_when": "the file is PUT, the run prints no skip line naming it, or the run exits non-zero because of it",
+      "command": "go -C packages/ov-sync-queue test ./... -run '^TestRunSkipsLargeFiles$' -count=1"
+    },
+    {
       "id": "r9",
       "behavior": "The module builds, vets and passes its whole test suite, and the repo's gates run it.",
       "fails_when": "go vet or go test fails, or neither the pre-commit config nor the loop gates run them",
-      "command": "go -C packages/ov-sync-queue vet ./... && go -C packages/ov-sync-queue test ./... -count=1 && grep -q 'ov-sync-queue' .pre-commit-config.yaml"
+      "command": "go -C packages/ov-sync-queue vet ./... && go -C packages/ov-sync-queue test ./... -count=1 && grep -q 'ov-sync-queue' .pre-commit-config.yaml && grep -q 'ov-sync-queue' .loop/config.toml"
     },
     {
       "id": "r10",

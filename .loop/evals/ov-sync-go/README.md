@@ -1,17 +1,17 @@
 ---
 type: eval
 title: 'Eval: ov-sync-go'
-description: 'Definition of done for ov-sync-go: 10 row(s).'
+description: 'Definition of done for ov-sync-go: 11 row(s).'
 tags:
 - eval
 generated:
   by: process:loopctl/2.3.1.dev65+g93b143856
-  at: '2026-11-27T08:49:58+00:00'
+  at: '2026-11-27T08:51:19+00:00'
 slug: ov-sync-go
 signoff:
   signer: delegated:jasperginn@gmail.com/claude
-  hash: 430c27c563a7b915aecb0b666675ebb8356799a6cf824410744e626a0eddfaa0
-  at: '2026-11-27T08:49:58+00:00'
+  hash: 5385239912387e2677da07e5a2d1c5060c21ea6839beb024b77879188053c7ef
+  at: '2026-11-27T08:51:19+00:00'
 verified: null
 ---
 
@@ -33,6 +33,8 @@ Rows: rows.json; the fields each row takes: loopctl schema eval-rows.
   Fails when: status issues a PUT or DELETE, changes the cache file, or its counts differ from what run then does
 - r8: A file whose size and mtime match the local cache is not read again.
   Fails when: the hasher is called for an unchanged file
+- r11: A selected file over 16 MiB is skipped and reported, never uploaded, and its absence does not fail the run.
+  Fails when: the file is PUT, the run prints no skip line naming it, or the run exits non-zero because of it
 - r9: The module builds, vets and passes its whole test suite, and the repo's gates run it.
   Fails when: go vet or go test fails, or neither the pre-commit config nor the loop gates run them
 - r10 (judgment): The package README explains install, config keys, how files reach OpenViking through the bucket and queue, the manifest, and deletes, and docs/ gains a reference page for the config.
