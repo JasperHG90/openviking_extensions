@@ -24,6 +24,11 @@ from ovx.errors import OvxError
 # reject anyway; the Rust CLI is laxer and ignores what it does not know, which
 # is worse — a typo'd key silently does nothing. Checking against this list
 # turns both cases into one error naming the offending key.
+#
+# One field is left out on purpose: `oidc_token`, added in OpenViking 0.5.1.
+# With `auth_mode = "oidc"` the Rust CLI sends it as the Authorization header,
+# which the server reads before X-API-Key, so a static token in a profile would
+# silently outrank the fresh one `ovx --login` puts in `api_key`.
 FIELD_TYPES: dict[str, str] = {
     "url": "str",
     "api_key": "str",

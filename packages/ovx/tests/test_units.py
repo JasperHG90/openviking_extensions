@@ -179,6 +179,9 @@ def test_banner_masks_the_key() -> None:
         ('["lab"]\napi_key = "k"\n', 2),  # no url
         ('["lab"]\nurl = "https://x"\ntimeout = "soon"\n', 2),  # wrong type
         ('["lab"]\nurl = "https://x"\ntimeout = true\n', 2),  # bool is not a num
+        # Accepted by OpenViking 0.5.6's reader, refused here on purpose: see
+        # the note above FIELD_TYPES.
+        ('["lab"]\nurl = "https://x"\noidc_token = "t"\n', 2),
     ],
 )
 def test_load_profile_rejects_a_bad_profile(body: str, code: int, tmp_path: Path) -> None:

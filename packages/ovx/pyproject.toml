@@ -70,7 +70,7 @@ testpaths = ["tests"]
 # `uv run pytest -m integration`.
 addopts = "-m 'not integration'"
 markers = [
-    "integration: needs the ov CLI on PATH",
+    "integration: needs the ov CLI on PATH, or docker to start Vault and OpenViking",
 ]
 
 [tool.ruff]
