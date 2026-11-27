@@ -1762,11 +1762,14 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             )
 
         specs = self._fulltext_specs()
-        # Narrowed only to requested fields the full-text index covers. Every
-        # OpenViking keyword caller sends `fields=["content"]`, and with
-        # `store_content` off that column is empty and unindexed: honoured
-        # literally, OpenViking's keyword search would find nothing. A request
-        # naming no indexed field gets the configured keyword fields instead.
+        # Narrowed only to requested fields the full-text index covers.
+        # OpenViking 0.5.6 refuses `search_type="keywords"` for this backend
+        # before its retriever runs (service/search_service.py,
+        # `ensure_keywords_search_supported`), so this serves direct callers
+        # such as ov-ext's keyword leg. One sending OpenViking's own
+        # `fields=["content"]` with `store_content` off would find nothing
+        # honoured literally, since that column is empty and unindexed. A
+        # request naming no indexed field gets the configured keyword fields.
         narrow: list[FieldSpec] = []
         if fields is not None:
             requested = {str(name) for name in fields}
