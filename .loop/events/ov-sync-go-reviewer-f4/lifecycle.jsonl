@@ -1,1 +1,2 @@
 {"at": "2026-11-27T09:14:17+00:00", "by": "review close", "kind": "register", "schema_version": "1.0", "stage": "stub"}
+{"at": "2026-11-27T09:21:21+00:00", "kind": "drop", "reason": "ov-sync-go review round 3: reviewer:f4 resolved", "schema_version": "1.0"}
