@@ -168,16 +168,22 @@ tests need 3.11+ — so run them scoped to this directory:
 
 ```bash
 uv run --directory packages/ov-skills pytest                  # offline
-uv run --directory packages/ov-skills pytest -m integration   # fetches from GitHub
+uv run --directory packages/ov-skills pytest -m integration   # GitHub, and docker
 ```
 
 The unit tests validate every skill's frontmatter against all three harnesses'
 rules, assert the installer's skill list matches the directories on disk, and
 drive `ov-handoff-path.sh` against real temporary git repositories — one per
 remote spelling — to prove every spelling of one repo folds onto one path. The
-integration test installs from the tip of `main`, which is the only local check
+integration tests install from the tip of `main`, which is the only local check
 of the `tar` invocation that differs between GNU tar and the bsdtar macOS
-ships.
+ships, and carry out the skills' instructions against a live OpenViking 0.5.6
+(`tests/test_live_openviking.py`). That suite starts OpenViking in `oidc` mode
+and a dev-mode Vault in containers, and makes the MCP calls each skill tells an
+agent to make, as a user holding a Vault identity token: that every tool a
+skill names takes the arguments it names, that a handoff saved where the script
+says is found again, how `glob` truncates, and that a file goes in through the
+upload URL. It needs docker, and `OV_TEST_IMAGE` picks the image.
 
 ## License
 

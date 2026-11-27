@@ -3,7 +3,9 @@
 Two kinds of check here:
 
 1.  Differential tests against OpenViking's own implementations
-    (``DataProcessor.parse_datetime_to_epoch_ms``, ``cuvs_index._parse_depth``)
+    (``DataProcessor.parse_datetime_to_epoch_ms``, and the openGauss adapter's
+    ``_parse_path_scope_depth``, OpenViking's one remaining Python parser of
+    the path depth parameter)
     so value conversion cannot silently drift from the native engine.
 2.  Structural tests on the emitted SQL, asserting the shape and the bound
     parameters rather than exact whitespace.
@@ -15,8 +17,8 @@ from collections.abc import Mapping
 from typing import Any
 
 import pytest
-from openviking.storage.vectordb.index import cuvs_index
 from openviking.storage.vectordb.utils.data_processor import DataProcessor
+from openviking.storage.vectordb_adapters.opengauss.sql import _parse_path_scope_depth
 
 from ov_postgres.filters import (
     FilterCompiler,
@@ -89,14 +91,19 @@ def test_datetime_rejects_garbage(value: object) -> None:
 
 @pytest.mark.parametrize("para", [None, "", "-d=0", "-d=1", "-d=-1", " -d=3 ", "-d=10"])
 def test_parse_depth_matches_openviking(para: object) -> None:
-    """Depth parsing agrees with OpenViking's ``_parse_depth``."""
-    assert parse_depth(para) == cuvs_index._parse_depth(para)
+    """Depth parsing agrees with OpenViking's ``_parse_path_scope_depth``."""
+    assert parse_depth(para) == _parse_path_scope_depth(para)
 
 
 @pytest.mark.parametrize("para", ["-depth=1", "junk", "-d=", "-d=x"])
 def test_parse_depth_rejects_garbage(para: object) -> None:
-    """A malformed depth parameter is rejected."""
-    with pytest.raises((UnsupportedFilterError, cuvs_index.UnsupportedCuVSFilterError)):
+    """A malformed depth parameter is rejected rather than read as unbounded.
+
+    openGauss reads these as "no depth limit", which would widen a scoped
+    search to the whole subtree; this backend refuses instead, as OpenViking
+    0.4's Python evaluator did.
+    """
+    with pytest.raises(UnsupportedFilterError):
         parse_depth(para)
 
 

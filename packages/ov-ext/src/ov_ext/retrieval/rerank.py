@@ -2,12 +2,10 @@
 
 OpenViking reranks with a module-level ``requests.post``
 (``openviking/models/rerank/openai_rerank.py``), which builds a fresh
-connection per call. That is cheap when a search reranks once. It does not:
-hierarchical descent calls ``_rerank_scores`` once per directory it visits, so
-one search opens hundreds of connections and pays a TCP and TLS handshake on
-every one. Measured against a LAN rerank service, the handshake costs more than
-the inference it wraps -- calls the service answers in about 5ms arrive back in
-15 to 30ms.
+connection per call. Since 0.4.23 a search reranks once rather than once per
+directory, but every search still pays a TCP and TLS handshake. Measured
+against a LAN rerank service, the handshake costs more than the inference it
+wraps -- calls the service answers in about 5ms arrive back in 15 to 30ms.
 
 Swapping the module's ``requests`` reference for a shim over a single
 ``requests.Session`` keeps the connection open across calls. The shim takes the

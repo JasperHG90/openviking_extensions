@@ -11,6 +11,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Literal, overload
 
 from opentelemetry.util.types import AttributeValue
+from openviking.storage.acl import ACL_CONTEXT_FIELDS
 from openviking.storage.vectordb.collection.collection import ICollection
 from openviking.storage.vectordb.collection.result import (
     AggregateResult,
@@ -31,13 +32,84 @@ from . import ddl
 from .filters import FilterCompiler, parse_datetime_to_epoch_ms
 from .observability import DB_SYSTEM, annotate, traced
 from .schema import (
+    CHECKED_TYPES,
     GEO_LAT_SUFFIX,
     GEO_LON_SUFFIX,
     CollectionSchema,
     FieldSpec,
     default_for,
+    fits,
     fulltext_candidates,
 )
+
+# Registry key holding this backend's own maintenance state, beside the schema
+# OpenViking reads. OpenViking ignores keys it does not know.
+MAINTENANCE_KEY = "OvPostgresMaintenance"
+MD5_BACKFILL = "md5_backfill"
+# Bumped every time the backfill is queued, so a run clears the mark only if
+# nobody queued it again while it ran.
+MD5_GENERATION = "md5_backfill_generation"
+# Who is running the backfill, and until when; see `take_md5_lease`.
+MD5_LEASE = "md5_backfill_lease"
+
+
+def _queued(maintenance: dict[str, Any]) -> dict[str, Any]:
+    """Return ``maintenance`` with the md5 backfill queued and its generation bumped."""
+    return {
+        **maintenance,
+        MD5_BACKFILL: "pending",
+        MD5_GENERATION: int(maintenance.get(MD5_GENERATION) or 0) + 1,
+    }
+
+
+# The fields a reconcile added, which the extra-guard trigger watches.
+EXTRA_GUARD = "extra_guard"
+
+# Set for the length of each write transaction this version makes, so the
+# extra-guard trigger can tell its writes from an older writer's. A setting
+# local to the transaction survives a transaction-mode connection pooler,
+# where a per-connection option would not.
+WRITER_SETTING = "ov_postgres.writer"
+WRITER_CURRENT = "current"
+
+# How the extra-guard trigger tests a JSON value from `extra` for each column
+# type, and converts it. `v` is the value. A type absent here is left in
+# `extra`, as before; none of the fields OpenViking has added is one.
+_GUARD_CONVERSIONS: dict[str, tuple[str, str]] = {
+    "string": ("jsonb_typeof(v) = 'string'", "v #>> '{}'"),
+    "text": ("jsonb_typeof(v) = 'string'", "v #>> '{}'"),
+    "bool": ("jsonb_typeof(v) = 'boolean'", "(v #>> '{}')::boolean"),
+    "int64": (
+        "jsonb_typeof(v) = 'number' AND (v #>> '{}') ~ '^-?[0-9]{1,18}$'",
+        "(v #>> '{}')::bigint",
+    ),
+    "float32": ("jsonb_typeof(v) = 'number'", "(v #>> '{}')::real"),
+    "list<string>": (
+        "jsonb_typeof(v) = 'array' AND NOT EXISTS ("
+        "SELECT 1 FROM jsonb_array_elements(v) e WHERE jsonb_typeof(e) <> 'string')",
+        "ARRAY(SELECT jsonb_array_elements_text(v))",
+    ),
+    "list<int64>": (
+        "jsonb_typeof(v) = 'array' AND NOT EXISTS ("
+        "SELECT 1 FROM jsonb_array_elements(v) e WHERE jsonb_typeof(e) <> 'number' "
+        "OR (e #>> '{}') !~ '^-?[0-9]{1,18}$')",
+        "ARRAY(SELECT x::bigint FROM jsonb_array_elements_text(v) x)",
+    ),
+}
+
+# Rows read per page while moving values out of `extra` during a reconcile.
+_EXTRA_MOVE_PAGE = 1000
+
+# How long a reconcile waits for a lock before giving up. It runs as one
+# transaction holding ACCESS EXCLUSIVE on the table, so while it waits every
+# other query on the table queues behind it. A failed reconcile is retried on
+# the next use of the collection, which refuses queries until then.
+_RECONCILE_LOCK_TIMEOUT = "10s"
+
+# Fields whose value decides who may read a row. A stashed value that cannot be
+# moved into its column must fail the reconcile: leaving it in `extra` would
+# give the row the column default, `none`, which means unrestricted.
+_FAIL_CLOSED_FIELDS = frozenset(ACL_CONTEXT_FIELDS)
 
 # What psycopg's execute()/executemany() actually accept.
 Statement = sql.SQL | sql.Composed
@@ -87,6 +159,88 @@ _KEYWORD_RANK_FNS: dict[str, sql.SQL] = {
 # Validated like the rank function: a typo silently falling through to `any`
 # would change what every query matches.
 _KEYWORD_QUERY_MODES = frozenset({"all", "any"})
+
+# Keyword modes OpenViking may ask for. `bm25` is what its own callers send;
+# this backend ranks with `keyword_rank` either way, as openGauss accepts the
+# same name for its own ranking.
+_ACCEPTED_KEYWORD_MODES = frozenset({None, "bm25"})
+
+
+# Candidates a time-decayed search re-ranks, at least: the nearest rows by
+# similarity, then reordered by the decayed score and paged. The same bounded
+# approximation, with the same default budget, as OpenViking's openGauss
+# backend.
+DECAY_CANDIDATES = 1000
+
+# The compiled time-decay request OpenViking's adapters pass on.
+_DECAY_KEYS = frozenset({"field", "origin_ms", "offset_ms", "scale_ms", "decay"})
+
+
+def _decay_spec(advance: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return the compiled time-decay request in ``advance``, refusing anything else.
+
+    Raises
+    ------
+    NotImplementedError
+        For an ``advance`` option other than ``time_decay``.
+    ValueError
+        For a ``time_decay`` that is not OpenViking's compiled form.
+    """
+    if not advance:
+        return None
+    rest = {key: value for key, value in advance.items() if key != "time_decay"}
+    _refuse_advance("search_by_vector", rest)
+    spec = advance.get("time_decay")
+    if not isinstance(spec, dict) or set(spec) != _DECAY_KEYS:
+        raise ValueError(
+            "time_decay must be OpenViking's compiled form, with "
+            + ", ".join(sorted(_DECAY_KEYS))
+        )
+    if float(spec["scale_ms"]) <= 0 or not 0 < float(spec["decay"]) < 1:
+        raise ValueError("time_decay needs a positive scale and a decay in (0, 1)")
+    return spec
+
+
+def _decay_factor(timestamp: object, spec: dict[str, Any]) -> float | None:
+    """Return OpenViking's decay factor for an epoch-ms timestamp, or ``None``.
+
+    ``None`` -- no timestamp -- leaves the score as it is, as on every other
+    backend.
+    """
+    if not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool):
+        return None
+    elapsed = max(
+        0.0, abs(float(spec["origin_ms"]) - float(timestamp)) - float(spec["offset_ms"])
+    )
+    return math.exp(math.log(float(spec["decay"])) * elapsed / float(spec["scale_ms"]))
+
+
+def _refuse_advance(method: str, advance: dict[str, Any] | None) -> None:
+    """Raise when a caller asks for engine-side options this backend lacks.
+
+    OpenViking's ``advance`` carries post-processing for the engines that have
+    it: ``time_decay``, ``post_process_ops``, ``post_process_input_limit``.
+    None of them has a PostgreSQL form here, and quietly ignoring one would
+    return results ranked or cut differently from what was asked for.
+
+    Parameters
+    ----------
+    method :
+        The method that was called, for the message.
+    advance :
+        The options passed; ``None`` or empty is accepted.
+
+    Raises
+    ------
+    NotImplementedError
+        Naming the keys that were passed.
+    """
+    if advance:
+        raise NotImplementedError(
+            f"PgVectorCollection.{method} does not support advance options: "
+            f"{', '.join(sorted(map(str, advance)))}"
+        )
+
 
 # Words allowed in one `any`-mode term before it is split into several. The
 # rewrite re-parses a flat `a | b | c ...` chain, which PostgreSQL's parser
@@ -287,6 +441,11 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         }
 
     @property
+    def table_name(self) -> str:
+        """The PostgreSQL table holding this collection's rows."""
+        return self._table
+
+    @property
     def _qualified(self) -> Statement:
         """The schema-qualified collection table."""
         return sql.SQL("{}.{}").format(
@@ -475,6 +634,12 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
     ) -> bool:
         """Merge changes into the collection's stored metadata.
 
+        Applied onto the registry row as stored, locked for the length of the
+        write, not onto this process's cached copy: another process may have
+        queued the md5 backfill or taken its lease since that copy was read.
+        The maintenance state belongs to this package, so it is kept as stored
+        even when ``fields`` names it.
+
         Parameters
         ----------
         fields :
@@ -488,32 +653,63 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             Always ``True``; a failure raises instead.
         """
         annotate({"db.operation.name": "UPDATE"})
-        with self._lock:
-            meta = dict(self._schema.raw)
-            if description is not None:
-                meta["Description"] = description
-            if fields:
-                meta.update(fields)
-            self._execute(
-                sql.SQL("UPDATE {} SET meta = %s WHERE name = %s").format(
-                    self._registry(ddl.REGISTRY_COLLECTIONS)
-                ),
-                (json.dumps(meta), self._name),
-            )
+        self._check_open()
+        registry = self._registry(ddl.REGISTRY_COLLECTIONS)
+        with self._lock, self._pool.connection() as conn, conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    sql.SQL("SELECT meta FROM {} WHERE name = %s FOR UPDATE").format(
+                        registry
+                    ),
+                    (self._name,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    meta = dict(self._schema.raw)
+                else:
+                    stored = row["meta"]
+                    meta = dict(
+                        stored if isinstance(stored, dict) else json.loads(stored)
+                    )
+                maintenance = meta.get(MAINTENANCE_KEY)
+                if description is not None:
+                    meta["Description"] = description
+                if fields:
+                    meta.update(fields)
+                if maintenance is None:
+                    meta.pop(MAINTENANCE_KEY, None)
+                else:
+                    meta[MAINTENANCE_KEY] = maintenance
+                cur.execute(
+                    sql.SQL("UPDATE {} SET meta = %s WHERE name = %s").format(registry),
+                    (json.dumps(meta), self._name),
+                )
             self._schema.raw = meta
             if description is not None:
                 self._schema.description = description
         return True
 
     @traced("ov_postgres.get_meta_data")
-    def get_meta_data(self) -> dict[str, Any]:
+    def get_meta_data(self, *, raise_on_error: bool = False) -> dict[str, Any]:
         """Return the collection metadata recorded in the registry.
+
+        Parameters
+        ----------
+        raise_on_error :
+            Raise instead of falling back to the in-memory copy when the
+            registry row is missing. OpenViking sets it where a stale answer
+            would be worse than none.
 
         Returns
         -------
         dict[str, Any]
             The stored schema, or the in-memory copy if the registry row is
-            missing.
+            missing and ``raise_on_error`` is false.
+
+        Raises
+        ------
+        LookupError
+            If the registry row is missing and ``raise_on_error`` is set.
         """
         annotate({"db.operation.name": "SELECT"})
         row = self._execute(
@@ -524,6 +720,10 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             fetch="one",
         )
         if not row:
+            if raise_on_error:
+                raise LookupError(
+                    f"collection {self._name!r} has no row in the registry table"
+                )
             return dict(self._schema.raw)
         meta = row["meta"]
         return meta if isinstance(meta, dict) else json.loads(meta)
@@ -872,6 +1072,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 # the check would commit before the insert begins, and a
                 # concurrent DELETE in that window would let a vectorless row
                 # through.
+                self._mark_writer(cur)
                 if vectorless:
                     self._lock_rows_and_reject_new_vectorless(cur, ids, vectorless)
                 cur.executemany(self._upsert_statement(columns), rows)
@@ -957,6 +1158,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
 
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
+                self._mark_writer(cur)
                 # Sorted by primary key for the same reason upsert sorts:
                 # every writer must take row locks in one order or two batches
                 # touching the same rows deadlock. Upsert sorting alone was not
@@ -1132,6 +1334,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         total = 0
         while True:
             with self._pool.connection() as conn, conn.cursor() as cur:
+                self._mark_writer(cur)
                 cur.execute(statement, params)
                 repaired = int(cur.rowcount)
             total += repaired
@@ -1210,6 +1413,8 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         filters: dict[str, Any] | None = None,
         sparse_vector: dict[str, float] | None = None,
         output_fields: list[str] | None = None,
+        advance: dict[str, Any] | None = None,
+        return_detail_info: bool = False,
     ) -> SearchResult:
         """Rank rows by similarity to a dense and/or sparse query vector.
 
@@ -1229,6 +1434,12 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             Sparse query vector, used only when ``sparse_weight`` is positive.
         output_fields :
             Columns to return; ``None`` returns all non-vector columns.
+        advance :
+            Engine-side post-processing. Must be empty: this backend has none.
+        return_detail_info :
+            Accepted for interface compatibility. The score has no components
+            to break down, so results carry no ``origin_score`` or
+            ``addition_score`` either way.
 
         Returns
         -------
@@ -1239,9 +1450,20 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         ------
         ValueError
             If neither a dense nor a sparse vector is supplied.
+        NotImplementedError
+            If ``advance`` asks for anything.
         """
+        decay = _decay_spec(advance)
         if dense_vector is None and sparse_vector is None:
             raise ValueError("search_by_vector requires a dense or sparse vector")
+        if decay is not None:
+            spec = self._schema.by_name(str(decay["field"]))
+            if spec is None or not spec.is_datetime:
+                raise ValueError(
+                    f"time_decay field {decay['field']!r} is not a date_time field"
+                )
+            page_limit, page_offset = limit, offset
+            limit, offset = max(limit + offset, DECAY_CANDIDATES), 0
 
         annotate(
             {
@@ -1257,6 +1479,10 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         predicate, filter_params = self._compiler.compile(filters)
         columns = self._output_columns(output_fields)
         include_extra = not output_fields
+        borrowed: str | None = None
+        if decay is not None and str(decay["field"]) not in columns:
+            borrowed = str(decay["field"])
+            columns = [*columns, borrowed]
 
         # A row with no vector scores NULL. It is sorted last rather than
         # filtered out: `CollectionAdapter.query` synthesises a random vector
@@ -1301,9 +1527,72 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         # embedding -- `coalesce(..., 0.0)` is the best possible value for l2
         # and ip, where every real term is negative -- so such a row could
         # outrank genuine matches on a score it did not earn.
-        return self._rows_to_search_result(
+        result = self._rows_to_search_result(
             rows, columns, floor_vectorless=dense_vector is not None
         )
+        if decay is None:
+            return result
+        return self._apply_decay(
+            result,
+            [row.get(str(decay["field"])) for row in rows or []],
+            decay,
+            page=(page_offset, page_limit),
+            detail=return_detail_info,
+            drop=borrowed,
+        )
+
+    @staticmethod
+    def _apply_decay(
+        result: SearchResult,
+        timestamps: list[object],
+        decay: dict[str, Any],
+        *,
+        page: tuple[int, int],
+        detail: bool,
+        drop: str | None,
+    ) -> SearchResult:
+        """Lower each score by its decay factor, re-rank, and page.
+
+        Parameters
+        ----------
+        result :
+            The candidates, in similarity order.
+        timestamps :
+            Each candidate's raw epoch-ms timestamp, in the same order.
+        decay :
+            The compiled time-decay request.
+        page :
+            ``(offset, limit)`` of the page to return.
+        detail :
+            Whether to report the similarity and the factor separately, as
+            ``origin_score`` and ``addition_score``.
+        drop :
+            A field fetched only to read the timestamp, removed again.
+
+        Returns
+        -------
+        SearchResult
+            The requested page of the decayed ranking.
+        """
+        for item, timestamp in zip(result.data, timestamps, strict=True):
+            factor = _decay_factor(timestamp, decay)
+            origin = float(item.score or 0.0)
+            if factor is not None:
+                # Multiplying lowers a positive score. This backend scores l2 as
+                # a negated distance, and inner product can go negative, where
+                # multiplying by a factor below one would raise the score
+                # instead; dividing lowers it, keeping decay a demotion.
+                item.score = origin * factor if origin >= 0 else origin / factor
+            if detail:
+                item.origin_score = origin
+                item.addition_score = factor
+            if drop is not None and item.fields is not None:
+                item.fields.pop(drop, None)
+        ranked = sorted(
+            result.data, key=lambda item: (-float(item.score or 0.0), str(item.id))
+        )
+        offset, limit = page
+        return SearchResult(data=ranked[offset : offset + limit])
 
     @traced("ov_postgres.search_by_id")
     def search_by_id(
@@ -1375,13 +1664,71 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         offset: int = 0,
         filters: dict[str, Any] | None = None,
         output_fields: list[str] | None = None,
+        mode: str | None = None,
+        fields: list[str] | None = None,
+        bm25_k1: float | None = None,
+        bm25_b: float | None = None,
+        advance: dict[str, Any] | None = None,
     ) -> SearchResult:
         """Lexical search over the indexed text columns via Postgres FTS.
 
         The native local backend raises NotImplementedError here because it
         cannot vectorise text itself.  Postgres can rank lexically without an
         embedding model, so this is implemented rather than refused.
+
+        Parameters
+        ----------
+        index_name :
+            Accepted for interface compatibility; unused.
+        keywords :
+            Phrases; the words inside one are ANDed, separate ones ORed.
+        query :
+            Natural-language text; its words combine per
+            ``keyword_query_mode``.
+        limit :
+            Maximum rows to return.
+        offset :
+            Rows to skip.
+        filters :
+            Compiled filter DSL restricting the candidate set.
+        output_fields :
+            Columns to return; ``None`` returns all non-vector columns.
+        mode :
+            ``None`` or ``"bm25"``. Either way rows are ranked with the
+            configured ``keyword_rank``.
+        fields :
+            Columns to narrow the search to, among the configured
+            ``keyword_fields`` the full-text index covers. A request naming
+            none of them -- OpenViking's ``["content"]`` with
+            ``store_content`` off, say -- searches all of them instead.
+        bm25_k1, bm25_b :
+            Must be ``None``: PostgreSQL's ranking has no such parameters.
+        advance :
+            Must be empty: this backend has no engine-side post-processing.
+
+        Returns
+        -------
+        SearchResult
+            Matching rows, best match first.
+
+        Raises
+        ------
+        ValueError
+            If ``mode`` is not ``bm25``, a BM25 parameter is set, or there are
+            more terms than one statement can bind.
+        NotImplementedError
+            If ``advance`` asks for anything.
         """
+        if mode not in _ACCEPTED_KEYWORD_MODES:
+            raise ValueError(
+                f"PgVectorCollection keyword mode must be bm25, not {mode!r}"
+            )
+        if bm25_k1 is not None or bm25_b is not None:
+            raise ValueError(
+                "PgVectorCollection ranks with PostgreSQL full-text search, which "
+                "takes no bm25_k1 or bm25_b"
+            )
+        _refuse_advance("search_by_keywords", advance)
         # Each term carries how its own words combine. A `keywords` entry is a
         # deliberate phrase, so its words are ANDed; a `query` is natural
         # language, where requiring every word matches almost nothing -- the
@@ -1419,6 +1766,8 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 "ov_postgres.offset": offset,
                 "ov_postgres.terms": len(terms),
                 "ov_postgres.filtered": filters is not None,
+                "ov_postgres.keyword_mode": mode or "",
+                "ov_postgres.requested_fields": ",".join(fields or []),
             }
         )
         if not terms:
@@ -1438,6 +1787,21 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             )
 
         specs = self._fulltext_specs()
+        # Narrowed only to requested fields the full-text index covers.
+        # OpenViking 0.5.6 refuses `search_type="keywords"` for this backend
+        # before its retriever runs (service/search_service.py,
+        # `ensure_keywords_search_supported`), so this serves direct callers
+        # such as ov-ext's keyword leg. One sending OpenViking's own
+        # `fields=["content"]` with `store_content` off would find nothing
+        # honoured literally, since that column is empty and unindexed. A
+        # request naming no indexed field gets the configured keyword fields.
+        narrow: list[FieldSpec] = []
+        if fields is not None:
+            requested = {str(name) for name in fields}
+            narrow = [spec for spec in specs if spec.name in requested]
+            if len(narrow) == len(specs):
+                narrow = []
+        annotate({"ov_postgres.narrowed_fields": ",".join(s.name for s in narrow)})
         if not specs:
             logger.warning(
                 "search_by_keywords: no text fields available on collection %s",
@@ -1468,29 +1832,53 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         columns = self._output_columns(output_fields)
         include_extra = not output_fields
 
+        # A narrowed search keeps the full match as its first condition, so the
+        # GIN index over every keyword field still finds the candidates, then
+        # re-checks and ranks them on the narrowed text alone.
+        ranked = (
+            ddl.tsvector_expr(narrow, self._text_search_config, self._db_schema)
+            if narrow
+            else tsvector
+        )
+        recheck = (
+            sql.SQL(" AND {} @@ {}").format(ranked, tsquery) if narrow else sql.SQL("")
+        )
         statement = sql.SQL(
-            "SELECT {cols}, {rank}({tsv}, {tsq}) AS _score FROM {table} "
-            "WHERE {pred} AND {tsv} @@ {tsq} "
+            "SELECT {cols}, {rank}({ranked}, {tsq}) AS _score FROM {table} "
+            "WHERE {pred} AND {tsv} @@ {tsq}{recheck} "
             "ORDER BY _score DESC, {pk} LIMIT %s OFFSET %s"
         ).format(
             cols=self._select_list(columns, include_extra=include_extra),
             rank=_KEYWORD_RANK_FNS[self._keyword_rank],
+            ranked=ranked,
             tsv=tsvector,
             tsq=tsquery,
+            recheck=recheck,
             table=self._qualified,
             pred=predicate,
             pk=sql.Identifier(self._schema.primary_key.name),
         )
-        # Placeholder order: rank's tsquery terms, filter params, then the
-        # WHERE clause's copy of the same terms.
-        params = [*terms, *filter_params, *terms, limit, offset]
+        # Placeholder order: rank's tsquery terms, filter params, the WHERE
+        # clause's copy of the terms, then the recheck's copy when narrowed.
+        params = [
+            *terms,
+            *filter_params,
+            *terms,
+            *(terms if narrow else []),
+            limit,
+            offset,
+        ]
         rows = self._execute(statement, params, fetch="all")
         annotate({"ov_postgres.rows": len(rows), "ov_postgres.outcome": "ok"})
         return self._rows_to_search_result(rows, columns)
 
     @traced("ov_postgres.pairwise_similarity")
     def pairwise_similarity(
-        self, values: Sequence[object], *, field: str | None = None
+        self,
+        values: Sequence[object],
+        *,
+        field: str | None = None,
+        account_id: str | None = None,
     ) -> dict[tuple[object, object], float]:
         """Return cosine similarity between every pair of the given rows.
 
@@ -1519,6 +1907,10 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             carries the URI and not the row id. A non-unique field is reduced
             to one representative row per value, so the matrix has exactly one
             entry per pair.
+        account_id :
+            Compare only that account's rows. A shared table holds the same
+            URI once per account, and without this the representative row
+            could be another tenant's.
 
         Returns
         -------
@@ -1556,6 +1948,11 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         column = sql.Identifier(name)
         vec = sql.Identifier(vector_field.name)
         pk = sql.Identifier(self._schema.primary_key.name)
+        params: list[object] = [keys]
+        scope: sql.Composable = sql.SQL("")
+        if account_id is not None and self._schema.by_name("account_id") is not None:
+            scope = sql.SQL(" AND account_id = %s")
+            params.append(account_id)
 
         # DISTINCT ON keeps one row per value: a URI can carry a row per level,
         # and without this the cross join would emit a pair per combination and
@@ -1567,15 +1964,15 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         statement = sql.SQL(
             "WITH reps AS ("
             "SELECT DISTINCT ON ({col}) {col} AS ref, {vec} AS vec FROM {table} "
-            "WHERE {col} = ANY(%s) AND {vec} IS NOT NULL "
+            "WHERE {col} = ANY(%s) AND {vec} IS NOT NULL{scope} "
             "ORDER BY {col}, {pk}"
             ") "
             "SELECT a.ref AS ref_a, b.ref AS ref_b, "
             "1 - (a.vec <=> b.vec) AS similarity "
             "FROM reps a JOIN reps b ON a.ref < b.ref"
-        ).format(col=column, vec=vec, table=self._qualified, pk=pk)
+        ).format(col=column, vec=vec, table=self._qualified, pk=pk, scope=scope)
 
-        rows = self._execute(statement, [keys], fetch="all")
+        rows = self._execute(statement, params, fetch="all")
         matrix: dict[tuple[object, object], float] = {}
         for row in rows:
             similarity = float(row["similarity"])
@@ -1620,6 +2017,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         offset: int = 0,
         filters: dict[str, Any] | None = None,
         output_fields: list[str] | None = None,
+        advance: dict[str, Any] | None = None,
     ) -> SearchResult:
         """Return an arbitrary sample of matching rows.
 
@@ -1635,12 +2033,20 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             Compiled filter DSL restricting the candidate set.
         output_fields :
             Columns to return; ``None`` returns all non-vector columns.
+        advance :
+            Engine-side post-processing. Must be empty: this backend has none.
 
         Returns
         -------
         SearchResult
             Randomly ordered rows; scores are not meaningful and are zero.
+
+        Raises
+        ------
+        NotImplementedError
+            If ``advance`` asks for anything.
         """
+        _refuse_advance("search_by_random", advance)
         annotate(
             {
                 "db.operation.name": "SELECT",
@@ -1698,7 +2104,8 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         -------
         SearchResult
             Rows in the requested order, with the sort value as the score.
-            NULLs sort last in both directions.
+            A NULL sorts as the smallest value: first ascending, last
+            descending.
 
         Raises
         ------
@@ -1719,7 +2126,9 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         if spec.is_vector or spec.is_sparse:
             raise ValueError(f"Cannot sort on a {spec.ov_type} field: {field!r}")
 
-        direction = sql.SQL("DESC") if str(order).lower() == "desc" else sql.SQL("ASC")
+        descending = str(order).lower() == "desc"
+        direction = sql.SQL("DESC") if descending else sql.SQL("ASC")
+        nulls = sql.SQL("NULLS LAST") if descending else sql.SQL("NULLS FIRST")
         # Same reason as the range comparisons: PostgreSQL's default collation
         # is not code-point order, so a text sort would disagree with the
         # built-in backend's Python sort.
@@ -1749,10 +2158,17 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         # The primary key breaks ties. Without it a page boundary that lands
         # inside a run of equal sort values returns rows twice and skips others
         # entirely, because PostgreSQL may order the run differently per query.
+        #
+        # A NULL sorts as the smallest value: first ascending, last
+        # descending. OpenViking's incremental inventory walks `updated_at`
+        # ascending, takes the leading pages without a timestamp by offset,
+        # and bounds every later page by the last timestamp it saw -- so a
+        # NULL sorted last is excluded by that bound and never listed.
         statement = sql.SQL(
             "SELECT {cols} FROM {table} WHERE {pred} "
-            "ORDER BY {sort} {dir} NULLS LAST, {pk} LIMIT %s OFFSET %s"
+            "ORDER BY {sort} {dir} {nulls}, {pk} LIMIT %s OFFSET %s"
         ).format(
+            nulls=nulls,
             cols=self._select_list(columns, include_extra=include_extra),
             table=self._qualified,
             pred=predicate,
@@ -2294,7 +2710,809 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         annotate({"ov_postgres.indexes_built": len(built)})
         return built
 
-    def _reconcilable_index_statements(self) -> list[ddl.IndexStatement]:
+    @traced("ov_postgres.reconcile_schema")
+    def reconcile_schema(self, meta: dict[str, Any]) -> dict[str, Any] | None:
+        """Add the fields and scalar indexes ``meta`` declares that the table lacks.
+
+        OpenViking passes its full current schema to ``create_collection`` on
+        every boot, and only migrates an existing collection itself for the
+        ``local`` and ``cuvs`` backends. A table created by an older OpenViking
+        would otherwise keep its old columns for ever -- and every field it
+        lacks is treated as missing by filters and dropped from explicit
+        projections, which is how ACL filters stop filtering on a table that
+        predates the ACL columns.
+
+        In one transaction, under the schema's advisory lock:
+
+        1. ``ADD COLUMN`` for each missing field, set to the engine's default
+           for that field on every existing row;
+        2. move any value already written into ``extra`` under that name into
+           the new column, and drop it from ``extra``;
+        3. record the new fields and scalar indexes in the registry;
+        4. build the indexes the new scalar-index entries call for.
+
+        A crash part way rolls all of it back, so the next boot starts over
+        rather than finding columns without their indexes.
+
+        Columns are only ever added. A field the schema no longer names keeps
+        its column and its data. A value in ``extra`` that the column cannot
+        hold stays in ``extra``, with a warning, rather than failing the boot.
+
+        Parameters
+        ----------
+        meta :
+            The collection schema OpenViking passed to ``create_collection``.
+
+        Returns
+        -------
+        dict[str, Any] | None
+            The registry's updated schema, or ``None`` when nothing was
+            missing. The caller rebuilds its view of the collection from it.
+        """
+        self._check_open()
+        incoming = CollectionSchema.from_meta(meta)
+        with self._lock, self._pool.connection() as conn, conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    sql.SQL("SET LOCAL lock_timeout = {}").format(
+                        sql.Literal(_RECONCILE_LOCK_TIMEOUT)
+                    )
+                )
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock(%s)",
+                    (ddl.advisory_lock_key(self._db_schema),),
+                )
+                # Read under the lock: another server may have reconciled while
+                # this one waited, and its columns must not be added twice.
+                cur.execute(
+                    sql.SQL("SELECT meta FROM {} WHERE name = %s FOR UPDATE").format(
+                        self._registry(ddl.REGISTRY_COLLECTIONS)
+                    ),
+                    (self._name,),
+                )
+                row = cur.fetchone()
+                stored_raw = row["meta"] if row else dict(self._schema.raw)
+                stored = dict(
+                    stored_raw if isinstance(stored_raw, dict) else json.loads(stored_raw)
+                )
+                current = CollectionSchema.from_meta(stored)
+                added = [
+                    spec
+                    for spec in incoming.fields
+                    if current.by_name(spec.name) is None
+                    and not spec.is_primary
+                    and not spec.is_vector
+                ]
+                indexed = [
+                    name
+                    for name in incoming.scalar_index
+                    if name not in current.scalar_index
+                ]
+                annotate(
+                    {
+                        "db.operation.name": "SELECT",
+                        "ov_postgres.fields_added": len(added),
+                        "ov_postgres.scalar_indexes_added": len(indexed),
+                    }
+                )
+                if not added and not indexed:
+                    # Another server may have reconciled after this one loaded
+                    # the registry, so the table is current while this
+                    # process's view is not. Writing through a stale view would
+                    # send the new fields to `extra` and leave their columns
+                    # NULL, which an ACL filter reads as unrestricted.
+                    stale = any(
+                        self._schema.by_name(spec.name) is None for spec in current.fields
+                    ) or not set(current.scalar_index) <= set(self._schema.scalar_index)
+                    return stored if stale else None
+
+                for spec in added:
+                    self._add_column(cur, spec)
+                moved = self._move_extra_into_columns(cur, added)
+                guarded = sorted(
+                    {*(stored.get(MAINTENANCE_KEY) or {}).get(EXTRA_GUARD, [])}
+                    | {spec.name for spec in added}
+                )
+                self._install_extra_guard(cur, [incoming.by_name(n) for n in guarded])
+
+            raw_by_name = {
+                str(field.get("FieldName")): field for field in meta.get("Fields", [])
+            }
+            stored["Fields"] = [
+                *stored.get("Fields", []),
+                *(raw_by_name[spec.name] for spec in added),
+            ]
+            stored["ScalarIndex"] = [*stored.get("ScalarIndex", []), *indexed]
+            stored[MAINTENANCE_KEY] = {
+                **stored.get(MAINTENANCE_KEY, {}),
+                EXTRA_GUARD: guarded,
+            }
+            if any(spec.name == "md5" for spec in added):
+                # Every existing row now has an empty md5, and OpenViking's
+                # maintenance reindex treats an empty md5 as stale. Mark the
+                # table so the backfill runs; see `ov_postgres.md5_backfill`.
+                stored[MAINTENANCE_KEY] = _queued(dict(stored.get(MAINTENANCE_KEY) or {}))
+            with conn.cursor() as plain:
+                built = self._create_new_indexes(
+                    plain, before=current, after=CollectionSchema.from_meta(stored)
+                )
+                # The registry is written last. Readers see none of this until
+                # the commit either way; going last keeps the UPDATE's row lock
+                # from serialising two reconciles before the index step, so
+                # tests/test_schema_reconcile.py can tell whether they are
+                # serialised at all. Two locks do that: the advisory lock, and
+                # the registry row's FOR UPDATE above; the test covers the pair,
+                # and either alone is enough to pass it.
+                plain.execute(
+                    sql.SQL("UPDATE {} SET meta = %s WHERE name = %s").format(
+                        self._registry(ddl.REGISTRY_COLLECTIONS)
+                    ),
+                    (json.dumps(stored), self._name),
+                )
+                # The index bundle keeps its own scalar-index list, as the
+                # local backend's does; extend it the same way.
+                plain.execute(
+                    sql.SQL(
+                        "UPDATE {} SET meta = jsonb_set(meta, '{{ScalarIndex}}', "
+                        "coalesce(meta->'ScalarIndex', '[]'::jsonb) || %s::jsonb) "
+                        "WHERE collection = %s"
+                    ).format(self._registry(ddl.REGISTRY_INDEXES)),
+                    (json.dumps(indexed), self._name),
+                )
+        annotate(
+            {
+                "db.operation.name": "ALTER TABLE",
+                "ov_postgres.rows": moved,
+                "ov_postgres.indexes_built": len(built),
+            }
+        )
+        logger.info(
+            "ov_postgres: added %d field(s) to %s.%s (%s); "
+            "moved %d value(s) out of extra",
+            len(added),
+            self._db_schema,
+            self._table,
+            ", ".join(spec.name for spec in added) or "none",
+            moved,
+        )
+        return stored
+
+    @staticmethod
+    def _mark_writer(cur: Cursor[Any]) -> None:
+        """Mark the current transaction as a write by this version.
+
+        See :data:`WRITER_SETTING`: without the mark, the extra-guard trigger
+        treats an update as an older writer's and keeps the row's guarded
+        fields.
+        """
+        cur.execute("SELECT set_config(%s, %s, true)", (WRITER_SETTING, WRITER_CURRENT))
+
+    def md5_backfill_pending(self) -> bool:
+        """Return whether a reconcile added ``md5`` and its backfill has not finished."""
+        maintenance = self.get_meta_data().get(MAINTENANCE_KEY) or {}
+        return bool(maintenance.get(MD5_BACKFILL) == "pending")
+
+    @traced("ov_postgres.md5_backfill_batch")
+    def md5_backfill_batch(
+        self, after: object, limit: int
+    ) -> list[tuple[object, str, int, str]]:
+        """Return the next rows with an empty ``md5`` that OpenViking fingerprints.
+
+        Levels 0 and 1 (a directory's sidecars) and 2 (a file), walked by
+        primary key so each row is visited once.
+
+        Parameters
+        ----------
+        after :
+            The last primary key of the previous batch, or ``None`` to start.
+        limit :
+            Rows to return.
+
+        Returns
+        -------
+        list[tuple[object, str, int, str]]
+            ``(primary key, stored uri, level, account id)`` per row.
+        """
+        annotate({"db.operation.name": "SELECT"})
+        self._check_open()
+        pk = sql.Identifier(self._schema.primary_key.name)
+        rows = self._execute(
+            sql.SQL(
+                "SELECT {pk} AS pk, uri, level, account_id FROM {table} "
+                "WHERE coalesce(md5, '') = '' AND level IN (0, 1, 2) "
+                "AND ({pk} > %s OR %s) ORDER BY {pk} LIMIT %s"
+            ).format(pk=pk, table=self._qualified),
+            (after, after is None, limit),
+            fetch="all",
+        )
+        return [
+            (
+                row["pk"],
+                str(row["uri"] or ""),
+                int(row["level"]),
+                str(row["account_id"] or ""),
+            )
+            for row in rows or []
+        ]
+
+    @traced("ov_postgres.record_md5")
+    def record_md5(self, key: object, md5: str) -> bool:
+        """Set a row's ``md5`` unless something wrote one in the meantime.
+
+        Returns
+        -------
+        bool
+            Whether the row was updated.
+        """
+        annotate({"db.operation.name": "UPDATE"})
+        self._check_open()
+        pk = sql.Identifier(self._schema.primary_key.name)
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            self._mark_writer(cur)
+            cur.execute(
+                sql.SQL(
+                    "UPDATE {table} SET md5 = %s "
+                    "WHERE {pk} = %s AND coalesce(md5, '') = ''"
+                ).format(table=self._qualified, pk=pk),
+                (md5, key),
+            )
+            return bool(cur.rowcount)
+
+    def md5_backfill_generation(self) -> int:
+        """Return how many times the md5 backfill has been queued."""
+        maintenance = self.get_meta_data().get(MAINTENANCE_KEY) or {}
+        return int(maintenance.get(MD5_GENERATION) or 0)
+
+    @traced("ov_postgres.queue_md5_backfill")
+    def _queue_md5_backfill(self) -> None:
+        """Queue the md5 backfill, bumping its generation.
+
+        Production queues it inside the reconcile's and the guard's own
+        transactions (see ``_queued``); this stands in for another server
+        doing so, in the tests.
+        """
+        annotate({"db.operation.name": "UPDATE"})
+        self._check_open()
+        self._execute(
+            sql.SQL(
+                "UPDATE {} SET meta = jsonb_set(meta, %s, "
+                "coalesce(meta->%s, '{{}}'::jsonb) || jsonb_build_object("
+                "%s::text, 'pending', %s::text, "
+                "coalesce((meta->%s->>%s)::bigint, 0) + 1)) WHERE name = %s"
+            ).format(self._registry(ddl.REGISTRY_COLLECTIONS)),
+            (
+                [MAINTENANCE_KEY],
+                MAINTENANCE_KEY,
+                MD5_BACKFILL,
+                MD5_GENERATION,
+                MAINTENANCE_KEY,
+                MD5_GENERATION,
+                self._name,
+            ),
+        )
+
+    def _lease_update(
+        self, assignment: sql.Composable, condition: sql.Composable, params: list[Any]
+    ) -> bool:
+        """Apply one conditional change to the backfill lease; return whether it held."""
+        row = self._execute(
+            sql.SQL(
+                "UPDATE {registry} SET meta = jsonb_set(meta, %s, {assignment}) "
+                "WHERE name = %s AND ({condition}) RETURNING 1"
+            ).format(
+                registry=self._registry(ddl.REGISTRY_COLLECTIONS),
+                assignment=assignment,
+                condition=condition,
+            ),
+            [[MAINTENANCE_KEY], *params],
+            fetch="one",
+        )
+        return row is not None
+
+    @traced("ov_postgres.take_md5_lease")
+    def take_md5_lease(self, owner: str, seconds: float) -> bool:
+        """Take the md5 backfill's lease unless a live one is held by someone else.
+
+        A row in the registry rather than a lock on a connection: it behaves
+        the same through a transaction-mode pooler, and a process that dies
+        holding it blocks the others only until it expires. Taken by one
+        conditional update, so of several takers exactly one wins.
+
+        Parameters
+        ----------
+        owner :
+            Identifies this run.
+        seconds :
+            How long the lease lasts unless renewed.
+
+        Returns
+        -------
+        bool
+            Whether this run now holds the lease.
+        """
+        annotate({"db.operation.name": "UPDATE"})
+        self._check_open()
+        lease = sql.SQL("meta->{key}->{lease}").format(
+            key=sql.Literal(MAINTENANCE_KEY), lease=sql.Literal(MD5_LEASE)
+        )
+        return self._lease_update(
+            sql.SQL(
+                "coalesce(meta->{key}, '{{}}'::jsonb) || jsonb_build_object({lease}, "
+                "jsonb_build_object('owner', %s::text, 'expires_at', "
+                "extract(epoch FROM clock_timestamp()) + %s))"
+            ).format(key=sql.Literal(MAINTENANCE_KEY), lease=sql.Literal(MD5_LEASE)),
+            sql.SQL(
+                "{lease} IS NULL OR ({lease}->>'expires_at')::float8 "
+                "< extract(epoch FROM clock_timestamp()) OR {lease}->>'owner' = %s"
+            ).format(lease=lease),
+            [owner, seconds, self._name, owner],
+        )
+
+    @traced("ov_postgres.renew_md5_lease")
+    def renew_md5_lease(self, owner: str, seconds: float) -> bool:
+        """Extend the lease if this run still holds it.
+
+        Returns
+        -------
+        bool
+            False if another process has taken it over; the run should stop.
+        """
+        annotate({"db.operation.name": "UPDATE"})
+        self._check_open()
+        lease = sql.SQL("meta->{key}->{lease}").format(
+            key=sql.Literal(MAINTENANCE_KEY), lease=sql.Literal(MD5_LEASE)
+        )
+        return self._lease_update(
+            sql.SQL(
+                "jsonb_set(meta->{key}, {path}, "
+                "to_jsonb(extract(epoch FROM clock_timestamp()) + %s))"
+            ).format(
+                key=sql.Literal(MAINTENANCE_KEY),
+                path=sql.Literal([MD5_LEASE, "expires_at"]),
+            ),
+            sql.SQL("{lease}->>'owner' = %s").format(lease=lease),
+            [seconds, self._name, owner],
+        )
+
+    @traced("ov_postgres.release_md5_lease")
+    def release_md5_lease(self, owner: str | None) -> bool:
+        """Give the lease up. ``None`` releases it whoever holds it.
+
+        Returns
+        -------
+        bool
+            Whether a lease was released.
+        """
+        annotate({"db.operation.name": "UPDATE"})
+        self._check_open()
+        lease = sql.SQL("meta->{key}->{lease}").format(
+            key=sql.Literal(MAINTENANCE_KEY), lease=sql.Literal(MD5_LEASE)
+        )
+        condition: sql.Composable = (
+            sql.SQL("{lease} IS NOT NULL").format(lease=lease)
+            if owner is None
+            else sql.SQL("{lease}->>'owner' = %s").format(lease=lease)
+        )
+        return self._lease_update(
+            sql.SQL("(meta->{key}) - {lease}::text").format(
+                key=sql.Literal(MAINTENANCE_KEY), lease=sql.Literal(MD5_LEASE)
+            ),
+            condition,
+            [self._name] if owner is None else [self._name, owner],
+        )
+
+    @traced("ov_postgres.finish_md5_backfill")
+    def finish_md5_backfill(self, generation: int) -> bool:
+        """Clear the pending mark, unless the backfill was queued again since.
+
+        Parameters
+        ----------
+        generation :
+            The generation the run started from.
+
+        Returns
+        -------
+        bool
+            Whether the mark was cleared. False means it was queued again
+            during the run, and the next run picks it up.
+        """
+        annotate({"db.operation.name": "UPDATE"})
+        self._check_open()
+        with self._lock:
+            row = self._execute(
+                sql.SQL(
+                    "UPDATE {} SET meta = jsonb_set(meta, %s, "
+                    "coalesce(meta->%s, '{{}}'::jsonb) - %s) WHERE name = %s "
+                    "AND coalesce((meta->%s->>%s)::bigint, 0) = %s RETURNING meta"
+                ).format(self._registry(ddl.REGISTRY_COLLECTIONS)),
+                (
+                    [MAINTENANCE_KEY],
+                    MAINTENANCE_KEY,
+                    MD5_BACKFILL,
+                    self._name,
+                    MAINTENANCE_KEY,
+                    MD5_GENERATION,
+                    generation,
+                ),
+                fetch="one",
+            )
+            if row is None:
+                return False
+            meta = row["meta"]
+            self._schema.raw = dict(meta if isinstance(meta, dict) else json.loads(meta))
+            return True
+
+    def _add_column(self, cur: Cursor[Any], spec: FieldSpec) -> None:
+        """Add the column(s) for one field, holding its default on every row.
+
+        ``ADD COLUMN ... DEFAULT`` with a constant fills existing rows without
+        rewriting the table. The default is dropped again straight after,
+        because this backend applies defaults on write and its tables carry no
+        column defaults; the rows already present keep the value.
+        """
+        table = self._qualified
+        if spec.is_geo:
+            for suffix in (GEO_LON_SUFFIX, GEO_LAT_SUFFIX):
+                cur.execute(
+                    sql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} real").format(
+                        table, sql.Identifier(spec.name + suffix)
+                    )
+                )
+            return
+        column = sql.Identifier(spec.name)
+        column_type = ddl.column_type(spec)
+        default = default_for(spec)
+        if default is None:
+            cur.execute(
+                sql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} {}").format(
+                    table, column, column_type
+                )
+            )
+            return
+        cur.execute(
+            sql.SQL(
+                "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {type} "
+                "DEFAULT {value}::{type}"
+            ).format(
+                table=table,
+                col=column,
+                type=column_type,
+                value=sql.Literal(self._adapt_value(spec, default)),
+            )
+        )
+        cur.execute(
+            sql.SQL("ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT").format(table, column)
+        )
+
+    def _create_new_indexes(
+        self, cur: Cursor[Any], *, before: CollectionSchema, after: CollectionSchema
+    ) -> list[str]:
+        """Build the indexes ``after`` calls for that ``before`` did not.
+
+        Only those: an index an older version of this package never built is
+        :meth:`ensure_indexes`'s business, run when an operator chooses, not
+        something to build unasked during a boot.
+
+        Returns
+        -------
+        list[str]
+            Names of the indexes built.
+        """
+        known = {entry.name for entry in self._reconcilable_index_statements(before)}
+        present = self._existing_index_names(cur)
+        built: list[str] = []
+        for entry in self._reconcilable_index_statements(after):
+            if entry.name in known or entry.name in present:
+                continue
+            cur.execute(entry.statement)
+            _stamp(cur, self._db_schema, entry)
+            present.add(entry.name)
+            built.append(entry.name)
+        return built
+
+    @traced("ov_postgres.ensure_extra_guard")
+    def ensure_extra_guard(self) -> bool:
+        """Install the extra-guard trigger if it is missing, and read what it recorded.
+
+        Runs on every boot. Guards the fields a reconcile added plus those an
+        older stack does not know -- ``md5`` and the ACL fields -- so a table
+        this version created is protected from an older writer too, not only
+        one it reconciled. And when the trigger has seen an unmarked writer add
+        a row without an md5 (an older stack, during a downgrade), it queues
+        the md5 backfill.
+
+        Returns
+        -------
+        bool
+            Whether the trigger was installed or changed.
+        """
+        annotate({"db.operation.name": "SELECT"})
+        self._check_open()
+        trigger = ddl.index_name(self._table, "extra_guard")
+        with self._lock, self._pool.connection() as conn, conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    sql.SQL("SET LOCAL lock_timeout = {}").format(
+                        sql.Literal(_RECONCILE_LOCK_TIMEOUT)
+                    )
+                )
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock(%s)",
+                    (ddl.advisory_lock_key(self._db_schema),),
+                )
+                cur.execute(
+                    sql.SQL("SELECT meta FROM {} WHERE name = %s FOR UPDATE").format(
+                        self._registry(ddl.REGISTRY_COLLECTIONS)
+                    ),
+                    (self._name,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return False
+                stored = dict(row["meta"])
+                maintenance = dict(stored.get(MAINTENANCE_KEY) or {})
+                guarded = sorted(
+                    {
+                        *maintenance.get(EXTRA_GUARD, []),
+                        *(
+                            name
+                            for name in (*_FAIL_CLOSED_FIELDS, "md5")
+                            if self._schema.by_name(name) is not None
+                        ),
+                    }
+                )
+                cur.execute(
+                    "SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = %s AND c.relname = %s AND t.tgname = %s",
+                    (self._db_schema, self._table, trigger),
+                )
+                present = cur.fetchone() is not None
+                changed = not present or maintenance.get(EXTRA_GUARD) != guarded
+                if changed:
+                    annotate({"db.operation.name": "CREATE TRIGGER"})
+                    self._install_extra_guard(
+                        cur, [self._schema.by_name(name) for name in guarded]
+                    )
+                    maintenance[EXTRA_GUARD] = guarded
+                cur.execute(
+                    sql.SQL("DELETE FROM {} WHERE collection = %s RETURNING 1").format(
+                        self._registry(ddl.REGISTRY_UNMARKED_WRITES)
+                    ),
+                    (self._name,),
+                )
+                unmarked = cur.fetchone() is not None
+                if unmarked and self._schema.by_name("md5") is not None:
+                    maintenance = _queued(maintenance)
+                if changed or unmarked:
+                    stored[MAINTENANCE_KEY] = maintenance
+                    cur.execute(
+                        sql.SQL("UPDATE {} SET meta = %s WHERE name = %s").format(
+                            self._registry(ddl.REGISTRY_COLLECTIONS)
+                        ),
+                        (json.dumps(stored), self._name),
+                    )
+                    self._schema.raw = stored
+        return changed
+
+    def _install_extra_guard(
+        self, cur: Cursor[Any], fields: list[FieldSpec | None]
+    ) -> None:
+        """Install the triggers that keep guarded fields right whatever writes them.
+
+        A server whose view predates the reconcile -- one still running from
+        before it, or an older ov-postgres -- has no column for these fields
+        and writes them into ``extra``. Read from there, every filter and
+        projection would see the column instead, and an ACL filter would let
+        a restricted row through. So before every insert and update, the
+        trigger copies such a value into its column, and gives a column left
+        NULL its default. An ACL value that does not fit its column fails the
+        write, rather than leave the row unrestricted; any other misfit stays
+        in ``extra``, as it did before.
+
+        The value stays in ``extra`` on insert and is stripped on update.
+        Such a writer upserts with ``INSERT ... ON CONFLICT DO UPDATE``, whose
+        SET list lacks the guarded columns, so the update must still find the
+        value; when no conflict happens, an AFTER INSERT trigger strips it.
+
+        On an update by a writer other than this version, a field it did not
+        supply through ``extra`` keeps the row's value: such a writer fills in
+        defaults for fields it knows nothing about, which would erase an ACL
+        restriction. And a row such a writer leaves without an md5 is recorded
+        in ``ov_unmarked_writes``, so the next boot queues the md5 backfill.
+
+        Parameters
+        ----------
+        cur :
+            A cursor inside the calling transaction.
+        fields :
+            The fields to guard.
+        """
+        setting = sql.Literal(WRITER_SETTING).as_string(cur)
+        current = sql.Literal(WRITER_CURRENT).as_string(cur)
+        branches: list[str] = [
+            f"unmarked := coalesce(current_setting({setting}, true), '') <> {current};",
+            "unaware := TG_OP = 'UPDATE' AND unmarked;",
+        ]
+        keys: list[str] = []
+        strips: list[str] = []
+        for spec in fields:
+            if spec is None or spec.ov_type not in _GUARD_CONVERSIONS:
+                continue
+            check, convert = _GUARD_CONVERSIONS[spec.ov_type]
+            key = sql.Literal(spec.name).as_string(cur)
+            column = sql.Identifier(spec.name).as_string(cur)
+            keys.append(spec.name)
+            # Only a value the BEFORE trigger copied; a misfit stays in extra.
+            strips.append(
+                f"IF NEW.extra ? {key} THEN v := NEW.extra -> {key}; "
+                f"IF {check} THEN moved := moved || {key}::text; END IF; END IF;"
+            )
+            refuse = (
+                "RAISE EXCEPTION 'ov_postgres: % in extra does not fit its column, "
+                "and an ACL value is never dropped', "
+                f"{key} USING ERRCODE = '22023';"
+                if spec.name in _FAIL_CLOSED_FIELDS
+                else "NULL;"
+            )
+            branches.append(
+                f"IF NEW.extra ? {key} THEN\n"
+                f"  v := NEW.extra -> {key};\n"
+                f"  IF {check} THEN\n"
+                f"    NEW.{column} := {convert};\n"
+                f"    IF TG_OP = 'UPDATE' THEN NEW.extra := NEW.extra - {key}; END IF;\n"
+                f"  ELSE\n    {refuse}\n  END IF;\n"
+                f"ELSIF unaware THEN\n  NEW.{column} := OLD.{column};\n"
+                "END IF;"
+            )
+            default = default_for(spec)
+            if default is not None:
+                literal = sql.SQL("{}::{}").format(
+                    sql.Literal(self._adapt_value(spec, default)), ddl.column_type(spec)
+                )
+                branches.append(
+                    f"IF NEW.{column} IS NULL THEN "
+                    f"NEW.{column} := {literal.as_string(cur)}; END IF;"
+                )
+        if not keys:
+            return
+        if "md5" in keys:
+            marker = sql.SQL(
+                "INSERT INTO {} (collection) VALUES ({}) ON CONFLICT DO NOTHING"
+            )
+            branches.append(
+                "IF unmarked AND coalesce(NEW.md5, '') = '' THEN "
+                + marker.format(
+                    self._registry(ddl.REGISTRY_UNMARKED_WRITES), sql.Literal(self._name)
+                ).as_string(cur)
+                + "; END IF;"
+            )
+        name = ddl.index_name(self._table, "extra_guard")
+        strip_name = ddl.index_name(self._table, "extra_strip")
+        function = sql.Identifier(self._db_schema, name)
+        strip_function = sql.Identifier(self._db_schema, strip_name)
+        body = (
+            "DECLARE v jsonb; unmarked boolean; unaware boolean;\nBEGIN\n"
+            + "\n".join(branches)
+            + "\nRETURN NEW;\nEND;"
+        )
+        key_array = sql.SQL("ARRAY[{}]::text[]").format(
+            sql.SQL(", ").join(sql.Literal(k) for k in keys)
+        )
+        pk = sql.Identifier(self._schema.primary_key.name)
+        strip_body = (
+            "DECLARE v jsonb; moved text[] := ARRAY[]::text[];\nBEGIN\n"
+            + "\n".join(strips)
+            + "\nIF cardinality(moved) > 0 THEN "
+            + sql.SQL("UPDATE {} SET extra = extra - moved WHERE {} = NEW.{};")
+            .format(self._qualified, pk, pk)
+            .as_string(cur)
+            + " END IF;\nRETURN NULL;\nEND;"
+        )
+        for fn, text in ((function, body), (strip_function, strip_body)):
+            cur.execute(
+                sql.SQL(
+                    "CREATE OR REPLACE FUNCTION {}() RETURNS trigger "
+                    "LANGUAGE plpgsql AS {}"
+                ).format(fn, sql.Literal(text))
+            )
+        for trigger_name in (name, strip_name):
+            cur.execute(
+                sql.SQL("DROP TRIGGER IF EXISTS {} ON {}").format(
+                    sql.Identifier(trigger_name), self._qualified
+                )
+            )
+        cur.execute(
+            sql.SQL(
+                "CREATE TRIGGER {} BEFORE INSERT OR UPDATE ON {} "
+                "FOR EACH ROW EXECUTE FUNCTION {}()"
+            ).format(sql.Identifier(name), self._qualified, function)
+        )
+        cur.execute(
+            sql.SQL(
+                "CREATE TRIGGER {} AFTER INSERT ON {} FOR EACH ROW "
+                "WHEN (NEW.extra ?| {}) EXECUTE FUNCTION {}()"
+            ).format(
+                sql.Identifier(strip_name), self._qualified, key_array, strip_function
+            )
+        )
+
+    def _move_extra_into_columns(self, cur: Cursor[Any], added: list[FieldSpec]) -> int:
+        """Move values written under the new fields' names out of ``extra``.
+
+        A field OpenViking sent before this table had a column for it was kept
+        in ``extra``. Walked by primary key in pages, so memory stays bounded
+        and each row is visited once even when a value cannot be moved.
+
+        Returns
+        -------
+        int
+            How many values were moved.
+        """
+        movable = {spec.name: spec for spec in added if not spec.is_geo}
+        if not movable:
+            return 0
+        keys = sorted(movable)
+        pk = sql.Identifier(self._schema.primary_key.name)
+        page = sql.SQL(
+            "SELECT {pk} AS pk, extra FROM {table} "
+            "WHERE extra ?| %s::text[] AND ({pk} > %s OR %s) "
+            "ORDER BY {pk} LIMIT %s"
+        ).format(pk=pk, table=self._qualified)
+        moved = 0
+        after: object = None
+        while True:
+            cur.execute(page, (keys, after, after is None, _EXTRA_MOVE_PAGE))
+            rows = cur.fetchall()
+            for row in rows:
+                extra = row["extra"] if isinstance(row["extra"], dict) else {}
+                columns: list[sql.Composable] = []
+                values: list[Any] = []
+                taken: list[str] = []
+                for name in keys:
+                    if name not in extra:
+                        continue
+                    spec = movable[name]
+                    try:
+                        if spec.ov_type in CHECKED_TYPES and not fits(spec, extra[name]):
+                            raise TypeError(f"{extra[name]!r} is not a {spec.ov_type}")
+                        values.append(self._adapt_value(spec, extra[name]))
+                    except (TypeError, ValueError, OverflowError) as exc:
+                        if name in _FAIL_CLOSED_FIELDS:
+                            raise ValueError(
+                                f"cannot move {name!r} out of extra for row "
+                                f"{row['pk']!r} of {self._db_schema}.{self._table}: "
+                                f"{exc}. Fix or remove that value; until then the "
+                                "collection refuses queries rather than read the "
+                                "row as unrestricted."
+                            ) from exc
+                        logger.warning(
+                            "ov_postgres: left %r in extra for row %r of %s.%s; "
+                            "the value does not fit the new %s column",
+                            name,
+                            row["pk"],
+                            self._db_schema,
+                            self._table,
+                            movable[name].ov_type,
+                        )
+                        continue
+                    columns.append(sql.SQL("{} = %s").format(sql.Identifier(name)))
+                    taken.append(name)
+                if taken:
+                    cur.execute(
+                        sql.SQL(
+                            "UPDATE {} SET {}, extra = extra - %s::text[] WHERE {} = %s"
+                        ).format(self._qualified, sql.SQL(", ").join(columns), pk),
+                        [*values, taken, row["pk"]],
+                    )
+                    moved += len(taken)
+            if len(rows) < _EXTRA_MOVE_PAGE:
+                return moved
+            after = rows[-1]["pk"]
+
+    def _reconcilable_index_statements(
+        self, schema: CollectionSchema | None = None
+    ) -> list[ddl.IndexStatement]:
         """Return the scalar and full-text index statements for this collection.
 
         Names are assigned in the same order as ``create_index``, so a field
@@ -2305,21 +3523,27 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         method recorded at creation, which reconciliation must not silently
         change.
 
+        Parameters
+        ----------
+        schema :
+            The schema to build for; the collection's own when omitted.
+
         Returns
         -------
         list[ddl.IndexStatement]
             ``CREATE INDEX`` statements with their names, full-text last.
         """
+        coll_schema = schema or self._schema
         taken: set[str] = set()
         fts = ddl.fulltext_index_statement(
             self._db_schema,
             self._table,
-            self._fulltext_specs(),
+            self._fulltext_specs(coll_schema),
             self._text_search_config,
             taken,
         )
         statements = ddl.scalar_index_statements(
-            self._db_schema, self._table, self._schema, taken
+            self._db_schema, self._table, coll_schema, taken
         )
         if fts is not None:
             statements.append(fts)
@@ -2362,17 +3586,23 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         """
         return {entry.name for entry in self._reconcilable_index_statements()}
 
-    def _fulltext_specs(self) -> list[FieldSpec]:
+    def _fulltext_specs(self, schema: CollectionSchema | None = None) -> list[FieldSpec]:
         """Return the schema fields backing keyword search.
+
+        Parameters
+        ----------
+        schema :
+            The schema to read; the collection's own when omitted.
 
         Returns
         -------
         list[FieldSpec]
             Declared, textual columns among the configured keyword fields.
         """
+        coll_schema = schema or self._schema
         specs: list[FieldSpec] = []
-        for name in fulltext_candidates(self._schema, self._keyword_fields):
-            spec = self._schema.by_name(name)
+        for name in fulltext_candidates(coll_schema, self._keyword_fields):
+            spec = coll_schema.by_name(name)
             if spec is not None:
                 specs.append(spec)
         return specs

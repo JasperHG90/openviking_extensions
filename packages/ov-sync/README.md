@@ -272,13 +272,18 @@ $ uv run mypy src tests
 
 Or run the repo's gates the way CI does: `prek run --all-files`.
 
-Integration tests hit a real server, so they stay out of the default run. Point
-them at a `viking://` parent they may create and remove directories under:
+Integration tests hit a real server, so they stay out of the default run. With
+docker available they start their own: OpenViking 0.5.6 in `oidc` mode trusting
+a dev-mode Vault, signed in with a Vault identity token, as the lab runs it:
 
 ```console
-$ OV_SYNC_TEST_ROOT=viking://resources uv run pytest -m integration
+$ uv run pytest -m integration
 ```
 
-They skip without that variable. They are worth running before a release: both
-bugs that reached the first working version were disagreements between the
-mocks and the real API, which only these catch.
+`OV_TEST_IMAGE` picks another OpenViking image. To use a server you already
+run instead, set `OV_SYNC_TEST_ROOT` to a `viking://` parent the tests may
+create and remove directories under; credentials then come from the `ov` CLI
+config, or `OV_SYNC_URL` and `OV_SYNC_API_KEY`. Without docker and without that
+variable they skip. They are worth running before a release: both bugs that
+reached the first working version were disagreements between the mocks and the
+real API, which only these catch.

@@ -1,10 +1,13 @@
 """Compile OpenViking's filter DSL into parameterised SQL.
 
 The DSL is the one emitted by ``CollectionAdapter._compile_filter``
-(openviking/storage/vectordb_adapters/base.py) and evaluated in pure Python by
-``matches_filter`` in openviking/storage/vectordb/index/cuvs_index.py.  That
-Python evaluator is the reference semantics this module reproduces in SQL --
-where the two disagree, the Python one is right and this is a bug.
+(openviking/storage/vectordb_adapters/base.py). The reference semantics this
+module reproduces in SQL are those of ``matches_filter``, the pure-Python
+evaluator OpenViking 0.4 shipped in openviking/storage/vectordb/index/
+cuvs_index.py; "the reference" below means that evaluator. OpenViking 0.5
+removed it and evaluates filters in its native engine, which the integration
+suite now compares against wherever that engine parses a filter
+(tests/reference.py; tests/test_integration.py lists where the two differ).
 
 Nodes have the shape::
 
@@ -48,7 +51,7 @@ class UnsupportedFilterError(ValueError):
 
 
 def parse_depth(para: object) -> int | None:
-    """Parse the ``-d=N`` path-scope parameter. Mirrors cuvs_index._parse_depth."""
+    """Parse the ``-d=N`` path-scope parameter, refusing anything malformed."""
     if para in (None, ""):
         return None
     if not isinstance(para, str):

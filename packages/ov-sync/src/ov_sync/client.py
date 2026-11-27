@@ -557,8 +557,14 @@ class OvClient:
         )
         return _parse_result(BatchWriteResult, result, "/content/batch-write")
 
-    def rm(self, uri: str, *, recursive: bool = False, wait: bool = False) -> bool:
-        """Remove a resource.
+    def rm(self, uri: str, *, recursive: bool = False, wait: bool = False) -> None:
+        """Remove a resource. Removing one that is already gone is not an error.
+
+        Nothing comes back to say whether anything was there, because the
+        server does not know either: OpenViking 0.4.17.1 and 0.5.6 both answer
+        a delete of a missing URI with success, and the
+        ``estimated_deleted_count`` they report counts index records, so it is
+        0 for a file that has not been indexed yet.
 
         Parameters
         ----------
@@ -568,11 +574,6 @@ class OvClient:
             Remove a directory and everything under it.
         wait :
             Wait for the semantic index to catch up.
-
-        Returns
-        -------
-        bool
-            True if something was removed, False if it was already gone.
         """
         try:
             self._send_idempotent(
@@ -581,8 +582,7 @@ class OvClient:
                 params={"uri": uri, "recursive": recursive, "wait": wait},
             )
         except NotFoundError:
-            return False
-        return True
+            return
 
     def snapshot_commit(
         self, message: str, paths: list[str] | None = None

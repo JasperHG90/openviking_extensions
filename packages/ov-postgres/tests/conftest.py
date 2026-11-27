@@ -18,7 +18,6 @@ from __future__ import annotations
 import os
 import uuid
 from collections.abc import Iterator
-from dataclasses import dataclass
 
 import pytest
 from opentelemetry import trace
@@ -141,40 +140,19 @@ def test_schema(dsn: str, _verify_pgvector: bool) -> Iterator[str]:
             )
 
 
-# Dimension the test collections declare. Must match `TEST_DIMENSION` in
-# tests/test_integration.py.
-TEST_DIMENSION = 8
+@pytest.fixture(scope="session", autouse=True)
+def _empty_openviking_config(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[None]:
+    """Point OpenViking at an empty config file for the whole session.
 
-
-@dataclass(frozen=True)
-class _StubEmbedding:
-    """The one embedding attribute the adapter reads from global config."""
-
-    dimension: int
-
-
-@dataclass(frozen=True)
-class _StubConfig:
-    """Stand-in for the global OpenViking config during tests."""
-
-    embedding: _StubEmbedding
-
-
-@pytest.fixture(autouse=True)
-def _fixed_embedding_dimension(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pin the embedding dimension the adapter reads from global config.
-
-    ``CollectionAdapter.query`` builds a random vector for filter-only queries,
-    sized from ``get_openviking_config().embedding.dimension`` -- the single
-    global-config read in that module. Left alone the suite would consult the
-    developer's real ``~/.openviking/ov.conf``, making results depend on a file
-    no test wrote. ``EmbeddingConfig.dimension`` is a read-only property, so a
-    stub is used rather than a mutated copy.
+    OpenViking 0.5's ``VikingVectorIndexBackend`` reads the global config on
+    construction, to set up its native logging. Left alone it would read the
+    developer's own ``~/.openviking/ov.conf``, or fail where there is none, as
+    on CI. An empty file gives OpenViking's defaults everywhere.
     """
-    from openviking.storage.vectordb_adapters import base
-
-    monkeypatch.setattr(
-        base,
-        "get_openviking_config",
-        lambda: _StubConfig(embedding=_StubEmbedding(dimension=TEST_DIMENSION)),
-    )
+    path = tmp_path_factory.mktemp("openviking") / "ov.conf"
+    path.write_text("{}")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("OPENVIKING_CONFIG_FILE", str(path))
+        yield

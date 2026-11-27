@@ -82,7 +82,7 @@ testpaths = ["tests"]
 # they stay out of the default run. Ask for them with `uv run pytest -m integration`.
 addopts = "-m 'not integration'"
 markers = [
-    "integration: needs a reachable OpenViking server and a writable target scope",
+    "integration: needs docker to start OpenViking, or a reachable server and a writable scope",
 ]
 
 [tool.ruff]

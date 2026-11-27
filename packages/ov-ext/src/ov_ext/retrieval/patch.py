@@ -12,13 +12,22 @@ module, so rebinding that single attribute reaches both sites, and any site
 added later, without patching either of them.
 
 This is still a monkeypatch on somebody else's package. :func:`install`
-verifies what it is replacing and refuses to guess, so an upstream change
-surfaces as a clear error at startup rather than as retrieval quietly
-reverting to vector-only months later.
+verifies what it is replacing, and the private backend methods the keyword leg
+calls, and refuses to guess, so an upstream change surfaces as a clear error at
+startup rather than as retrieval quietly reverting to vector-only months later.
+
+One retriever is deliberately left alone. The Skills API's package search,
+``SkillPackageRetriever``, subclasses ``HierarchicalRetriever`` at import time,
+so rebinding the name never reaches it. Patching it would buy nothing: it has
+its own ``retrieve_skills``, which pages the vector search and collapses files
+into packages, and calls neither ``retrieve`` nor ``_rerank_scores`` -- the two
+methods this package overrides. ``find`` and ``search`` with a skill context
+type still go through the patched retriever.
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Any
 
@@ -32,6 +41,20 @@ logger = logging.getLogger(__name__)
 
 _MODULE = "openviking.retrieve.hierarchical_retriever"
 _ATTRIBUTE = "HierarchicalRetriever"
+
+# Arguments the keyword leg passes to the backend's `_build_scope_filter`. A
+# required parameter outside this set is one ov-ext does not know to supply.
+_SCOPE_ARGUMENTS = frozenset(
+    {
+        "self",
+        "ctx",
+        "context_type",
+        "target_directories",
+        "extra_filter",
+        "level",
+        "acl_enabled",
+    }
+)
 
 # The class displaced by install(), so uninstall() can put it back. Module
 # state because the patch is process-global: there is nothing else to hang it
@@ -54,9 +77,10 @@ def install(settings: HybridSettings | None = None) -> None:
     Raises
     ------
     RuntimeError
-        If the expected class is not where it should be, or is not a class.
-        Better a refused startup than retrieval silently losing its keyword
-        leg and its diversity pass.
+        If the expected class is not where it should be, is not a class, or
+        the backend methods the keyword leg calls have changed shape. Better a
+        refused startup than retrieval silently losing its keyword leg and its
+        diversity pass.
     pydantic.ValidationError
         If ``settings`` is omitted and the environment holds a bad or
         misspelled ``OV_RETRIEVAL_`` variable, since the settings are then read
@@ -84,7 +108,14 @@ def install(settings: HybridSettings | None = None) -> None:
             f"{_MODULE}.{_ATTRIBUTE} is {type(current)!r}, not a class. Refusing "
             "to replace something whose shape is not understood."
         )
-    # After both refusals above, so a startup this function is going to reject
+    _check_backend_contract()
+    if not callable(getattr(current, "_rerank_scores", None)):
+        raise RuntimeError(
+            f"{_MODULE}.{_ATTRIBUTE} has no _rerank_scores. The document cap "
+            "overrides it; this OpenViking reranks some other way."
+        )
+
+    # After the refusals above, so a startup this function is going to reject
     # leaves nothing patched behind it. Otherwise the RuntimeError path would
     # exit with the rerank client swapped and nobody left to call uninstall().
     #
@@ -118,6 +149,52 @@ def install(settings: HybridSettings | None = None) -> None:
 
     setattr(module, _ATTRIBUTE, _ConfiguredHybridRetriever)
     logger.info("ov-ext: hybrid retrieval installed over %s", current.__name__)
+
+
+def _check_backend_contract() -> None:
+    """Refuse to start if the keyword leg's backend calls no longer fit.
+
+    The keyword leg scopes its search with the vector store's private
+    ``_build_scope_filter`` and asks ``_acl_enabled`` for the flag it needs.
+    It catches failures at query time and falls back to vector-only, which is
+    right for an outage and wrong for a signature change: the server would
+    look healthy and lose its keyword leg on every search. So the signature is
+    checked here, once.
+
+    Raises
+    ------
+    RuntimeError
+        If either method is missing, or the scope builder requires an argument
+        ov-ext does not pass.
+    """
+    import importlib
+
+    module = importlib.import_module("openviking.storage.viking_vector_index_backend")
+    backend = getattr(module, "VikingVectorIndexBackend", None)
+    build_scope = getattr(backend, "_build_scope_filter", None)
+    if build_scope is None or not callable(getattr(backend, "_acl_enabled", None)):
+        raise RuntimeError(
+            "VikingVectorIndexBackend lacks _build_scope_filter or _acl_enabled, "
+            "which the keyword leg uses to stay inside the user's scope. This "
+            "OpenViking is not one ov-ext supports."
+        )
+    params = inspect.signature(build_scope).parameters
+    unknown = sorted(
+        name
+        for name, param in params.items()
+        if param.default is inspect.Parameter.empty
+        and param.kind not in (param.VAR_POSITIONAL, param.VAR_KEYWORD)
+        and name not in _SCOPE_ARGUMENTS
+    )
+    takes_any = any(param.kind is param.VAR_KEYWORD for param in params.values())
+    refused = [] if takes_any else sorted(_SCOPE_ARGUMENTS - set(params))
+    if unknown or refused:
+        raise RuntimeError(
+            "VikingVectorIndexBackend._build_scope_filter no longer matches the "
+            f"call the keyword leg makes (requires: {', '.join(unknown) or '-'}; "
+            f"does not take: {', '.join(refused) or '-'}). This OpenViking is "
+            "not one ov-ext supports."
+        )
 
 
 def uninstall() -> None:

@@ -328,7 +328,7 @@ class TestSpansFromRealQueries:
         steady-state path, where it only reads the catalog.
         """
         from .test_backends import build
-        from .test_integration import vec
+        from .test_integration import META, vec
 
         adapter = build(dsn, test_schema)
         try:
@@ -362,6 +362,26 @@ class TestSpansFromRealQueries:
             collection.pairwise_similarity(["a", "b"])
             collection.backfill_defaults()
             collection.ensure_indexes()
+            collection.reconcile_schema(
+                {
+                    **META,
+                    "Fields": [
+                        *META["Fields"],
+                        {"FieldName": "probe_field", "FieldType": "string"},
+                        {"FieldName": "md5", "FieldType": "string"},
+                        {"FieldName": "account_id", "FieldType": "string"},
+                    ],
+                    "ScalarIndex": [*META["ScalarIndex"], "probe_field"],
+                }
+            )
+            collection.ensure_extra_guard()
+            collection.md5_backfill_batch(None, 10)
+            collection.record_md5("b", "probe")
+            collection.take_md5_lease("probe", 60.0)
+            collection.renew_md5_lease("probe", 60.0)
+            collection.release_md5_lease("probe")
+            collection._queue_md5_backfill()
+            collection.finish_md5_backfill(collection.md5_backfill_generation())
             collection.create_index("probe_index", {})
             collection.update_index("probe_index", description="probe")
             collection.drop_index("probe_index")
@@ -416,6 +436,15 @@ class TestSpansFromRealQueries:
         assert declared == {
             "ov_postgres.get_meta_data": "SELECT",
             "ov_postgres.update": "UPDATE",
+            "ov_postgres.reconcile_schema": "ALTER TABLE",
+            "ov_postgres.ensure_extra_guard": "SELECT",
+            "ov_postgres.md5_backfill_batch": "SELECT",
+            "ov_postgres.record_md5": "UPDATE",
+            "ov_postgres.take_md5_lease": "UPDATE",
+            "ov_postgres.renew_md5_lease": "UPDATE",
+            "ov_postgres.release_md5_lease": "UPDATE",
+            "ov_postgres.queue_md5_backfill": "UPDATE",
+            "ov_postgres.finish_md5_backfill": "UPDATE",
             "ov_postgres.list_indexes": "SELECT",
             "ov_postgres.has_index": "SELECT",
             "ov_postgres.get_index_meta_data": "SELECT",

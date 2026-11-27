@@ -38,6 +38,10 @@ class IndexStatement(NamedTuple):
 # ``get_meta_data`` / ``list_indexes`` return exactly what was declared.
 REGISTRY_COLLECTIONS = "ov_collections"
 REGISTRY_INDEXES = "ov_indexes"
+# Collections an unmarked writer -- one that is not this version -- has written
+# a row without an md5 to. The extra-guard trigger adds the collection; the
+# next boot queues the md5 backfill and clears it.
+REGISTRY_UNMARKED_WRITES = "ov_unmarked_writes"
 
 # PostgreSQL truncates identifiers at this many bytes, silently.
 _MAX_IDENTIFIER_BYTES = 63
@@ -159,6 +163,9 @@ def bootstrap_statements(
             )
             """
         ).format(ns, sql.Identifier(REGISTRY_INDEXES)),
+        sql.SQL("CREATE TABLE IF NOT EXISTS {}.{} (collection text PRIMARY KEY)").format(
+            ns, sql.Identifier(REGISTRY_UNMARKED_WRITES)
+        ),
         *(delta_table_statements(schema_name) if keep_deltas else []),
     ]
 
@@ -214,7 +221,7 @@ def index_name(table: str, *parts: str, taken: set[str] | None = None) -> str:
 def _path_matches_fn(schema_name: str) -> Statement:
     """Build the path-scope helper, a port of ``_path_matches``.
 
-    Kept equivalent to the Python reference in
+    Kept equivalent to the Python reference in OpenViking 0.4's
     ``openviking/storage/vectordb/index/cuvs_index.py``: normalise both sides
     to a leading slash and no trailing slash, compute the relative depth of
     *value* beneath *expected*, and compare against the depth budget (negative
@@ -356,7 +363,7 @@ _COLUMN_TYPES: dict[str, sql.SQL] = {
 }
 
 
-def _column_type(spec: FieldSpec) -> sql.Composable:
+def column_type(spec: FieldSpec) -> sql.Composable:
     """Return the PostgreSQL column type for a field.
 
     Parameters
@@ -412,7 +419,7 @@ def create_table(schema_name: str, table: str, coll: CollectionSchema) -> Statem
                     sql.SQL("{} real").format(sql.Identifier(spec.name + suffix))
                 )
             continue
-        column = sql.SQL("{} {}").format(sql.Identifier(spec.name), _column_type(spec))
+        column = sql.SQL("{} {}").format(sql.Identifier(spec.name), column_type(spec))
         if spec.is_primary:
             column = sql.SQL("{} PRIMARY KEY").format(column)
         columns.append(column)

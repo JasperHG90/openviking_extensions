@@ -20,25 +20,41 @@ import json
 import logging
 import re
 import threading
+import time
 from collections.abc import Sequence
 from typing import Any
 
+from openviking.storage.expr import FilterExpr
 from openviking.storage.vectordb.collection.collection import Collection
-from openviking.storage.vectordb_adapters.base import CollectionAdapter
+from openviking.storage.vectordb_adapters.base import (
+    CollectionAdapter,
+    _normalize_result_score,
+)
 from psycopg import sql
 from psycopg_pool import ConnectionPool
 
 from . import ddl
 from .collection import PgVectorCollection
+from .compat import check_openviking_version
 from .config import DSN_ENV_VARS, PgVectorParams, VectorDBConfigLike, resolve_dsn
+from .md5_backfill import BATCH_SIZE, FileReader, run_md5_backfill
 from .observability import DB_SYSTEM, annotate, traced
 from .schema import CollectionSchema
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["DSN_ENV_VARS", "PgVectorCollectionAdapter"]
+__all__ = ["DSN_ENV_VARS", "MODE", "PgVectorCollectionAdapter"]
 
 _IDENT_SAFE = re.compile(r"[^a-z0-9_]+")
+
+# What this adapter reports as its `mode`. Not "pgvector": since 0.5.5 that
+# names OpenViking's own PostgreSQL backend, and OpenViking branches on it.
+# `CollectionAdapter.query` passes an event-time-decay request through raw
+# for "pgvector", expecting that backend's SQL to apply it, and the
+# incremental inventory scan probes for NULL timestamps the way that backend
+# sorts them. Neither holds here. Under a name OpenViking does not know, every
+# path takes the generic route, and `query` below applies time decay itself.
+MODE = "ov_postgres"
 
 # PostgreSQL truncates identifiers at 63 bytes.
 _MAX_IDENTIFIER_LENGTH = 63
@@ -65,7 +81,7 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
     Attributes
     ----------
     mode : str
-        Backend identifier reported to OpenViking; always ``"pgvector"``.
+        Backend identifier reported to OpenViking; always ``MODE``.
     USE_CONTENT_FIELD : bool
         Whether OpenViking should write each record's body text to the
         ``content`` column. Taken from ``params.store_content``.
@@ -78,6 +94,12 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
     # The same collection as `_collection`, before OpenViking's facade wraps
     # it. Kept so this backend's own methods stay reachable.
     _pg_collection: PgVectorCollection | None
+
+    # Least time between two attempts at a failed schema reconcile. In between,
+    # requests are refused at once instead of each waiting out a fresh attempt
+    # -- which can take the reconcile's whole lock timeout -- under the
+    # adapter's lock.
+    _RECONCILE_RETRY_SECONDS: float = 5.0
 
     # PostgreSQL has no per-statement row cap; batching uses executemany.
     _DATA_BATCH_SIZE: int | None = None
@@ -101,13 +123,17 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
     # `content` at 1 MiB of *characters*, which is up to 4 MiB of UTF-8, so its
     # cap alone does not keep us under the limit.
     #
-    # The base class truncates each field in ``_TRUNCATABLE_TEXT_FIELDS``
-    # ("content", "abstract") to this many bytes, on a UTF-8 character
-    # boundary. Both can land in one tsvector alongside the shorter keyword
-    # columns, so the budget is set below half the limit rather than at it.
-    # Applied whether or not `store_content` is on: a large `abstract` is in
-    # the default keyword fields and could overflow the same index on its own.
+    # The base class truncates ``content`` (``_TRUNCATABLE_TEXT_FIELDS``) to
+    # ``_TEXT_FIELD_BYTE_LIMIT`` bytes and ``abstract``
+    # (``_TRUNCATABLE_STRING_FIELDS``) to ``_STRING_FIELD_BYTE_LIMIT``, each on
+    # a UTF-8 character boundary. A limit left at ``None`` truncates nothing,
+    # so both are set. The two fields can land in one tsvector alongside the
+    # shorter keyword columns, so each budget is below half the limit rather
+    # than at it. Applied whether or not `store_content` is on: a large
+    # `abstract` is in the default keyword fields and could overflow the same
+    # index on its own.
     _TEXT_FIELD_BYTE_LIMIT: int = 448 * 1024
+    _STRING_FIELD_BYTE_LIMIT: int = 448 * 1024
 
     def __init__(
         self,
@@ -119,7 +145,7 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
         sparse_weight: float = 0.0,
     ) -> None:
         super().__init__(collection_name=collection_name, index_name=index_name)
-        self.mode = "pgvector"
+        self.mode = MODE
         self._dsn = dsn
         self._params = params
         # Shadows the class attribute, so one collection can store bodies while
@@ -131,6 +157,10 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
         self._bootstrapped = False
         self._pgvector_version: tuple[int, ...] = ()
         self._lock = threading.RLock()
+        # The schema of a reconcile that failed, kept for the retry in
+        # `get_collection`; see `_reconcile`.
+        self._pending_reconcile: dict[str, Any] | None = None
+        self._last_reconcile_attempt = 0.0
 
     @classmethod
     def from_config(cls, config: VectorDBConfigLike) -> PgVectorCollectionAdapter:
@@ -154,11 +184,15 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
 
         Raises
         ------
+        RuntimeError
+            If the installed OpenViking is outside the range this package was
+            tested against; see :mod:`ov_postgres.compat`.
         pydantic.ValidationError
             If ``custom_params`` contains an unknown or invalid option.
         ValueError
             If no connection string is configured.
         """
+        check_openviking_version()
         raw_params = getattr(config, "custom_params", None) or {}
         params = PgVectorParams.model_validate(raw_params)
 
@@ -359,6 +393,310 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
 
         return self._build_collection(coll_schema, table_name)
 
+    @traced("ov_postgres.ensure_collection")
+    def create_collection(
+        self,
+        name: str,
+        schema: dict[str, Any],
+        *,
+        distance: str,
+        sparse_weight: float,
+        index_name: str,
+    ) -> bool:
+        """Create the collection, or bring an existing one up to ``schema``.
+
+        OpenViking calls this on every boot with its full current schema, and
+        migrates an existing collection itself only for its ``local`` and
+        ``cuvs`` backends. So the existing case is where a table created by an
+        older OpenViking gains the fields added since -- ``md5`` and the ACL
+        fields among them -- along with their scalar indexes. Only ever adds;
+        see :meth:`PgVectorCollection.reconcile_schema`.
+
+        Parameters
+        ----------
+        name :
+            Collection name.
+        schema :
+            The collection schema.
+        distance :
+            Distance metric for a new collection's vector index.
+        sparse_weight :
+            Sparse weight for a new collection's index bundle.
+        index_name :
+            Name of a new collection's index bundle.
+
+        Returns
+        -------
+        bool
+            True if the collection was created, False if it already existed.
+        """
+        if not self.collection_exists():
+            created: bool = super().create_collection(
+                name,
+                schema,
+                distance=distance,
+                sparse_weight=sparse_weight,
+                index_name=index_name,
+            )
+            # Through `_reconcile` for the guard, so a guard that cannot be
+            # installed fails closed exactly as a failed reconcile does.
+            self._reconcile(dict(schema))
+            return created
+        self._reconcile(dict(schema))
+        inner = self._pg_collection
+        if inner is not None and inner.md5_backfill_pending():
+            logger.warning(
+                "ov_postgres: %s has rows with no md5, so OpenViking's next reindex "
+                "would re-embed every one. The backfill runs by itself under "
+                "ov-ext-server; without ov-ext, await run_md5_backfill(viking_fs) "
+                "on this adapter once the server has started",
+                self._collection_name,
+            )
+        return False
+
+    async def run_md5_backfill(
+        self, viking_fs: FileReader, *, batch_size: int = BATCH_SIZE
+    ) -> int:
+        """Fill in ``md5`` on rows a reconcile left without one.
+
+        Needs the running server's ``VikingFS``, because the md5 is of the
+        stored file's bytes and only the server's filesystem holds them, and
+        decrypts them when encryption at rest is on. ov-ext starts this by
+        itself once the server has started. Safe to run more than once, and to
+        run beside normal traffic. See :mod:`ov_postgres.md5_backfill`.
+
+        Parameters
+        ----------
+        viking_fs :
+            The server's ``VikingFS``.
+        batch_size :
+            Rows read per round trip.
+
+        Returns
+        -------
+        int
+            How many rows were given an md5; 0 when nothing was pending.
+        """
+        self.get_collection()
+        inner = self._pg_collection
+        if inner is None:
+            return 0
+        return await run_md5_backfill(
+            inner, viking_fs, self._decode_uri_field_value, batch_size=batch_size
+        )
+
+    @traced("ov_postgres.reconcile")
+    def _reconcile(self, schema: dict[str, Any]) -> None:
+        """Reconcile the table against ``schema``, failing closed on any error.
+
+        OpenViking's own ``create_collection`` catches every exception and
+        logs it. A table left without the ACL columns reads every row as
+        unrestricted, so a failure is remembered here instead, and
+        :meth:`get_collection` -- the way every query and write reaches the
+        table -- refuses to serve until a retry succeeds.
+
+        The reconcile counts as done only once this process's view of the
+        table has been rebuilt from the new schema. Rebuilding queries the
+        database again after the reconcile's transaction has committed; if
+        that fails, the old view, with no ACL fields, must not serve. A retry
+        then finds the table current and the view stale, and rebuilds.
+
+        Parameters
+        ----------
+        schema :
+            The collection schema OpenViking passed to ``create_collection``.
+
+        Raises
+        ------
+        Exception
+            Whatever the reconcile raised, after recording it.
+        """
+        with self._lock:
+            inner = self._pg_collection
+            if inner is None:
+                return
+            try:
+                reconciled = inner.reconcile_schema(schema)
+                if reconciled is not None:
+                    # Rebuilt rather than patched: the filter compiler, the
+                    # projection and the keyword fields all derive from it.
+                    self._collection = self._build_collection(
+                        CollectionSchema.from_meta(reconciled), inner.table_name
+                    )
+                    inner.close()
+                # Part of the reconcile: without the guard an older writer could
+                # erase a row's ACL, so a guard that cannot be installed keeps
+                # the table from serving just as a failed reconcile does.
+                current = self._pg_collection
+                if current is not None:
+                    current.ensure_extra_guard()
+            except Exception as exc:
+                self._pending_reconcile = schema
+                self._last_reconcile_attempt = time.monotonic()
+                logger.error(
+                    "ov_postgres: schema reconcile of %s failed (%s: %s); the "
+                    "collection refuses queries until a retry succeeds",
+                    self._collection_name,
+                    type(exc).__name__,
+                    exc,
+                )
+                raise
+            self._pending_reconcile = None
+
+    def get_collection(self) -> Collection:
+        """Return the collection, retrying a failed reconcile first.
+
+        Every query and write in OpenViking's ``CollectionAdapter`` goes
+        through here, so this is where a table the reconcile could not bring up
+        to date is kept from serving.
+
+        Returns
+        -------
+        Collection
+            The collection handle.
+
+        Raises
+        ------
+        RuntimeError
+            If an earlier reconcile failed and has not since succeeded. A retry
+            is made at most once every ``_RECONCILE_RETRY_SECONDS``; in between
+            the call is refused at once.
+        """
+        if self._pending_reconcile is not None:
+            # Checked again under the lock: requests that arrive together as
+            # the window opens must share one retry, not each run their own.
+            with self._lock:
+                pending = self._pending_reconcile
+                if pending is not None:
+                    self._retry_reconcile(pending)
+        collection: Collection = super().get_collection()
+        return collection
+
+    def _retry_reconcile(self, pending: dict[str, Any]) -> None:
+        """Retry a failed reconcile if the retry window is open, else refuse.
+
+        Call with ``self._lock`` held, so the window is read and the attempt
+        made by one thread at a time.
+
+        Parameters
+        ----------
+        pending :
+            The schema of the reconcile that failed.
+
+        Raises
+        ------
+        RuntimeError
+            If the window is still closed, or the retry fails.
+        """
+        wait = (
+            self._last_reconcile_attempt
+            + self._RECONCILE_RETRY_SECONDS
+            - time.monotonic()
+        )
+        if wait > 0:
+            raise RuntimeError(
+                f"collection {self._collection_name!r} is not served: its schema "
+                f"reconcile failed and is retried in {wait:.1f}s. Without the "
+                "fields it adds, ACL filters would let restricted rows through."
+            )
+        try:
+            self._reconcile(pending)
+        except Exception as exc:
+            raise RuntimeError(
+                f"collection {self._collection_name!r} is not served: its schema "
+                f"reconcile failed ({type(exc).__name__}: {exc}). Without the "
+                "fields it adds, ACL filters would let restricted rows through."
+            ) from exc
+
+    def query(
+        self,
+        *,
+        query_vector: list[float] | None = None,
+        sparse_query_vector: dict[str, float] | None = None,
+        filter: dict[str, Any] | FilterExpr | None = None,  # OpenViking's name
+        limit: int = 10,
+        offset: int = 0,
+        output_fields: list[str] | None = None,
+        order_by: str | None = None,
+        order_desc: bool = False,
+        advance: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Query as OpenViking's base adapter does, applying event time decay too.
+
+        OpenViking hands every backend an event-time-decay request as
+        ``advance={"time_decay": {"protection": ..., "origin": ...}}``, and
+        compiles it for the backends it knows by mode. This one it does not
+        know, so the request is compiled here, with OpenViking's own
+        ``build_time_decay_fusion_spec``, and applied by
+        :meth:`PgVectorCollection.search_by_vector`: each similarity is
+        multiplied by the fixed curve over ``updated_at``, and a row with no
+        timestamp keeps its score. Every other query is the base class's.
+
+        Parameters
+        ----------
+        query_vector, sparse_query_vector, filter, limit, offset, output_fields,
+        order_by, order_desc, advance :
+            As ``CollectionAdapter.query``.
+
+        Returns
+        -------
+        list[dict[str, Any]]
+            Matching records, with ``_origin_score`` and ``_time_score`` beside
+            ``_score`` when time decay applied.
+        """
+        request = (advance or {}).get("time_decay")
+        if request is None or not (query_vector or sparse_query_vector):
+            # Without a vector OpenViking ignores the request, as it does here.
+            records: list[dict[str, Any]] = super().query(
+                query_vector=query_vector,
+                sparse_query_vector=sparse_query_vector,
+                filter=filter,
+                limit=limit,
+                offset=offset,
+                output_fields=output_fields,
+                order_by=order_by,
+                order_desc=order_desc,
+                advance=None if request is not None else advance,
+            )
+            return records
+        from openviking.utils.time_decay import build_time_decay_fusion_spec
+        from openviking.utils.time_utils import parse_iso_datetime
+
+        spec = build_time_decay_fusion_spec(
+            protection=request["protection"],
+            origin=parse_iso_datetime(request["origin"]),
+        )
+        result = self.get_collection().search_by_vector(
+            index_name=self._index_name,
+            dense_vector=query_vector,
+            sparse_vector=sparse_query_vector,
+            limit=limit,
+            offset=offset,
+            filters=self._compile_filter(filter),
+            output_fields=output_fields,
+            advance={
+                "time_decay": {
+                    "field": spec.field,
+                    "origin_ms": spec.origin_ms,
+                    "offset_ms": spec.offset_ms,
+                    "scale_ms": spec.scale_ms,
+                    "decay": spec.decay,
+                }
+            },
+            return_detail_info=True,
+        )
+        decayed: list[dict[str, Any]] = []
+        for item in result.data:
+            record = dict(item.fields) if item.fields else {}
+            record["id"] = item.id
+            record["_score"] = _normalize_result_score(item.score)
+            if item.origin_score is not None:
+                record["_origin_score"] = _normalize_result_score(item.origin_score)
+            if item.addition_score is not None:
+                record["_time_score"] = _normalize_result_score(item.addition_score)
+            decayed.append(self._normalize_record_for_read(record))
+        return decayed
+
     def _table_exists(self, table_name: str) -> bool:
         """Return whether the named table is present in the configured schema."""
         pool = self._get_pool()
@@ -397,7 +735,11 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
         return str(distance) if distance else None
 
     def pairwise_similarity(
-        self, values: Sequence[object], *, field: str | None = None
+        self,
+        values: Sequence[object],
+        *,
+        field: str | None = None,
+        account_id: str | None = None,
     ) -> dict[tuple[object, object], float]:
         """Return cosine similarity between every pair of the given rows.
 
@@ -413,6 +755,9 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
         field :
             Column those values name; ``None`` means the primary key. Callers
             working in URIs pass ``"uri"``.
+        account_id :
+            Compare only that account's rows; see
+            :meth:`PgVectorCollection.pairwise_similarity`.
 
         Returns
         -------
@@ -421,6 +766,9 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
             has no open collection, so a caller can treat "cannot" and
             "nothing similar" alike and skip the diversity pass.
         """
+        if self._pending_reconcile is not None:
+            # Retried, and if it fails again refused, like every other read.
+            self.get_collection()
         inner = self._pg_collection
         if inner is None:
             return {}
@@ -433,7 +781,7 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
         # the caller works in the URIs it was given.
         if field in self._URI_FIELD_NAMES:
             lookup = [self._encode_uri_field_value(value) for value in values]
-            matrix = inner.pairwise_similarity(lookup, field=field)
+            matrix = inner.pairwise_similarity(lookup, field=field, account_id=account_id)
             return {
                 (
                     self._decode_uri_field_value(left),
@@ -441,7 +789,7 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
                 ): score
                 for (left, right), score in matrix.items()
             }
-        return inner.pairwise_similarity(values, field=field)
+        return inner.pairwise_similarity(values, field=field, account_id=account_id)
 
     def _build_collection(
         self, coll_schema: CollectionSchema, table_name: str

@@ -21,7 +21,8 @@ jobs:
   check:
     name: ${{ inputs.package }} / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    # Room for a cold pull of the 2.4 GB OpenViking image before the live suite.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -49,3 +50,29 @@ jobs:
         run: >
           uv run --locked --directory packages/${{ inputs.package }}
           pytest -v -m "not integration" --color=yes --tb=short
+
+      # Pulled first, so a slow registry shows up as a slow pull, not a test
+      # that ran out of time. The OpenViking image is 2.4 GB.
+      - name: Pull the integration images
+        if: >-
+          ${{ runner.os == 'Linux'
+              && hashFiles(format('packages/{0}/tests/test_live_openviking.py', inputs.package)) != '' }}
+        run: |
+          set -euo pipefail
+          images=$(grep -rhoE '(ghcr\.io/volcengine/openviking|hashicorp/vault|pgvector/pgvector):[A-Za-z0-9._-]+' \
+            packages/${{ inputs.package }}/tests 2>/dev/null | grep -v ':latest$' | sort -u || true)
+          for image in $images; do
+            docker pull --quiet "$image"
+          done
+
+      # The skills' instructions carried out against a real OpenViking, which
+      # the suite starts in docker. Linux only: macOS runners have no docker,
+      # and what this checks is the server, not the bash. Only this file: the
+      # package's other integration tests download releases from GitHub.
+      - name: Run the skills against a live OpenViking
+        if: >-
+          ${{ runner.os == 'Linux'
+              && hashFiles(format('packages/{0}/tests/test_live_openviking.py', inputs.package)) != '' }}
+        run: >
+          uv run --locked --directory packages/${{ inputs.package }}
+          pytest -v -m integration tests/test_live_openviking.py --color=yes --tb=short
