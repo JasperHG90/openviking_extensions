@@ -111,7 +111,9 @@ def install() -> None:
     service_class = getattr(importlib.import_module(_MODULE), _CLASS, None)
     original = getattr(service_class, _METHOD, None)
     if service_class is None or original is None or not callable(original):
-        raise RuntimeError(f"{_MODULE}.{_CLASS}.{_METHOD} is missing; OpenViking has moved it")
+        raise RuntimeError(
+            f"{_MODULE}.{_CLASS}.{_METHOD} is missing; OpenViking has moved it"
+        )
 
     async def initialize_and_maintain(service: Any, *args: Any, **kwargs: Any) -> Any:
         """Run OpenViking's initialize, then start the maintenance task."""

@@ -21,13 +21,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from openviking.storage.acl import AclAction, acl_grant_tokens
 
 from .test_integration import DIM, make_adapter, vec
 from .test_schema_reconcile import (
     NEW,
     OLD,
-    AclAction,
-    acl_grant_tokens,
     create,
     resource,
     visible_to_bob,
@@ -53,7 +52,14 @@ def old_python() -> Path:
         assert uv is not None, "building the old environment needs uv on PATH"
         shutil.rmtree(root, ignore_errors=True)
         subprocess.run(
-            [uv, "venv", "--quiet", "--python", f"{sys.version_info[0]}.{sys.version_info[1]}", str(root)],
+            [
+                uv,
+                "venv",
+                "--quiet",
+                "--python",
+                f"{sys.version_info[0]}.{sys.version_info[1]}",
+                str(root),
+            ],
             check=True,
         )
         subprocess.run(
@@ -76,7 +82,12 @@ def old_python() -> Path:
 def run_old(python: Path, dsn: str, schema: str) -> dict[str, Any]:
     """Run the probe under the old stack and return its report."""
     result = subprocess.run(
-        [str(python), "-I", str(PROBE), json.dumps({"dsn": dsn, "schema": schema, "dim": DIM})],
+        [
+            str(python),
+            "-I",
+            str(PROBE),
+            json.dumps({"dsn": dsn, "schema": schema, "dim": DIM}),
+        ],
         capture_output=True,
         text=True,
         check=False,
@@ -130,7 +141,9 @@ def test_the_previous_release_runs_on_a_reconciled_table(
     after = make_adapter(dsn, test_schema)
     try:
         assert create(after, NEW) is False
-        rows = {row["id"]: row for row in after.get(["old-write", "new-open", "new-secret"])}
+        rows = {
+            row["id"]: row for row in after.get(["old-write", "new-open", "new-secret"])
+        }
         assert rows["old-write"]["acl_mode"] == "none"
         assert rows["old-write"]["md5"] == ""
         assert rows["new-open"]["active_count"] == 5

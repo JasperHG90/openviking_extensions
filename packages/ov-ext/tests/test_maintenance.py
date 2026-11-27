@@ -37,7 +37,7 @@ def restore_service() -> Iterator[None]:
     original = OpenVikingService.initialize
     yield
     maintenance.uninstall()
-    OpenVikingService.initialize = original  # type: ignore[method-assign]
+    OpenVikingService.initialize = original
 
 
 async def test_every_reachable_adapter_is_backfilled_once() -> None:
@@ -88,7 +88,7 @@ async def test_the_backfill_starts_when_the_service_has_started(
         viking_fs="the server's fs",
     )
     maintenance.install()
-    await OpenVikingService.initialize(service)  # type: ignore[arg-type]
+    await OpenVikingService.initialize(service)
     for _ in range(10):
         if adapter.calls:
             break

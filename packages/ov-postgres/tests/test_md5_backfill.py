@@ -33,7 +33,7 @@ OVERVIEW = "## Files\n\n- a.md: alpha\n- b.md: beta\n"
 
 @pytest.fixture
 def viking_fs() -> Iterator[Any]:
-    """A real RAGFS filesystem over a temporary directory."""
+    """Yield a real RAGFS filesystem over a temporary directory."""
     from openviking.storage.viking_fs import VikingFS
     from openviking.utils.agfs_utils import RagfsBindingConfig, create_agfs_client
     from openviking_cli.utils.config.agfs_config import AGFSConfig
@@ -46,7 +46,7 @@ def viking_fs() -> Iterator[Any]:
 
 
 def root_ctx() -> Any:
-    """The context the files are written under."""
+    """Return the context the files are written under."""
     from openviking.server.identity import RequestContext, Role, UserIdentifier
 
     return RequestContext(user=UserIdentifier("acme", "default"), role=Role.ROOT)

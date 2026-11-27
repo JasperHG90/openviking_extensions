@@ -43,6 +43,7 @@ def main() -> None:
     from openviking.storage.collection_schemas import CollectionSchemas
     from openviking.storage.vectordb_adapters import base
     from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
+
     from ov_postgres.adapter import PgVectorCollectionAdapter
 
     base.get_openviking_config = lambda: _Config(_Embedding(dim))
