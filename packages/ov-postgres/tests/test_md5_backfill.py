@@ -166,3 +166,51 @@ def test_a_fresh_table_has_nothing_to_backfill(
         assert adapter.get(["a"])[0]["md5"] == ""
     finally:
         adapter.close()
+
+
+def test_the_backfill_reads_files_an_acl_restricts(
+    dsn: str, test_schema: str, viking_fs: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With ACL on, a restricted file is hashed too, as OpenViking's own scans read it."""
+    import openviking.storage.viking_fs._access as access
+    from openviking.utils.content_hash import content_md5
+
+    asyncio.run(write_tree(viking_fs))
+    old = make_adapter(dsn, test_schema)
+    create(old, OLD)
+    old.upsert(old_rows())
+    old.close()
+
+    class RestrictedEverywhere:
+        """An ACL manager under which nobody holds a grant."""
+
+        async def is_enabled(self, account_id: str) -> bool:
+            return True
+
+        async def resolve_many(self, uris: Any, ctx: Any) -> dict[str, Any]:
+            return {uri: object() for uri in uris}
+
+    viking_fs.acl_manager = RestrictedEverywhere()
+    monkeypatch.setattr(access, "acl_permission", lambda effective, ctx: None)
+
+    adapter = make_adapter(dsn, test_schema)
+    try:
+        create(adapter, NEW)
+        asyncio.run(adapter.run_md5_backfill(viking_fs))
+        assert adapter.get(["a"])[0]["md5"] == content_md5(FILES["a.md"])
+    finally:
+        adapter.close()
+
+
+def test_record_md5_keeps_an_md5_written_meanwhile(dsn: str, test_schema: str) -> None:
+    """The guard on the write itself: a row given an md5 since the read keeps it."""
+    adapter = make_adapter(dsn, test_schema)
+    try:
+        create(adapter, NEW)
+        adapter.upsert(resource("a", uri=f"{ROOT_URI}/a.md", md5="written-by-openviking"))
+        inner = adapter._pg_collection
+        assert inner is not None
+        assert inner.record_md5("a", "from-the-backfill") is False
+        assert adapter.get(["a"])[0]["md5"] == "written-by-openviking"
+    finally:
+        adapter.close()

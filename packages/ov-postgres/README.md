@@ -607,11 +607,21 @@ writes the row:
   older stack on an OpenViking without ACL fills in defaults for fields it does
   not know, and OpenViking keeps ACL on the rows themselves, so without this a
   rewrite would erase a restriction for good.
+- A row such a writer adds without an md5 is recorded, and the next boot of
+  this version queues the md5 backfill for it.
+
+The trigger guards `md5` and the ACL fields on every table this version opens,
+whether it reconciled the table or created it, and each boot reinstalls it if
+it is missing.
 
 Downgrading needs no migration. ov-postgres 0.6.0 on OpenViking 0.4.17.1 reads
 the new fields from the registry, and reads, filters, writes and deletes on a
-reconciled table; the test suite runs that exact stack against one
-(`tests/test_downgrade.py`). Upgrading again finds the table current.
+table this version reconciled or created; the test suite runs that exact stack
+against both (`tests/test_downgrade.py`). Upgrading again finds the table
+current. One thing a downgrade cannot keep: OpenViking 0.4 has no ACL, so
+while it runs, every user it serves can read every resource in the account,
+restricted ones included. The restrictions are still on the rows when you
+upgrade again.
 
 **md5 on existing rows.** OpenViking fingerprints each indexed file with the md5
 of its stored bytes, and each directory's abstract and overview with the md5 of
@@ -621,7 +631,10 @@ server log says so on every boot until it is done. The backfill reads each
 file through the server's own filesystem — which also decrypts it when
 encryption at rest is on, so it cannot run from outside the server — and hashes
 it with OpenViking's own functions. It never overwrites an md5 written
-meanwhile. Under [ov-ext](../ov-ext/)'s `ov-ext-server` it runs by itself once
+meanwhile. It records what each file holds now, so a row whose embedding was
+already behind its file — an embedding that failed or is still queued — is
+then treated as current by the next reindex; re-index such a resource
+explicitly. Under [ov-ext](../ov-ext/)'s `ov-ext-server` it runs by itself once
 the server has started. Without ov-ext, run it from inside the server process:
 
 ```python

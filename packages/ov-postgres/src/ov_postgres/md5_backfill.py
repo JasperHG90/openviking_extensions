@@ -97,7 +97,11 @@ async def md5_for(
     from openviking.storage.abstract_overview import body_for_preview
     from openviking.utils.content_hash import content_md5
 
-    ctx = RequestContext(user=UserIdentifier(account_id, "default"), role=Role.ROOT)
+    # As OpenViking's own background scans read: ROOT alone is still checked
+    # against an account's ACL, and a restricted file would go unhashed.
+    ctx = RequestContext(
+        user=UserIdentifier(account_id, "default"), role=Role.ROOT, bypass_acl=True
+    )
     source = uri if level == 2 else f"{uri.rstrip('/')}/{SIDECAR_NAMES[level]}"
     try:
         raw = await viking_fs.read_file_bytes(source, ctx=ctx)

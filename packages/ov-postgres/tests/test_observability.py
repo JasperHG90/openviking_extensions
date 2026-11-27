@@ -374,6 +374,7 @@ class TestSpansFromRealQueries:
                     "ScalarIndex": [*META["ScalarIndex"], "probe_field"],
                 }
             )
+            collection.ensure_extra_guard()
             collection.md5_backfill_batch(None, 10)
             collection.record_md5("b", "probe")
             collection.finish_md5_backfill()
@@ -432,6 +433,7 @@ class TestSpansFromRealQueries:
             "ov_postgres.get_meta_data": "SELECT",
             "ov_postgres.update": "UPDATE",
             "ov_postgres.reconcile_schema": "ALTER TABLE",
+            "ov_postgres.ensure_extra_guard": "SELECT",
             "ov_postgres.md5_backfill_batch": "SELECT",
             "ov_postgres.record_md5": "UPDATE",
             "ov_postgres.finish_md5_backfill": "UPDATE",

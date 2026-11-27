@@ -1510,7 +1510,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         detail: bool,
         drop: str | None,
     ) -> SearchResult:
-        """Multiply each score by its decay factor, re-rank, and page.
+        """Lower each score by its decay factor, re-rank, and page.
 
         Parameters
         ----------
@@ -1537,7 +1537,11 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             factor = _decay_factor(timestamp, decay)
             origin = float(item.score or 0.0)
             if factor is not None:
-                item.score = origin * factor
+                # Multiplying lowers a positive score. This backend scores l2 as
+                # a negated distance, and inner product can go negative, where
+                # multiplying by a factor below one would raise the score
+                # instead; dividing lowers it, keeping decay a demotion.
+                item.score = origin * factor if origin >= 0 else origin / factor
             if detail:
                 item.origin_score = origin
                 item.addition_score = factor
@@ -1804,7 +1808,11 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
 
     @traced("ov_postgres.pairwise_similarity")
     def pairwise_similarity(
-        self, values: Sequence[object], *, field: str | None = None
+        self,
+        values: Sequence[object],
+        *,
+        field: str | None = None,
+        account_id: str | None = None,
     ) -> dict[tuple[object, object], float]:
         """Return cosine similarity between every pair of the given rows.
 
@@ -1833,6 +1841,10 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             carries the URI and not the row id. A non-unique field is reduced
             to one representative row per value, so the matrix has exactly one
             entry per pair.
+        account_id :
+            Compare only that account's rows. A shared table holds the same
+            URI once per account, and without this the representative row
+            could be another tenant's.
 
         Returns
         -------
@@ -1870,6 +1882,11 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         column = sql.Identifier(name)
         vec = sql.Identifier(vector_field.name)
         pk = sql.Identifier(self._schema.primary_key.name)
+        params: list[object] = [keys]
+        scope: sql.Composable = sql.SQL("")
+        if account_id is not None and self._schema.by_name("account_id") is not None:
+            scope = sql.SQL(" AND account_id = %s")
+            params.append(account_id)
 
         # DISTINCT ON keeps one row per value: a URI can carry a row per level,
         # and without this the cross join would emit a pair per combination and
@@ -1881,15 +1898,15 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         statement = sql.SQL(
             "WITH reps AS ("
             "SELECT DISTINCT ON ({col}) {col} AS ref, {vec} AS vec FROM {table} "
-            "WHERE {col} = ANY(%s) AND {vec} IS NOT NULL "
+            "WHERE {col} = ANY(%s) AND {vec} IS NOT NULL{scope} "
             "ORDER BY {col}, {pk}"
             ") "
             "SELECT a.ref AS ref_a, b.ref AS ref_b, "
             "1 - (a.vec <=> b.vec) AS similarity "
             "FROM reps a JOIN reps b ON a.ref < b.ref"
-        ).format(col=column, vec=vec, table=self._qualified, pk=pk)
+        ).format(col=column, vec=vec, table=self._qualified, pk=pk, scope=scope)
 
-        rows = self._execute(statement, [keys], fetch="all")
+        rows = self._execute(statement, params, fetch="all")
         matrix: dict[tuple[object, object], float] = {}
         for row in rows:
             similarity = float(row["similarity"])
@@ -2967,46 +2984,139 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             built.append(entry.name)
         return built
 
+    @traced("ov_postgres.ensure_extra_guard")
+    def ensure_extra_guard(self) -> bool:
+        """Install the extra-guard trigger if it is missing, and read what it recorded.
+
+        Runs on every boot. Guards the fields a reconcile added plus those an
+        older stack does not know -- ``md5`` and the ACL fields -- so a table
+        this version created is protected from an older writer too, not only
+        one it reconciled. And when the trigger has seen an unmarked writer add
+        a row without an md5 (an older stack, during a downgrade), it queues
+        the md5 backfill.
+
+        Returns
+        -------
+        bool
+            Whether the trigger was installed or changed.
+        """
+        annotate({"db.operation.name": "SELECT"})
+        self._check_open()
+        trigger = ddl.index_name(self._table, "extra_guard")
+        with self._lock, self._pool.connection() as conn, conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock(%s)",
+                    (ddl.advisory_lock_key(self._db_schema),),
+                )
+                cur.execute(
+                    sql.SQL("SELECT meta FROM {} WHERE name = %s FOR UPDATE").format(
+                        self._registry(ddl.REGISTRY_COLLECTIONS)
+                    ),
+                    (self._name,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return False
+                stored = dict(row["meta"])
+                maintenance = dict(stored.get(MAINTENANCE_KEY) or {})
+                guarded = sorted(
+                    {
+                        *maintenance.get(EXTRA_GUARD, []),
+                        *(
+                            name
+                            for name in (*_FAIL_CLOSED_FIELDS, "md5")
+                            if self._schema.by_name(name) is not None
+                        ),
+                    }
+                )
+                cur.execute(
+                    "SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = %s AND c.relname = %s AND t.tgname = %s",
+                    (self._db_schema, self._table, trigger),
+                )
+                present = cur.fetchone() is not None
+                changed = not present or maintenance.get(EXTRA_GUARD) != guarded
+                if changed:
+                    annotate({"db.operation.name": "CREATE TRIGGER"})
+                    self._install_extra_guard(
+                        cur, [self._schema.by_name(name) for name in guarded]
+                    )
+                    maintenance[EXTRA_GUARD] = guarded
+                cur.execute(
+                    sql.SQL("DELETE FROM {} WHERE collection = %s RETURNING 1").format(
+                        self._registry(ddl.REGISTRY_UNMARKED_WRITES)
+                    ),
+                    (self._name,),
+                )
+                unmarked = cur.fetchone() is not None
+                if unmarked and self._schema.by_name("md5") is not None:
+                    maintenance[MD5_BACKFILL] = "pending"
+                if changed or unmarked:
+                    stored[MAINTENANCE_KEY] = maintenance
+                    cur.execute(
+                        sql.SQL("UPDATE {} SET meta = %s WHERE name = %s").format(
+                            self._registry(ddl.REGISTRY_COLLECTIONS)
+                        ),
+                        (json.dumps(stored), self._name),
+                    )
+                    self._schema.raw = stored
+        return changed
+
     def _install_extra_guard(
         self, cur: Cursor[Any], fields: list[FieldSpec | None]
     ) -> None:
-        """Install the trigger that keeps reconciled fields out of ``extra``.
+        """Install the triggers that keep guarded fields right whatever writes them.
 
         A server whose view predates the reconcile -- one still running from
         before it, or an older ov-postgres -- has no column for these fields
         and writes them into ``extra``. Read from there, every filter and
         projection would see the column instead, and an ACL filter would let
         a restricted row through. So before every insert and update, the
-        trigger moves such a value into its column, and gives a column left
+        trigger copies such a value into its column, and gives a column left
         NULL its default. An ACL value that does not fit its column fails the
         write, rather than leave the row unrestricted; any other misfit stays
-        in ``extra``, as it did before. And on an update by a writer other than
-        this version, a field it did not supply through ``extra`` keeps the
-        row's value: such a writer fills in defaults for fields it knows
-        nothing about, which would erase an ACL restriction.
+        in ``extra``, as it did before.
+
+        The value stays in ``extra`` on insert and is stripped on update.
+        Such a writer upserts with ``INSERT ... ON CONFLICT DO UPDATE``, whose
+        SET list lacks the guarded columns, so the update must still find the
+        value; when no conflict happens, an AFTER INSERT trigger strips it.
+
+        On an update by a writer other than this version, a field it did not
+        supply through ``extra`` keeps the row's value: such a writer fills in
+        defaults for fields it knows nothing about, which would erase an ACL
+        restriction. And a row such a writer leaves without an md5 is recorded
+        in ``ov_unmarked_writes``, so the next boot queues the md5 backfill.
 
         Parameters
         ----------
         cur :
-            A cursor inside the reconcile's transaction.
+            A cursor inside the calling transaction.
         fields :
             The fields to guard.
         """
+        setting = sql.Literal(WRITER_SETTING).as_string(cur)
+        current = sql.Literal(WRITER_CURRENT).as_string(cur)
         branches: list[str] = [
-            # An update by a writer that is not this version: one that knows
-            # nothing of these fields, and would write their defaults over the
-            # row's -- erasing an ACL restriction for good, since OpenViking
-            # keeps ACL on the rows themselves.
-            "unaware := TG_OP = 'UPDATE' AND coalesce(current_setting("
-            f"{sql.Literal(WRITER_SETTING).as_string(cur)}, true), '') <> "
-            f"{sql.Literal(WRITER_CURRENT).as_string(cur)};"
+            f"unmarked := coalesce(current_setting({setting}, true), '') <> {current};",
+            "unaware := TG_OP = 'UPDATE' AND unmarked;",
         ]
+        keys: list[str] = []
+        strips: list[str] = []
         for spec in fields:
             if spec is None or spec.ov_type not in _GUARD_CONVERSIONS:
                 continue
             check, convert = _GUARD_CONVERSIONS[spec.ov_type]
             key = sql.Literal(spec.name).as_string(cur)
             column = sql.Identifier(spec.name).as_string(cur)
+            keys.append(spec.name)
+            # Only a value the BEFORE trigger copied; a misfit stays in extra.
+            strips.append(
+                f"IF NEW.extra ? {key} THEN v := NEW.extra -> {key}; "
+                f"IF {check} THEN moved := moved || {key}::text; END IF; END IF;"
+            )
             refuse = (
                 "RAISE EXCEPTION 'ov_postgres: % in extra does not fit its column, "
                 "and an ACL value is never dropped', "
@@ -3019,7 +3129,7 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 f"  v := NEW.extra -> {key};\n"
                 f"  IF {check} THEN\n"
                 f"    NEW.{column} := {convert};\n"
-                f"    NEW.extra := NEW.extra - {key};\n"
+                f"    IF TG_OP = 'UPDATE' THEN NEW.extra := NEW.extra - {key}; END IF;\n"
                 f"  ELSE\n    {refuse}\n  END IF;\n"
                 f"ELSIF unaware THEN\n  NEW.{column} := OLD.{column};\n"
                 "END IF;"
@@ -3033,30 +3143,67 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                     f"IF NEW.{column} IS NULL THEN "
                     f"NEW.{column} := {literal.as_string(cur)}; END IF;"
                 )
-        if len(branches) == 1:
+        if not keys:
             return
-        function = sql.Identifier(
-            self._db_schema, ddl.index_name(self._table, "extra_guard")
-        )
-        trigger = sql.Identifier(ddl.index_name(self._table, "extra_guard"))
+        if "md5" in keys:
+            marker = sql.SQL(
+                "INSERT INTO {} (collection) VALUES ({}) ON CONFLICT DO NOTHING"
+            )
+            branches.append(
+                "IF unmarked AND coalesce(NEW.md5, '') = '' THEN "
+                + marker.format(
+                    self._registry(ddl.REGISTRY_UNMARKED_WRITES), sql.Literal(self._name)
+                ).as_string(cur)
+                + "; END IF;"
+            )
+        name = ddl.index_name(self._table, "extra_guard")
+        strip_name = ddl.index_name(self._table, "extra_strip")
+        function = sql.Identifier(self._db_schema, name)
+        strip_function = sql.Identifier(self._db_schema, strip_name)
         body = (
-            "DECLARE v jsonb; unaware boolean;\nBEGIN\n"
+            "DECLARE v jsonb; unmarked boolean; unaware boolean;\nBEGIN\n"
             + "\n".join(branches)
             + "\nRETURN NEW;\nEND;"
         )
-        cur.execute(
-            sql.SQL(
-                "CREATE OR REPLACE FUNCTION {}() RETURNS trigger LANGUAGE plpgsql AS {}"
-            ).format(function, sql.Literal(body))
+        key_array = sql.SQL("ARRAY[{}]::text[]").format(
+            sql.SQL(", ").join(sql.Literal(k) for k in keys)
         )
-        cur.execute(
-            sql.SQL("DROP TRIGGER IF EXISTS {} ON {}").format(trigger, self._qualified)
+        pk = sql.Identifier(self._schema.primary_key.name)
+        strip_body = (
+            "DECLARE v jsonb; moved text[] := ARRAY[]::text[];\nBEGIN\n"
+            + "\n".join(strips)
+            + "\nIF cardinality(moved) > 0 THEN "
+            + sql.SQL("UPDATE {} SET extra = extra - moved WHERE {} = NEW.{};")
+            .format(self._qualified, pk, pk)
+            .as_string(cur)
+            + " END IF;\nRETURN NULL;\nEND;"
         )
+        for fn, text in ((function, body), (strip_function, strip_body)):
+            cur.execute(
+                sql.SQL(
+                    "CREATE OR REPLACE FUNCTION {}() RETURNS trigger "
+                    "LANGUAGE plpgsql AS {}"
+                ).format(fn, sql.Literal(text))
+            )
+        for trigger_name in (name, strip_name):
+            cur.execute(
+                sql.SQL("DROP TRIGGER IF EXISTS {} ON {}").format(
+                    sql.Identifier(trigger_name), self._qualified
+                )
+            )
         cur.execute(
             sql.SQL(
                 "CREATE TRIGGER {} BEFORE INSERT OR UPDATE ON {} "
                 "FOR EACH ROW EXECUTE FUNCTION {}()"
-            ).format(trigger, self._qualified, function)
+            ).format(sql.Identifier(name), self._qualified, function)
+        )
+        cur.execute(
+            sql.SQL(
+                "CREATE TRIGGER {} AFTER INSERT ON {} FOR EACH ROW "
+                "WHEN (NEW.extra ?| {}) EXECUTE FUNCTION {}()"
+            ).format(
+                sql.Identifier(strip_name), self._qualified, key_array, strip_function
+            )
         )
 
     def _move_extra_into_columns(self, cur: Cursor[Any], added: list[FieldSpec]) -> int:

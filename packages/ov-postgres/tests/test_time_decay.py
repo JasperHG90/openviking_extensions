@@ -198,3 +198,35 @@ def test_openvikings_own_decayed_search_runs_on_this_backend(
             await store.close()
 
     assert asyncio.run(run()) == ["new-event", "old-event"]
+
+
+@pytest.mark.parametrize("distance", ["l2", "ip"])
+def test_decay_demotes_older_rows_whatever_the_metric(
+    dsn: str, test_schema: str, distance: str
+) -> None:
+    """Under l2 a score is a negated distance; decay must still push old rows down.
+
+    Multiplying a negative score by a factor below one moves it toward zero,
+    which ranks it higher -- the opposite of what decay is for.
+    """
+    inst = make_adapter(dsn, test_schema, distance=distance)
+    inst.create_collection(
+        "context", META, distance=distance, sparse_weight=0.0, index_name="default"
+    )
+    try:
+        far = [0.2, 0.9] + [0.0] * (DIM - 2)
+        inst.upsert(
+            [
+                {
+                    "id": "old",
+                    "vector": NEAR,
+                    "updated_at": (ORIGIN - timedelta(days=60)).isoformat(),
+                },
+                {"id": "fresh", "vector": far, "updated_at": ORIGIN.isoformat()},
+            ]
+        )
+        plain = inst.query(query_vector=QUERY, limit=10)
+        assert plain[0]["id"] == "old"
+        assert decay(inst)[0]["id"] == "fresh"
+    finally:
+        inst.close()

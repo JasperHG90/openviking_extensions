@@ -52,9 +52,8 @@ _IDENT_SAFE = re.compile(r"[^a-z0-9_]+")
 # `CollectionAdapter.query` passes an event-time-decay request through raw
 # for "pgvector", expecting that backend's SQL to apply it, and the
 # incremental inventory scan probes for NULL timestamps the way that backend
-# sorts them. Neither holds here. Under a name OpenViking does not know, time
-# decay is refused up front with an error naming this backend, and every other
-# path takes the generic route.
+# sorts them. Neither holds here. Under a name OpenViking does not know, every
+# path takes the generic route, and `query` below applies time decay itself.
 MODE = "ov_postgres"
 
 # PostgreSQL truncates identifiers at 63 bytes.
@@ -439,9 +438,14 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
                 sparse_weight=sparse_weight,
                 index_name=index_name,
             )
+            fresh = self._pg_collection
+            if fresh is not None:
+                fresh.ensure_extra_guard()
             return created
         self._reconcile(dict(schema))
         inner = self._pg_collection
+        if inner is not None:
+            inner.ensure_extra_guard()
         if inner is not None and inner.md5_backfill_pending():
             logger.warning(
                 "ov_postgres: %s has rows with no md5, so OpenViking's next reindex "
@@ -721,7 +725,11 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
         return str(distance) if distance else None
 
     def pairwise_similarity(
-        self, values: Sequence[object], *, field: str | None = None
+        self,
+        values: Sequence[object],
+        *,
+        field: str | None = None,
+        account_id: str | None = None,
     ) -> dict[tuple[object, object], float]:
         """Return cosine similarity between every pair of the given rows.
 
@@ -737,6 +745,9 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
         field :
             Column those values name; ``None`` means the primary key. Callers
             working in URIs pass ``"uri"``.
+        account_id :
+            Compare only that account's rows; see
+            :meth:`PgVectorCollection.pairwise_similarity`.
 
         Returns
         -------
@@ -760,7 +771,7 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
         # the caller works in the URIs it was given.
         if field in self._URI_FIELD_NAMES:
             lookup = [self._encode_uri_field_value(value) for value in values]
-            matrix = inner.pairwise_similarity(lookup, field=field)
+            matrix = inner.pairwise_similarity(lookup, field=field, account_id=account_id)
             return {
                 (
                     self._decode_uri_field_value(left),
@@ -768,7 +779,7 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
                 ): score
                 for (left, right), score in matrix.items()
             }
-        return inner.pairwise_similarity(values, field=field)
+        return inner.pairwise_similarity(values, field=field, account_id=account_id)
 
     def _build_collection(
         self, coll_schema: CollectionSchema, table_name: str

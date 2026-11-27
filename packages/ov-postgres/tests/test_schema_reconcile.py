@@ -696,3 +696,99 @@ def test_a_writer_that_knows_nothing_of_acl_cannot_erase_a_restriction(
         assert (lifted["acl_mode"], lifted["md5"]) == ("none", "m2")
     finally:
         adapter.close()
+
+
+def test_a_stale_writers_change_to_an_existing_row_is_applied(
+    dsn: str, test_schema: str
+) -> None:
+    """Restricting a row that already exists, through ``extra``, takes effect.
+
+    The write is ``INSERT ... ON CONFLICT DO UPDATE`` whose SET list lacks the
+    new columns. The value has to survive from the proposed row to the update.
+    """
+    stale, current = stale_and_current(dsn, test_schema)
+    try:
+        current.upsert(resource("doc", md5="m1"))
+        grants = acl_grant_tokens(["user:alice"], AclAction.READ)
+        stale.upsert(
+            resource("doc", acl_mode="restricted", acl_direct_grants=grants[:1], md5="m2")
+        )
+        row = current.get(["doc"])[0]
+        assert (row["acl_mode"], row["acl_direct_grants"], row["md5"]) == (
+            "restricted",
+            grants[:1],
+            "m2",
+        )
+        assert not NEW_FIELDS & set(extra_of(dsn, test_schema, "doc"))
+        assert visible_to_bob(current) == set()
+    finally:
+        stale.close()
+        current.close()
+
+
+def test_a_freshly_created_table_is_guarded_too(dsn: str, test_schema: str) -> None:
+    """Not only a reconciled table: an older writer can reach a new one as well."""
+    adapter = make_adapter(dsn, test_schema)
+    try:
+        create(adapter, NEW)
+        grants = acl_grant_tokens(["user:alice"], AclAction.READ)
+        adapter.upsert(
+            resource("doc", acl_mode="restricted", acl_direct_grants=grants[:1])
+        )
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            conn.execute(
+                f'UPDATE "{test_schema}".ov_context SET acl_mode = %s WHERE id = %s',
+                ("none", "doc"),
+            )
+        assert adapter.get(["doc"])[0]["acl_mode"] == "restricted"
+    finally:
+        adapter.close()
+
+
+def test_rows_an_older_writer_adds_are_queued_for_the_md5_backfill(
+    dsn: str, test_schema: str
+) -> None:
+    """A row an older writer inserts has no md5; the next boot marks the backfill."""
+    adapter = make_adapter(dsn, test_schema)
+    create(adapter, NEW)
+    inner = adapter._pg_collection
+    assert inner is not None and not inner.md5_backfill_pending()
+    adapter.close()
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(
+            f'INSERT INTO "{test_schema}".ov_context '
+            "(id, uri, level, account_id, vector) "
+            "VALUES ('older', '/resources/older.md', 2, 'acme', %s::vector)",
+            ("[" + ",".join(["0.1"] * DIM) + "]",),
+        )
+    rebooted = reopen(dsn, test_schema, NEW)
+    try:
+        inner = rebooted._pg_collection
+        assert inner is not None and inner.md5_backfill_pending()
+    finally:
+        rebooted.close()
+
+
+def test_similarity_is_taken_within_one_account(dsn: str, test_schema: str) -> None:
+    """In a shared table the same URI exists once per account; compare the right ones."""
+    adapter = make_adapter(dsn, test_schema)
+    try:
+        create(adapter, NEW)
+        x = [1.0] + [0.0] * (DIM - 1)
+        y = [0.0, 1.0] + [0.0] * (DIM - 2)
+        uri_a, uri_b = "viking://resources/a.md", "viking://resources/b.md"
+        adapter.upsert(
+            [
+                {**resource("acme-a", uri=uri_a), "vector": x},
+                {**resource("acme-b", uri=uri_b), "vector": x},
+                {**resource("aaa-other-a", uri=uri_a, account_id="other"), "vector": y},
+            ]
+        )
+        own = adapter.pairwise_similarity([uri_a, uri_b], field="uri", account_id="acme")
+        assert own[(uri_a, uri_b)] == pytest.approx(1.0)
+        theirs = adapter.pairwise_similarity(
+            [uri_a, uri_b], field="uri", account_id="other"
+        )
+        assert theirs == {}, "the other account has no b.md"
+    finally:
+        adapter.close()

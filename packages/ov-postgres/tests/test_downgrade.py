@@ -98,12 +98,17 @@ def run_old(python: Path, dsn: str, schema: str) -> dict[str, Any]:
     return report
 
 
-def test_the_previous_release_runs_on_a_reconciled_table(
-    dsn: str, test_schema: str, old_python: Path
+@pytest.mark.parametrize("start", ["reconciled", "created-here"])
+def test_the_previous_release_runs_on_a_table_this_version_manages(
+    dsn: str, test_schema: str, old_python: Path, start: str
 ) -> None:
-    """Reconcile here, run 0.6.0 there, then read its writes back here."""
+    """Set up here, run 0.6.0 there, then read its writes back here.
+
+    Once on a table reconciled from the 0.4 schema, once on one this version
+    created: the old stack reaches either during a downgrade.
+    """
     old_era = make_adapter(dsn, test_schema)
-    create(old_era, OLD)
+    create(old_era, OLD if start == "reconciled" else NEW)
     old_era.upsert([resource("legacy"), resource("to-delete")])
     old_era.close()
 
