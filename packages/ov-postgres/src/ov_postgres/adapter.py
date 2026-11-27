@@ -438,14 +438,12 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
                 sparse_weight=sparse_weight,
                 index_name=index_name,
             )
-            fresh = self._pg_collection
-            if fresh is not None:
-                fresh.ensure_extra_guard()
+            # Through `_reconcile` for the guard, so a guard that cannot be
+            # installed fails closed exactly as a failed reconcile does.
+            self._reconcile(dict(schema))
             return created
         self._reconcile(dict(schema))
         inner = self._pg_collection
-        if inner is not None:
-            inner.ensure_extra_guard()
         if inner is not None and inner.md5_backfill_pending():
             logger.warning(
                 "ov_postgres: %s has rows with no md5, so OpenViking's next reindex "
@@ -520,6 +518,12 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
                         CollectionSchema.from_meta(reconciled), inner.table_name
                     )
                     inner.close()
+                # Part of the reconcile: without the guard an older writer could
+                # erase a row's ACL, so a guard that cannot be installed keeps
+                # the table from serving just as a failed reconcile does.
+                current = self._pg_collection
+                if current is not None:
+                    current.ensure_extra_guard()
             except Exception as exc:
                 self._pending_reconcile = schema
                 self._last_reconcile_attempt = time.monotonic()

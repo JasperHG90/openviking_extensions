@@ -792,3 +792,70 @@ def test_similarity_is_taken_within_one_account(dsn: str, test_schema: str) -> N
         assert theirs == {}, "the other account has no b.md"
     finally:
         adapter.close()
+
+
+def test_a_guard_that_cannot_be_installed_fails_closed(
+    dsn: str, test_schema: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without the guard an older writer could erase ACL, so the table is not served."""
+    monkeypatch.setattr(PgVectorCollectionAdapter, "_RECONCILE_RETRY_SECONDS", 0.0)
+    install = PgVectorCollection._install_extra_guard
+
+    def denied(self: Any, cur: Any, fields: Any) -> None:
+        raise psycopg.errors.InsufficientPrivilege("must be owner of table ov_context")
+
+    monkeypatch.setattr(PgVectorCollection, "_install_extra_guard", denied)
+    adapter = make_adapter(dsn, test_schema)
+    try:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            create(adapter, NEW)
+        with pytest.raises(RuntimeError, match="reconcile"):
+            adapter.query(limit=10)
+
+        monkeypatch.setattr(PgVectorCollection, "_install_extra_guard", install)
+        assert adapter.query(limit=10) == []
+        assert "extra_guard" in indexed_triggers(dsn, test_schema)
+    finally:
+        adapter.close()
+
+
+def test_installing_the_guard_gives_up_on_a_held_lock(
+    dsn: str, test_schema: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard's DDL waits a bounded time for its lock, as the reconcile does."""
+    import ov_postgres.collection as collection_module
+
+    adapter = make_adapter(dsn, test_schema)
+    create(adapter, NEW)
+    adapter.close()
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(
+            f'DROP TRIGGER ov_context__extra_guard ON "{test_schema}".ov_context'
+        )
+    monkeypatch.setattr(collection_module, "_RECONCILE_LOCK_TIMEOUT", "300ms")
+    holder = psycopg.connect(dsn)
+    try:
+        holder.execute(f'LOCK TABLE "{test_schema}".ov_context IN ACCESS EXCLUSIVE MODE')
+        reopened = make_adapter(dsn, test_schema)
+        try:
+            started = time.monotonic()
+            with pytest.raises(psycopg.errors.LockNotAvailable):
+                create(reopened, NEW)
+            assert time.monotonic() - started < 5
+        finally:
+            reopened.close()
+    finally:
+        holder.rollback()
+        holder.close()
+
+
+def indexed_triggers(dsn: str, schema: str) -> str:
+    """Return the names of the triggers on the context table, joined."""
+    with psycopg.connect(dsn) as conn:
+        rows = conn.execute(
+            "SELECT t.tgname FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = %s AND c.relname = 'ov_context' AND NOT t.tgisinternal",
+            (schema,),
+        ).fetchall()
+    return " ".join(str(row[0]) for row in rows)

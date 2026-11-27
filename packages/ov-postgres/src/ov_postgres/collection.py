@@ -3028,6 +3028,11 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         with self._lock, self._pool.connection() as conn, conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
+                    sql.SQL("SET LOCAL lock_timeout = {}").format(
+                        sql.Literal(_RECONCILE_LOCK_TIMEOUT)
+                    )
+                )
+                cur.execute(
                     "SELECT pg_advisory_xact_lock(%s)",
                     (ddl.advisory_lock_key(self._db_schema),),
                 )
