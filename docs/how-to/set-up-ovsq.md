@@ -18,9 +18,9 @@ JasperHG90/localstack takes them from there.
 `ovsq` runs on your laptop, never in CI. In CI, use the `openviking-sync`
 action.
 
-No S3 key is stored for it. Before each run, `localstack ov-sync-env` trades
-your Vault session for S3 credentials that last 15 minutes and can read,
-write and delete under `ov-sync/JasperHG90/local/` only. Localstack maps that
+No S3 key is stored for it. Before each run,
+`localstack token s3 local-ov-sync` trades your Vault session for S3
+credentials that last 15 minutes and can read, write and delete under `ov-sync/JasperHG90/local/` only. Localstack maps that
 prefix once to `viking://user/jasper/resources/local/`, and each folder picks
 its own place under it with `subdir`. So adding a folder needs no change in
 localstack.
@@ -88,8 +88,8 @@ localstack never maps a prefix over a folder that holds other content.
 In the shell that runs `ovsq`:
 
 ```console
-$ eval "$(localstack ov-sync-env)"
-ov-sync credentials expire at 2026-11-27T18:15:00Z
+$ eval "$(localstack token s3 local-ov-sync)"
+local-ov-sync credentials expire at 2026-11-27T18:15:00Z
 ```
 
 It exports `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and

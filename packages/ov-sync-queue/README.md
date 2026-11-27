@@ -54,8 +54,8 @@ whether they go further, both in JasperHG90/localstack:
    mapped to a `viking://` folder. A prefix missing there reaches the bucket
    and goes no further.
 2. **A write credential.** No S3 key is stored for ovsq.
-   `eval "$(localstack ov-sync-env)"` trades your Vault session for STS
-   credentials that last 15 minutes and reach only
+   `eval "$(localstack token s3 local-ov-sync)"` trades your Vault session
+   for STS credentials that last 15 minutes and reach only
    `ov-sync/JasperHG90/local/*`. Localstack maps that prefix to
    `viking://user/jasper/resources/local/`, so each folder picks its place
    with `subdir` and needs no localstack change.

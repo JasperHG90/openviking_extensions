@@ -47,5 +47,5 @@ ships it as stamped static binaries
 ([ADR 0005](decisions/0005-ship-ovsq-as-stamped-static-binaries-from-the-release-workflow.md));
 `watch` is not built. Reaching
 OpenViking uses localstack's one `JasperHG90/local` prefix and 15-minute
-credentials from `localstack ov-sync-env`, both outside this repo. The other packages have no
-architecture pages or decision records yet.
+credentials from `localstack token s3 local-ov-sync`, both outside this
+repo. The other packages have no architecture pages or decision records yet.
