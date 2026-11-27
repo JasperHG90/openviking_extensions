@@ -48,6 +48,12 @@ command = "prek run ruff-check --all-files"
 name = "format"
 command = "prek run ruff-format --all-files"
 
+# The Go module ov-sync-queue: gofmt, vet and its tests. Needs a Go toolchain.
+[[gates]]
+name = "go-ov-sync-queue"
+command = "bash packages/ov-sync-queue/check.sh"
+inputs = ["packages/ov-sync-queue/**"]
+
 # The passes that must give a verdict before a ticket's commit, and the most
 # review rounds a ticket gets (ADR 0023).
 [review]
@@ -61,7 +67,7 @@ interface_paths = [
     "**/AGENTS.md",
     "**/CLAUDE.md",
 ]
-test_paths = ["tests/**", "**/test_*.py", "**/*_test.py"]
+test_paths = ["tests/**", "**/test_*.py", "**/*_test.py", "**/*_test.go"]
 clear_cheap_fixes = false
 narrow_rounds = false
 
