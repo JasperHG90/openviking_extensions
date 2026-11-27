@@ -163,7 +163,7 @@ replies, and that it never hands over a profile's static `api_key`.
 Two things are worth doing in a real Firefox before trusting this end to end, in order:
 
 1. `ovx --install-firefox-host`, restart, open the settings, and confirm it says ovx is answering. That exercises the native-messaging round trip, which the integration suite does not cover.
-2. **Save one real page.** The integration suite proves the OpenViking half against a real server, but it uses an API key; a Vault identity token is accepted by the same code path and has not been exercised end to end here.
+2. **Save one real page.** The integration suite proves the OpenViking half against a real OpenViking in `oidc` mode, signed in with a Vault identity token minted the way ovx mints one, as the lab runs it. What it cannot reach is the browser itself: the popup, the content script and the native-messaging hop that hands the token over.
 
 ### Why `activeTab` is in the manifest next to `<all_urls>`
 

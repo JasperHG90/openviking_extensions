@@ -25,8 +25,9 @@ checked against. Set ``OV_TEST_KEEP=1`` to leave the containers running.
 
 This file is copied, not shared, between ov-sync, ovx and ov-skills: each is a
 standalone uv project and cannot import from the others. It uses ``urllib``
-rather than httpx for the same reason: two of the three have no httpx, and the
-copies stay identical.
+rather than httpx for the same reason: two of the three have no httpx. The
+copies are identical except that ovx's adds ``ov_binary``, which copies the
+``ov`` CLI out of the image under test; keep the shared part in step.
 """
 
 from __future__ import annotations
