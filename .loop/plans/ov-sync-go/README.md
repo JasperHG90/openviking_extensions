@@ -23,13 +23,12 @@ Relayed from: none
 Add a Go module at `new:packages/ov-sync-queue/go.mod` that builds one binary,
 `ovsq`. It does for a local folder what the `openviking-sync` GitHub action
 (JasperHG90/localstack, .github/actions/openviking-sync/sync.py) does for a
-repo: it hashes the chosen files, compares them with the manifest at
-<prefix>/_state/manifest.json in the `ov-sync` bucket, uploads what changed,
-deletes what the manifest lists and the folder no longer has (only with
-`--delete`), and writes the manifest back after every batch. It never talks to
-OpenViking. The bucket's webhook puts each change on the JetStream stream
-`OV_SYNC`, and `ov-sync-consumer` writes it to OpenViking. That pipeline is
-where documents get managed, paced and retried.
+repo: it hashes the chosen files, compares them with a manifest object in the
+`ov-sync` bucket, uploads what changed, deletes what the manifest lists and the
+folder no longer has (only with `--delete`), and writes the manifest back after
+every batch. It never talks to OpenViking. The bucket's webhook puts each
+change on the JetStream stream `OV_SYNC`, and `ov-sync-consumer` writes it to
+OpenViking. That pipeline is where documents get managed, paced and retried.
 
 Choices made without the operator (they were asked and did not answer; each
 is cheap to change later):
@@ -37,15 +36,23 @@ is cheap to change later):
 - Transport is the bucket, not a direct publish to JetStream. The consumer
   reads each object's content from S3, so a bare message carries nothing it
   can write.
-- The bucket manifest is the record of what was synced, in the action's exact
-  format (repo-relative path to sha256), so CI and a laptop can share a
-  prefix. A local cache, `.ov-sync-queue.db` beside the folder like
+- Each source owns its own manifest: <owner>/<name>/_state/ovsq-<source>.json,
+  where `source` is a config key (default `local`, letters, digits, dashes).
+  It is never `manifest.json`, which the CI action owns, so neither tool
+  deletes the other's files. The consumer skips every key under
+  `<owner>/<name>/_state/`, so manifests never reach OpenViking. The format is
+  the action's: path to sha256, where the path is relative to the prefix and
+  already includes `subdir`, so a delete targets exactly `<prefix>/<path>`.
+  Two sources writing the same key is the operator's mistake to avoid; the
+  README says so.
+- A local cache, `.ov-sync-queue.db` beside the folder like
   `packages/ov-sync/src/ov_sync/state.py`, keeps size, mtime and hash so an
-  unchanged file is never re-read.
-- S3 credentials come from the standard chain (env vars, AWS profile, web
-  identity token file) through minio-go, the client `ov-sync-consumer` already
-  uses against SeaweedFS. CI can keep its Vault to STS step and run `ovsq`
-  after it.
+  unchanged file is never re-read. The bucket manifest stays the record of
+  truth: losing the cache costs re-hashing, never re-uploading or a missed
+  delete.
+- S3 credentials come from minio-go's standard chain (env vars including a
+  session token, an AWS profile), the client `ov-sync-consumer` already uses
+  against SeaweedFS. Built-in Vault or STS exchange is out of scope.
 - First version: `ovsq init`, `ovsq status`, `ovsq run`. `watch` is a later
   ticket.
 
@@ -53,23 +60,30 @@ The config, `ov-sync-queue.toml` in the folder root, decides what is synced
 (`include_folders`, `include_extensions`, exclude globs, an optional
 `git_tracked_only` that lists files with `git ls-files` as the action does)
 and where it lands (`bucket`, `endpoint`, `region`, `prefix` as
-`<owner>/<name>` which the consumer maps to a `viking://` folder, and an
-optional `subdir` under it). Every key can be overridden by an `OVSQ_`
+`<owner>/<name>` which the consumer maps to a `viking://` folder, an optional
+`subdir` under it, and `source`). Every key can be overridden by an `OVSQ_`
 environment variable.
 
-The outcome that shows it worked: against a SeaweedFS S3 server, a first
-`ovsq run` uploads every selected file and writes a manifest the CI action
-would read as up to date, and a second run with no change uploads nothing.
+Outside this repo, and not part of this ticket: for files to reach OpenViking,
+the operator adds the prefix to the consumer's prefix map
+(deployments/applications/services.tf in localstack) and gives the laptop a
+write credential for that prefix (the bucket has `writers = []` today). The
+README names both steps. This ticket delivers the tool up to the bucket.
+
+The outcome that shows it worked: against a fake S3 server in tests, a first
+`ovsq run` uploads every selected file and writes its manifest, and a second
+run with no change uploads nothing.
 
 ## Problems
 
-- P1: ov-sync writes straight to OpenViking, so a local folder's documents skip the queue that paces, retries and dead-letters writes, and only CI repos reach that pipeline today.
+- P1: ov-sync writes straight to OpenViking, so a local folder has no way into the bucket that feeds the queue which paces, retries and dead-letters writes.
 - P2: There is no way to choose which local files go to the bucket and under which prefix, short of copying `sync.py` and its folder list.
 - P3: Nothing records which local files were sent to the bucket, so deletes cannot be mirrored and unchanged files would be re-sent.
+- P4: The repo's gates cover Python and TypeScript only, so a Go module would ship unchecked.
 
 ## Goals
 
-- G1: Any local folder reaches OpenViking through the ov-sync bucket and its queue, with the same manifest the CI action keeps.
+- G1: A local folder can be mirrored into a prefix of the ov-sync bucket with the CI action's manifest logic, so the queue and consumer can carry it to OpenViking.
 - G2: A config file decides what is synced and where in the bucket it lands.
 
 ## Outcomes
@@ -80,7 +94,7 @@ would read as up to date, and a second run with no change uploads nothing.
 - fixes: P1
 - needs: O2, O3
 - touches: `new:packages/ov-sync-queue/main.go`, `ovsq run`
-- checked by: Go tests against an in-process fake S3 (upload, unchanged second run, `--delete`, failed upload keeps its old manifest entry, manifest written after each batch, keys under `_state/` never uploaded)
+- checked by: Go tests against an in-process fake S3 (upload, unchanged second run, `--delete`, failed upload keeps its old manifest entry, manifest written after each batch, files under `_state/` never uploaded, `manifest.json` never written)
 - seen by: operator
 
 ### O2: `ov-sync-queue.toml` selects files and the target prefix
@@ -89,10 +103,10 @@ would read as up to date, and a second run with no change uploads nothing.
 - fixes: P2
 - needs: none
 - touches: `ov-sync-queue.toml`, `ovsq init`
-- checked by: Go tests for loading, defaults, `OVSQ_` overrides, and refusing a prefix that is not `<owner>/<name>`
+- checked by: Go tests for loading, defaults, `OVSQ_` overrides, and refusing a prefix that is not `<owner>/<name>` or a bad `source`
 - seen by: operator
 
-### O3: A local cache and the bucket manifest record what was sent
+### O3: A local cache and a per-source bucket manifest record what was sent
 - kind: support
 - goal: G1
 - fixes: P3
@@ -104,7 +118,7 @@ would read as up to date, and a second run with no change uploads nothing.
 ### O4: The Go gates run with the repo's other gates, and the package is documented
 - kind: support
 - goal: G1
-- fixes: P1
+- fixes: P4
 - needs: O1
 - touches: `.pre-commit-config.yaml`, `.loop/config.toml`, `new:packages/ov-sync-queue/README.md`
 - checked by: `prek run --all-files` and `loopctl gate stamp` run `go vet` and `go test` for the module

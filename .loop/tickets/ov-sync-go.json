@@ -3,7 +3,7 @@
   "slug": "ov-sync-go",
   "stage": "planning",
   "attempts": 0,
-  "plan_rounds": 1,
+  "plan_rounds": 2,
   "review_rounds": 0,
   "extra_plan_rounds": 0,
   "extra_review_rounds": 0,
@@ -105,9 +105,9 @@
   "overrides": [],
   "round": {
     "kind": "plan",
-    "n": 1,
-    "binds": "9f24e7b0e4ec4b6ad2d91423a754436b4bb73e42f3e0f134aaf8c4e87b39a3bb",
-    "started_at": "2026-11-27T08:47:10+00:00",
+    "n": 2,
+    "binds": "1acce95aca04fb38055f362bdc3d0e4f7a18237ad7532b3a234c04ccc9528959",
+    "started_at": "2026-11-27T08:49:45+00:00",
     "passes": [
       "plan-reviewer"
     ],
@@ -120,10 +120,10 @@
     "returned": {},
     "chosen": {},
     "skipped": [],
-    "closed": true,
-    "outcome": "fail"
+    "closed": false,
+    "outcome": null
   },
-  "plan_hash": "9f24e7b0e4ec4b6ad2d91423a754436b4bb73e42f3e0f134aaf8c4e87b39a3bb",
+  "plan_hash": "1acce95aca04fb38055f362bdc3d0e4f7a18237ad7532b3a234c04ccc9528959",
   "intent": {
     "epic": null,
     "depends_on": [],
@@ -138,5 +138,5 @@
     }
   ],
   "by": "process:loopctl/2.3.1.dev65+g93b143856",
-  "at": "2026-11-27T08:49:40+00:00"
+  "at": "2026-11-27T08:49:45+00:00"
 }
