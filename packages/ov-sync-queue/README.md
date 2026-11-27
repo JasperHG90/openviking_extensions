@@ -119,15 +119,30 @@ $ ./e2e/run.sh        # against a real SeaweedFS in docker; not a gate
 $ ./e2e/pipeline.sh   # LOCAL ONLY: the whole pipeline, see below
 ```
 
-`e2e/pipeline.sh` runs ovsq through the whole pipeline in docker: SeaweedFS
-with its filer webhook, the receiver, NATS JetStream and ov-sync-consumer,
-which writes to a fake OpenViking. It builds the receiver and consumer from
-a clone of localstack (`LOCALSTACK_DIR`, default `../localstack` beside this
-repo) and uses the SeaweedFS and NATS images localstack pins. It checks that
-uploads, edits and deletes under a `subdir` reach OpenViking through events
-alone, that the consumer never touches ovsq's manifest, and that a folder a
-delete empties is removed. It is local only: CI has no localstack clone, so
-it is not a gate.
+`e2e/pipeline.sh` runs ovsq through the whole pipeline in docker, as close
+to production as a laptop gets. It needs a clone of localstack
+(`LOCALSTACK_DIR`, default `../localstack` beside this repo), so it is local
+only: CI has no clone, and it is not a gate.
+
+- SeaweedFS and NATS run the images localstack pins. SeaweedFS runs the
+  jobspec's own args, webhook config and `master.toml`, read from
+  `seaweedfs.hcl`, inside the receiver's network namespace, so its webhook
+  reaches the receiver on 127.0.0.1 as in production.
+- The receiver and the consumer are the real `ov-sync-consumer` binary,
+  built from the clone and run with the jobspec's environment.
+- The consumer gets S3 credentials the production way: SeaweedFS's STS trades
+  a Nomad-style workload token for the `ov-sync-consumer` role, under the
+  IAM policy `services.tf` renders, with `defaultEffect` Deny. The script
+  stops if those lines in `services.tf` change, so its copy cannot drift.
+- Only OpenViking and the Nomad token issuer are faked (`e2e/pipeline/`).
+  The catch-up pass is pushed out to 24h, so every change must arrive
+  through an event.
+
+It checks that text files and a PNG under a `subdir` reach OpenViking:
+upload, edit, replace, and delete, with the image compared byte for byte.
+It also checks that the consumer never touches ovsq's manifest, that
+emptied folders (an image's included) are removed, and that nothing is
+dead-lettered. `OVSQ_E2E_KEEP=1` leaves the containers up after a run.
 
 The repo's `prek run --all-files` runs `check.sh` through the
 `go-ov-sync-queue` hook, so the repo's gates now need Go on PATH.
