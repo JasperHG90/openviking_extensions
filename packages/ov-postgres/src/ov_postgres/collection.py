@@ -7,11 +7,9 @@ import json
 import logging
 import math
 import threading
-from collections.abc import Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Literal, overload
 
-import psycopg
 from opentelemetry.util.types import AttributeValue
 from openviking.storage.acl import ACL_CONTEXT_FIELDS
 from openviking.storage.vectordb.collection.collection import ICollection
@@ -51,6 +49,8 @@ MD5_BACKFILL = "md5_backfill"
 # Bumped every time the backfill is queued, so a run clears the mark only if
 # nobody queued it again while it ran.
 MD5_GENERATION = "md5_backfill_generation"
+# Who is running the backfill, and until when; see `take_md5_lease`.
+MD5_LEASE = "md5_backfill_lease"
 
 
 def _queued(maintenance: dict[str, Any]) -> dict[str, Any]:
@@ -2936,8 +2936,13 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
         return int(maintenance.get(MD5_GENERATION) or 0)
 
     @traced("ov_postgres.queue_md5_backfill")
-    def queue_md5_backfill(self) -> None:
-        """Queue the md5 backfill, bumping its generation."""
+    def _queue_md5_backfill(self) -> None:
+        """Queue the md5 backfill, bumping its generation.
+
+        Production queues it inside the reconcile's and the guard's own
+        transactions (see ``_queued``); this stands in for another server
+        doing so, in the tests.
+        """
         annotate({"db.operation.name": "UPDATE"})
         self._check_open()
         self._execute(
@@ -2958,69 +2963,115 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             ),
         )
 
-    @contextmanager
-    def md5_backfill_run(self) -> Iterator[int | None]:
-        """Hold the right to backfill, or yield ``None`` if another process has it.
-
-        A session-level advisory lock on a connection held for the whole run,
-        so of several servers -- or several uvicorn workers -- starting
-        together, one backfills and the rest skip at once. Yields the
-        generation the run started from, for :meth:`finish_md5_backfill`.
-        """
-        key = (
-            int.from_bytes(
-                hashlib.sha256(
-                    f"ov_postgres.md5_backfill.{self._db_schema}.{self._table}".encode()
-                ).digest()[:8],
-                "big",
-            )
-            >> 1
+    def _lease_update(
+        self, assignment: sql.Composable, condition: sql.Composable, params: list[Any]
+    ) -> bool:
+        """Apply one conditional change to the backfill lease; return whether it held."""
+        row = self._execute(
+            sql.SQL(
+                "UPDATE {registry} SET meta = jsonb_set(meta, %s, {assignment}) "
+                "WHERE name = %s AND ({condition}) RETURNING 1"
+            ).format(
+                registry=self._registry(ddl.REGISTRY_COLLECTIONS),
+                assignment=assignment,
+                condition=condition,
+            ),
+            [[MAINTENANCE_KEY], *params],
+            fetch="one",
         )
-        # Read before taking the lock: a re-queue in between bumps the
-        # generation past this one, and the run then leaves the mark set.
-        generation = self.md5_backfill_generation()
-        conn = self._take_md5_run_lock(key)
-        if conn is None:
-            yield None
-            return
-        try:
-            yield generation
-        finally:
-            self._release_md5_run_lock(conn, key)
+        return row is not None
 
-    @traced("ov_postgres.take_md5_run_lock")
-    def _take_md5_run_lock(self, key: int) -> psycopg.Connection[Any] | None:
-        """Open a connection holding the backfill's session lock, or return None.
+    @traced("ov_postgres.take_md5_lease")
+    def take_md5_lease(self, owner: str, seconds: float) -> bool:
+        """Take the md5 backfill's lease unless a live one is held by someone else.
 
-        A connection of its own rather than one from the pool: the run holds it
-        for minutes while its own queries need the pool, which may be a single
-        connection. Never waits for the lock.
+        A row in the registry rather than a lock on a connection: it behaves
+        the same through a transaction-mode pooler, and a process that dies
+        holding it blocks the others only until it expires. Taken by one
+        conditional update, so of several takers exactly one wins.
+
+        Parameters
+        ----------
+        owner :
+            Identifies this run.
+        seconds :
+            How long the lease lasts unless renewed.
+
+        Returns
+        -------
+        bool
+            Whether this run now holds the lease.
         """
-        annotate({"db.operation.name": "SELECT"})
-        conninfo = self._pool.conninfo
-        kwargs = self._pool.kwargs
-        conn = psycopg.connect(
-            conninfo() if callable(conninfo) else conninfo,
-            autocommit=True,
-            **((kwargs() if callable(kwargs) else kwargs) or {}),
+        annotate({"db.operation.name": "UPDATE"})
+        self._check_open()
+        lease = sql.SQL("meta->{key}->{lease}").format(
+            key=sql.Literal(MAINTENANCE_KEY), lease=sql.Literal(MD5_LEASE)
         )
-        with conn.cursor() as cur:
-            cur.execute("SELECT pg_try_advisory_lock(%s)", (key,))
-            row = cur.fetchone()
-        if row and row[0]:
-            return conn
-        conn.close()
-        return None
+        return self._lease_update(
+            sql.SQL(
+                "coalesce(meta->{key}, '{{}}'::jsonb) || jsonb_build_object({lease}, "
+                "jsonb_build_object('owner', %s::text, 'expires_at', "
+                "extract(epoch FROM clock_timestamp()) + %s))"
+            ).format(key=sql.Literal(MAINTENANCE_KEY), lease=sql.Literal(MD5_LEASE)),
+            sql.SQL(
+                "{lease} IS NULL OR ({lease}->>'expires_at')::float8 "
+                "< extract(epoch FROM clock_timestamp()) OR {lease}->>'owner' = %s"
+            ).format(lease=lease),
+            [owner, seconds, self._name, owner],
+        )
 
-    @traced("ov_postgres.release_md5_run_lock")
-    def _release_md5_run_lock(self, conn: psycopg.Connection[Any], key: int) -> None:
-        """Release the backfill's session lock and close its connection."""
-        annotate({"db.operation.name": "SELECT"})
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT pg_advisory_unlock(%s)", (key,))
-        finally:
-            conn.close()
+    @traced("ov_postgres.renew_md5_lease")
+    def renew_md5_lease(self, owner: str, seconds: float) -> bool:
+        """Extend the lease if this run still holds it.
+
+        Returns
+        -------
+        bool
+            False if another process has taken it over; the run should stop.
+        """
+        annotate({"db.operation.name": "UPDATE"})
+        self._check_open()
+        lease = sql.SQL("meta->{key}->{lease}").format(
+            key=sql.Literal(MAINTENANCE_KEY), lease=sql.Literal(MD5_LEASE)
+        )
+        return self._lease_update(
+            sql.SQL(
+                "jsonb_set(meta->{key}, {path}, "
+                "to_jsonb(extract(epoch FROM clock_timestamp()) + %s))"
+            ).format(
+                key=sql.Literal(MAINTENANCE_KEY),
+                path=sql.Literal([MD5_LEASE, "expires_at"]),
+            ),
+            sql.SQL("{lease}->>'owner' = %s").format(lease=lease),
+            [seconds, self._name, owner],
+        )
+
+    @traced("ov_postgres.release_md5_lease")
+    def release_md5_lease(self, owner: str | None) -> bool:
+        """Give the lease up. ``None`` releases it whoever holds it.
+
+        Returns
+        -------
+        bool
+            Whether a lease was released.
+        """
+        annotate({"db.operation.name": "UPDATE"})
+        self._check_open()
+        lease = sql.SQL("meta->{key}->{lease}").format(
+            key=sql.Literal(MAINTENANCE_KEY), lease=sql.Literal(MD5_LEASE)
+        )
+        condition: sql.Composable = (
+            sql.SQL("{lease} IS NOT NULL").format(lease=lease)
+            if owner is None
+            else sql.SQL("{lease}->>'owner' = %s").format(lease=lease)
+        )
+        return self._lease_update(
+            sql.SQL("(meta->{key}) - {lease}::text").format(
+                key=sql.Literal(MAINTENANCE_KEY), lease=sql.Literal(MD5_LEASE)
+            ),
+            condition,
+            [self._name] if owner is None else [self._name, owner],
+        )
 
     @traced("ov_postgres.finish_md5_backfill")
     def finish_md5_backfill(self, generation: int) -> bool:

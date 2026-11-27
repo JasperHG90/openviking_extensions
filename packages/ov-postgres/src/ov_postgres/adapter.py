@@ -37,7 +37,7 @@ from . import ddl
 from .collection import PgVectorCollection
 from .compat import check_openviking_version
 from .config import DSN_ENV_VARS, PgVectorParams, VectorDBConfigLike, resolve_dsn
-from .md5_backfill import FileReader, run_md5_backfill
+from .md5_backfill import BATCH_SIZE, FileReader, run_md5_backfill
 from .observability import DB_SYSTEM, annotate, traced
 from .schema import CollectionSchema
 
@@ -454,7 +454,9 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
             )
         return False
 
-    async def run_md5_backfill(self, viking_fs: FileReader) -> int:
+    async def run_md5_backfill(
+        self, viking_fs: FileReader, *, batch_size: int = BATCH_SIZE
+    ) -> int:
         """Fill in ``md5`` on rows a reconcile left without one.
 
         Needs the running server's ``VikingFS``, because the md5 is of the
@@ -467,6 +469,8 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
         ----------
         viking_fs :
             The server's ``VikingFS``.
+        batch_size :
+            Rows read per round trip.
 
         Returns
         -------
@@ -477,7 +481,9 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
         inner = self._pg_collection
         if inner is None:
             return 0
-        return await run_md5_backfill(inner, viking_fs, self._decode_uri_field_value)
+        return await run_md5_backfill(
+            inner, viking_fs, self._decode_uri_field_value, batch_size=batch_size
+        )
 
     @traced("ov_postgres.reconcile")
     def _reconcile(self, schema: dict[str, Any]) -> None:

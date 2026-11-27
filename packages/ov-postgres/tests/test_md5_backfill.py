@@ -9,8 +9,11 @@ complete.
 from __future__ import annotations
 
 import asyncio
+import logging
 import tempfile
+import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
@@ -280,10 +283,80 @@ def test_a_backfill_queued_again_during_a_run_stays_queued(
         assert adapter.collection_exists()
         inner = adapter._pg_collection
         assert inner is not None
-        reader = CountingReader(viking_fs, on_first=inner.queue_md5_backfill)
+        reader = CountingReader(viking_fs, on_first=inner._queue_md5_backfill)
         asyncio.run(adapter.run_md5_backfill(reader))
         assert inner.md5_backfill_pending(), "queued during the run: still pending"
         asyncio.run(adapter.run_md5_backfill(viking_fs))
         assert not inner.md5_backfill_pending()
+    finally:
+        adapter.close()
+
+
+def test_a_lease_left_by_a_crashed_process_expires(
+    dsn: str, test_schema: str, viking_fs: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A run that died holding the lease blocks others only until it lapses."""
+    reconciled_old_table(dsn, test_schema, viking_fs)
+    adapter = make_adapter(dsn, test_schema)
+    try:
+        assert adapter.collection_exists()
+        inner = adapter._pg_collection
+        assert inner is not None
+        assert inner.take_md5_lease("crashed-worker", 1.0)
+        with caplog.at_level(logging.INFO, logger="ov_postgres.md5_backfill"):
+            assert asyncio.run(adapter.run_md5_backfill(viking_fs)) == 0
+        assert any(
+            r.levelno == logging.INFO and "holds the lease" in r.getMessage()
+            for r in caplog.records
+        )
+        time.sleep(1.5)
+        assert asyncio.run(adapter.run_md5_backfill(viking_fs)) == 4
+        assert not inner.md5_backfill_pending()
+    finally:
+        adapter.close()
+
+
+def test_of_racing_takers_exactly_one_gets_the_lease(
+    dsn: str, test_schema: str, viking_fs: Any
+) -> None:
+    """The lease is taken by a conditional update, so a race has one winner."""
+    reconciled_old_table(dsn, test_schema, viking_fs)
+    adapters = [make_adapter(dsn, test_schema) for _ in range(8)]
+    try:
+        inners = []
+        for adapter in adapters:
+            assert adapter.collection_exists()
+            inners.append(adapter._pg_collection)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            won = list(
+                pool.map(
+                    lambda pair: pair[1].take_md5_lease(f"worker-{pair[0]}", 60.0),
+                    enumerate(inners),
+                )
+            )
+        assert won.count(True) == 1
+    finally:
+        for adapter in adapters:
+            adapter.close()
+
+
+def test_a_run_that_loses_its_lease_stops_without_clearing_the_mark(
+    dsn: str, test_schema: str, viking_fs: Any
+) -> None:
+    """If another process took over, this run must not finish its work for it."""
+    reconciled_old_table(dsn, test_schema, viking_fs)
+    adapter = make_adapter(dsn, test_schema)
+    try:
+        assert adapter.collection_exists()
+        inner = adapter._pg_collection
+        assert inner is not None
+
+        def steal() -> None:
+            inner.release_md5_lease(None)
+            assert inner.take_md5_lease("someone-else", 60.0)
+
+        reader = CountingReader(viking_fs, on_first=steal)
+        asyncio.run(adapter.run_md5_backfill(reader, batch_size=1))
+        assert inner.md5_backfill_pending()
     finally:
         adapter.close()

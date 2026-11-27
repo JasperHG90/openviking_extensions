@@ -23,16 +23,27 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from collections.abc import Callable
-from contextlib import AbstractContextManager
 from typing import Protocol
 
-__all__ = ["BATCH_SIZE", "SIDECAR_NAMES", "FileReader", "md5_for", "run_md5_backfill"]
+__all__ = [
+    "BATCH_SIZE",
+    "LEASE_SECONDS",
+    "SIDECAR_NAMES",
+    "FileReader",
+    "md5_for",
+    "run_md5_backfill",
+]
 
 logger = logging.getLogger(__name__)
 
 # Rows fingerprinted per round trip to the database.
 BATCH_SIZE = 200
+
+# How long a run holds the lease without renewing it. A run renews it after
+# every batch, so this bounds how long a crashed run blocks the next one.
+LEASE_SECONDS = 120.0
 
 # The sidecar file that carries each directory level's embedding source.
 SIDECAR_NAMES: dict[int, str] = {0: ".abstract.md", 1: ".overview.md"}
@@ -63,8 +74,20 @@ class _Collection(Protocol):
         """Set one row's md5 if it is still empty."""
         ...
 
-    def md5_backfill_run(self) -> AbstractContextManager[int | None]:
-        """Hold the right to backfill; yield the starting generation, or None."""
+    def md5_backfill_generation(self) -> int:
+        """Return how many times the backfill has been queued."""
+        ...
+
+    def take_md5_lease(self, owner: str, seconds: float) -> bool:
+        """Take the right to backfill unless someone else holds a live lease."""
+        ...
+
+    def renew_md5_lease(self, owner: str, seconds: float) -> bool:
+        """Extend the lease; False if another process has taken it."""
+        ...
+
+    def release_md5_lease(self, owner: str | None) -> bool:
+        """Give the lease up."""
         ...
 
     def finish_md5_backfill(self, generation: int) -> bool:
@@ -133,6 +156,7 @@ async def run_md5_backfill(
     decode_uri: Callable[[str], object],
     *,
     batch_size: int = BATCH_SIZE,
+    lease_seconds: float = LEASE_SECONDS,
 ) -> int:
     """Fingerprint every row left with an empty md5, then clear the mark.
 
@@ -141,7 +165,8 @@ async def run_md5_backfill(
     it together, and one run is enough. A row whose source cannot be read
     keeps its empty md5. A row written meanwhile with an md5 of its own keeps
     that one. If the backfill is queued again while this run works, the mark
-    stays for the next run.
+    stays for the next run. A run that finds its lease taken over stops
+    and leaves the mark for whoever took it.
 
     Parameters
     ----------
@@ -153,6 +178,8 @@ async def run_md5_backfill(
         Turns a stored URI into the ``viking://`` form.
     batch_size :
         Rows read per round trip.
+    lease_seconds :
+        How long the lease lasts between renewals.
 
     Returns
     -------
@@ -161,15 +188,16 @@ async def run_md5_backfill(
     """
     if not await asyncio.to_thread(collection.md5_backfill_pending):
         return 0
-    run = collection.md5_backfill_run()
-    generation = await asyncio.to_thread(run.__enter__)
+    owner = uuid.uuid4().hex
+    if not await asyncio.to_thread(collection.take_md5_lease, owner, lease_seconds):
+        logger.info("ov_postgres: md5 backfill skipped; another process holds the lease")
+        return 0
     try:
-        if generation is None:
-            logger.debug("ov_postgres: md5 backfill already running elsewhere")
-            return 0
-        return await _fill(collection, viking_fs, decode_uri, batch_size, generation)
+        return await _fill(
+            collection, viking_fs, decode_uri, batch_size, owner, lease_seconds
+        )
     finally:
-        await asyncio.to_thread(run.__exit__, None, None, None)
+        await asyncio.to_thread(collection.release_md5_lease, owner)
 
 
 async def _fill(
@@ -177,11 +205,13 @@ async def _fill(
     viking_fs: FileReader,
     decode_uri: Callable[[str], object],
     batch_size: int,
-    generation: int,
+    owner: str,
+    lease_seconds: float,
 ) -> int:
-    """Run one backfill pass while holding the run lock."""
+    """Run one backfill pass while holding the lease."""
     if not await asyncio.to_thread(collection.md5_backfill_pending):
         return 0
+    generation = await asyncio.to_thread(collection.md5_backfill_generation)
     filled = 0
     skipped = 0
     after: object = None
@@ -195,6 +225,13 @@ async def _fill(
                 continue
             if await asyncio.to_thread(collection.record_md5, key, md5):
                 filled += 1
+        if not await asyncio.to_thread(collection.renew_md5_lease, owner, lease_seconds):
+            logger.warning(
+                "ov_postgres: md5 backfill lost its lease to another process; "
+                "stopping after %d row(s)",
+                filled,
+            )
+            return filled
         if len(batch) < batch_size:
             break
         after = batch[-1][0]
