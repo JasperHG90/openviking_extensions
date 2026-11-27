@@ -12,6 +12,7 @@ Packages that extend [OpenViking](https://github.com/volcengine/OpenViking), col
 | [`ov-skills`](packages/ov-skills/) | Markdown + Bash | `/handoff`, `/continue`, `/learnings`, `/ingest` for Claude Code, opencode, and Hermes |
 | [`ov-dash`](packages/ov-dash/) | TypeScript | A dashboard over OpenViking that signs people in through Vault and keeps their credential server-side |
 | [`ov-clip`](packages/ov-clip/) | TypeScript | Firefox extension that saves the page you are reading into OpenViking, using `ovx`'s Vault login |
+| [`ov-sync-queue`](packages/ov-sync-queue/) | Go | `ovsq`: mirror a local folder into the ov-sync bucket, so OpenViking gets it through the queue and its consumer |
 
 Each package has its own README with install and usage instructions.
 
@@ -25,6 +26,7 @@ packages/
   ov-skills/       Agent skills with a Python test suite (standalone uv project)
   ov-dash/         Node service and Svelte client (npm, its own toolchain)
   ov-clip/         Firefox extension (npm, its own toolchain)
+  ov-sync-queue/   Go module, the ovsq CLI (go, its own toolchain)
 ```
 
 Two of the four Python packages — `ov-postgres` and `ov-ext` — are members of a single [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/): one `uv.lock` and one `.venv` at the root cover both. `ovx` and `ov-skills` stand alone, each with a lock and a `.venv` of its own. Packages in other languages live under `packages/` beside them with their own toolchains.

@@ -12,16 +12,37 @@ tags: [summary]
 
 ## The project
 
-What the project is for and who uses it, in a few sentences.
+Extensions around OpenViking, one package per folder under `packages/`: a
+pgvector store, server extensions, CLIs, agent skills, a dashboard, a browser
+clipper and two folder syncs. The manifesto is not written yet, so the
+project's purpose and values are only in the root README for now.
 
 ## How it works
 
-The design as a whole: the parts, how they fit and the main flows, citing the architecture pages.
+The bundle covers one design so far: `ovsq`
+([architecture](architecture/ov-sync-queue.md)), which mirrors a local folder
+into a prefix of the `ov-sync` bucket. It picks files from its config, hashes
+them with a local cache, compares them with its manifest in the bucket, and
+uploads and deletes to match. Everything after the bucket (webhook, JetStream
+queue, `ov-sync-consumer`, OpenViking) lives in JasperHG90/localstack.
 
 ## What it has settled
 
-The principles and constraints the decisions and practices set, with their reasons, grouped by idea and citing the records inline as evidence; never one bullet per decision.
+- Knowledge lives in this OKF bundle next to the code
+  ([ADR 0001](decisions/0001-keep-project-knowledge-in-an-okf-bundle.md)).
+- Local documents should reach OpenViking through the queue that paces and
+  retries writes, not straight from a laptop, so `ovsq` stops at the bucket
+  ([ADR 0002](decisions/0002-ov-sync-queue-syncs-into-the-ov-sync-bucket-not-straight-to-the-queue.md)).
+- Whoever writes a set of keys owns their record: each `ovsq` source keeps
+  its own manifest beside the CI action's, and the bucket copy, not the local
+  cache, is the truth
+  ([ADR 0003](decisions/0003-each-ovsq-source-owns-its-own-manifest-in-the-bucket.md)).
+- `ovsq` is Go, matching the consumer it feeds, so the gates need a Go
+  toolchain ([ADR 0004](decisions/0004-ovsq-is-written-in-go.md)).
 
 ## Where it stands
 
-What works, what is open or in flight, and what the bundle does not cover yet.
+`ovsq` has `init`, `status` and `run`; `watch` is not built. Reaching
+OpenViking still needs each prefix added to the consumer's prefix map and a
+write credential, both outside this repo. The other packages have no
+architecture pages or decision records yet.
