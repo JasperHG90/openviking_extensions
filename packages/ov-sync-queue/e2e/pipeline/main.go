@@ -5,15 +5,19 @@
 // The fake OpenViking (FAKE_OV_ADDR) keeps files and folders in memory and
 // answers the calls ov-sync-consumer makes: content/write, temp_upload plus
 // resources for images, DELETE fs, and fs/ls, which lists OpenViking's
-// .abstract.md and .overview.md in every folder. Anything else is logged as
+// .abstract.md and .overview.md in every folder. As real OpenViking does
+// (localstack spike:ov-sync-consumer-binary-upload/6), a deleted image's
+// folder stays listed in its parent for good, as an empty folder whose own
+// listing is []. Anything else is logged as
 // UNEXPECTED and refused. GET /_files returns every file it holds, uri to
 // content, with content that is not UTF-8 shown as sha256:<hex>; GET /_dirs
-// every folder; GET /_calls every call it took.
+// every folder (dir, or ghost for a deleted image's); GET /_calls every call
+// it took.
 //
 // The issuer (ISSUER_ADDR, public URL ISSUER) serves OIDC discovery and a
-// JWKS, and writes a token to TOKEN_FILE shaped like the one Nomad gives the
-// ov-sync-consumer job: audience seaweedfs, nomad_job_id ov-sync-consumer and
-// a global:default:ov-sync-consumer:... subject.
+// JWKS, and writes a token to TOKEN_FILE shaped like the workload identity
+// Nomad gives job JOB for audience AUD: nomad_job_id JOB and a
+// global:default:JOB:... subject.
 package main
 
 import (
@@ -42,7 +46,7 @@ func main() {
 		log.Fatal(err)
 	}
 	issuer := os.Getenv("ISSUER")
-	token, err := workloadToken(key, issuer, time.Now())
+	token, err := workloadToken(key, issuer, os.Getenv("JOB"), os.Getenv("AUD"), time.Now())
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -50,7 +54,8 @@ func main() {
 		log.Fatal(err)
 	}
 	go func() { log.Fatal(http.ListenAndServe(os.Getenv("ISSUER_ADDR"), issuerHandler(key, issuer))) }()
-	ov := &fakeOV{files: map[string][]byte{}, dirs: map[string]bool{}, temp: map[string][]byte{}}
+	ov := &fakeOV{files: map[string][]byte{}, dirs: map[string]bool{}, temp: map[string][]byte{},
+		images: map[string]bool{}, ghosts: map[string]bool{}}
 	log.Fatal(http.ListenAndServe(os.Getenv("FAKE_OV_ADDR"), ov))
 }
 
@@ -58,15 +63,18 @@ const keyID = "nomad-e2e"
 
 func b64(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
 
-func workloadToken(key *rsa.PrivateKey, issuer string, now time.Time) (string, error) {
+func workloadToken(key *rsa.PrivateKey, issuer, job, aud string, now time.Time) (string, error) {
+	if job == "" || aud == "" {
+		return "", fmt.Errorf("JOB and AUD must be set")
+	}
 	header, _ := json.Marshal(map[string]string{"alg": "RS256", "typ": "JWT", "kid": keyID})
 	claims, _ := json.Marshal(map[string]any{
 		"iss":             issuer,
-		"aud":             []string{"seaweedfs"},
-		"sub":             "global:default:ov-sync-consumer:consumer:consumer:seaweedfs",
+		"aud":             []string{aud},
+		"sub":             "global:default:" + job + ":" + job + ":" + job + ":" + aud,
 		"nomad_namespace": "default",
-		"nomad_job_id":    "ov-sync-consumer",
-		"nomad_task":      "consumer",
+		"nomad_job_id":    job,
+		"nomad_task":      job,
 		"iat":             now.Unix(),
 		"nbf":             now.Unix(),
 		"exp":             now.Add(time.Hour).Unix(),
@@ -103,9 +111,13 @@ type fakeOV struct {
 	files map[string][]byte
 	// dirs holds every folder a write created. As in OpenViking, a folder
 	// stays when its last file goes, until a recursive delete removes it.
-	dirs  map[string]bool
-	temp  map[string][]byte
-	calls []string
+	dirs map[string]bool
+	temp map[string][]byte
+	// images holds the folders an image upload made; ghosts the ones whose
+	// image was deleted, which stay listed but empty.
+	images map[string]bool
+	ghosts map[string]bool
+	calls  []string
 }
 
 func parent(uri string) string { return uri[:max(strings.LastIndex(uri, "/"), 0)] }
@@ -137,7 +149,14 @@ func (f *fakeOV) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.NewEncoder(w).Encode(out)
 	case r.Method == http.MethodGet && r.URL.Path == "/_dirs":
-		_ = json.NewEncoder(w).Encode(f.dirs)
+		out := map[string]string{}
+		for d := range f.dirs {
+			out[d] = "dir"
+			if f.ghosts[d] {
+				out[d] = "ghost"
+			}
+		}
+		_ = json.NewEncoder(w).Encode(out)
 	case r.Method == http.MethodGet && r.URL.Path == "/_calls":
 		_ = json.NewEncoder(w).Encode(f.calls)
 	case r.Header.Get("Authorization") != "Bearer ov-token":
@@ -190,6 +209,8 @@ func (f *fakeOV) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.removeTree(folder)
 		f.files[folder+"/"+body.Name] = f.temp[body.TempID]
 		f.dirs[folder] = true
+		f.images[folder] = true
+		delete(f.ghosts, folder)
 		f.mkdirs(folder)
 		delete(f.temp, body.TempID)
 		ok(nil)
@@ -200,7 +221,11 @@ func (f *fakeOV) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			delete(f.files, uri)
 		} else if f.dirs[uri] && q.Get("recursive") == "true" {
 			f.removeTree(uri)
-			delete(f.dirs, uri)
+			if f.images[uri] {
+				f.ghosts[uri] = true
+			} else {
+				delete(f.dirs, uri)
+			}
 		} else if f.dirs[uri] {
 			refuse(http.StatusPreconditionFailed)
 			return
@@ -213,6 +238,10 @@ func (f *fakeOV) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		uri := strings.TrimSuffix(q.Get("uri"), "/")
 		if !f.dirs[uri] {
 			refuse(http.StatusNotFound)
+			return
+		}
+		if f.ghosts[uri] {
+			ok([]map[string]any{})
 			return
 		}
 		// OpenViking keeps a summary pair in every folder, so the consumer
@@ -248,6 +277,8 @@ func (f *fakeOV) removeTree(uri string) {
 	for d := range f.dirs {
 		if strings.HasPrefix(d, uri+"/") {
 			delete(f.dirs, d)
+			delete(f.images, d)
+			delete(f.ghosts, d)
 		}
 	}
 }

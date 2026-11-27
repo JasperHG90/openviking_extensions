@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# LOCAL ONLY: not in CI and not a gate. It needs docker, Go, jq and a clone
-# of JasperHG90/localstack (LOCALSTACK_DIR, default ../localstack beside this
-# repo), because it builds ov-sync-consumer from that clone and reads the
-# production SeaweedFS set-up from its jobspecs.
+# LOCAL ONLY: not in CI and not a gate. It needs docker, Go, jq, terraform
+# and a clone of JasperHG90/localstack (LOCALSTACK_DIR, default ../localstack
+# beside this repo), because it builds ov-sync-consumer from that clone and
+# reads the production set-up from its jobspecs and Terraform.
 #
 # Runs ovsq through the whole ov-sync pipeline, each piece in a container:
 #
@@ -17,9 +17,12 @@
 # - The receiver and consumer are the real ov-sync-consumer binary, run with
 #   the jobspec's environment. The consumer gets its S3 credentials the
 #   production way: SeaweedFS's STS trades a Nomad-style workload token for
-#   the ov-sync-consumer role, under the IAM policy services.tf renders
-#   (defaultEffect Deny). The script refuses to run if services.tf's role,
-#   policy or trust lines change, so its copy cannot drift silently.
+#   its role. SeaweedFS's iam.json is built the way production builds it:
+#   terraform evaluates services.tf's own iam_members expression over its
+#   local.seaweedfs_iam, and the result fills seaweedfs.hcl's iam.json
+#   template. Only the nomad provider's issuer is swapped for the fake one.
+#   The role ARN, the token's audience and the job id come from
+#   ov-sync-consumer.hcl.
 # What is faked: OpenViking, and the Nomad OIDC issuer that signs the token
 # (pipeline/main.go). The catch-up pass is pushed out to 24h, so every change
 # that reaches OpenViking got there through an event.
@@ -38,24 +41,14 @@ done
 step() { echo "== $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-# The IAM copy below must match services.tf's local.seaweedfs_iam.
-for line in \
-    'policy = { defaultEffect = "Deny" }' \
-    'config  = { issuer = "https://nomad.lab.orangecluster.nl", clientId = "seaweedfs" }' \
-    '"ov-sync-consumer" = "ov-sync"' \
-    'Action   = ["s3:*"]' \
-    'Resource = ["arn:aws:s3:::${bucket}", "arn:aws:s3:::${bucket}/*"]' \
-    'roleArn  = "arn:aws:iam::role/${job}"' \
-    'Principal = { Federated = "nomad" }' \
-    'StringEquals = { "oidc:nomad_job_id" = job }' \
-    'StringLike   = { "oidc:sub" = "global:default:${job}:*" }'; do
-    grep -qF -- "$line" "$infra/services.tf" ||
-        fail "services.tf no longer has: $line. Update the IAM copy in pipeline.sh to match."
-done
-for line in 'AWS_ROLE_ARN                = "arn:aws:iam::role/ov-sync-consumer"' 'aud         = ["seaweedfs"]'; do
-    grep -qF -- "$line" "$consumer_hcl" ||
-        fail "ov-sync-consumer.hcl no longer has: $line. Update pipeline.sh to match."
-done
+hcl_value() { # hcl_value FILE KEY: the quoted value of the first KEY = "..." line
+    grep -E "^[[:space:]]*$2[[:space:]]*=" "$1" | head -1 | sed -E 's/^[^"]*"([^"]*)".*/\1/'
+}
+role_arn=$(hcl_value "$consumer_hcl" AWS_ROLE_ARN)
+job=$(grep -E '^job "' "$consumer_hcl" | sed -E 's/^job "([^"]+)".*/\1/')
+aud=$(grep -E '^[[:space:]]*aud[[:space:]]*=' "$consumer_hcl" | head -1 | sed -E 's/.*\["([^"]+)"\].*/\1/')
+[ -n "$role_arn" ] && [ -n "$job" ] && [ -n "$aud" ] ||
+    fail "could not read the role ARN, job or audience from $consumer_hcl"
 
 pin() { grep -Eo 'docker\.io/[a-z0-9/._-]+:[A-Za-z0-9._-]+' "$1" | head -1; }
 seaweed_image=$(pin "$seaweed_hcl")
@@ -104,20 +97,31 @@ grep -qF 'endpoint = "http://127.0.0.1:20500/events"' "$work/secrets/notificatio
     fail "the webhook no longer posts to the receiver on loopback: $(cat "$work/secrets/notification.toml")"
 awk '/\[master.volume_growth\]/{p=1} p&&/EOH/{exit} p' "$seaweed_hcl" | sed 's/^ *//' > "$work/secrets/master.toml"
 issuer=http://$run_id-fakes:8090
-jq -n --arg issuer "$issuer" '{
-  sts: {tokenDuration: "1h", maxSessionLength: "12h", issuer: "seaweedfs-sts",
-        signingKey: "c2VhdHdlZWRmcy1lMmUtc2lnbmluZy1rZXktMzJieXRlcyE="},
-  policy: {defaultEffect: "Deny"},
-  providers: [{name: "nomad", type: "oidc", enabled: true, config: {issuer: $issuer, clientId: "seaweedfs"}}],
-  policies: [{name: "ov-sync-consumer", document: {Version: "2012-10-17", Statement: [{
-    Effect: "Allow", Action: ["s3:*"], Resource: ["arn:aws:s3:::ov-sync", "arn:aws:s3:::ov-sync/*"]}]}}],
-  roles: [{roleName: "ov-sync-consumer", roleArn: "arn:aws:iam::role/ov-sync-consumer",
-    trustPolicy: {Version: "2012-10-17", Statement: [{
-      Effect: "Allow", Principal: {Federated: "nomad"}, Action: "sts:AssumeRoleWithWebIdentity",
-      Condition: {StringEquals: {"oidc:nomad_job_id": "ov-sync-consumer"},
-                  StringLike: {"oidc:sub": "global:default:ov-sync-consumer:*"}}}]},
-    attachedPolicies: ["ov-sync-consumer"]}]
-}' > "$work/secrets/iam.json"
+# Production: services.tf passes iam_members (an expression over
+# local.seaweedfs_iam) into seaweedfs.hcl's iam.json template. Evaluate that
+# same expression with terraform over the locals block that defines it, with
+# no CI callers, then fill the same template.
+mkdir -p "$work/tf"
+awk '/^locals \{/{buf=$0"\n"; inb=1; next}
+     inb{buf=buf $0 "\n"; if ($0 ~ /^\}/) { if (buf ~ /seaweedfs_iam/) printf "%s", buf; inb=0; buf="" }}' \
+    "$infra/services.tf" > "$work/tf/locals.tf"
+printf 'variable "vault_ci_callers" {\n  type    = any\n  default = {}\n}\n' > "$work/tf/variables.tf"
+members_expr=$(grep -E '^[[:space:]]*iam_members[[:space:]]*=' "$infra/services.tf" | sed -E 's/^[[:space:]]*iam_members[[:space:]]*=[[:space:]]*//')
+[ -n "$members_expr" ] || fail "services.tf no longer passes iam_members to seaweedfs.hcl"
+members=$(cd "$work/tf" && echo "jsonencode($members_expr)" | terraform console -no-color | jq -r . | jq -r .) ||
+    fail "terraform could not evaluate iam_members over services.tf's locals"
+template=$(grep -F '"sts":' "$seaweed_hcl" | sed -E 's/^[[:space:]]+//')
+[ -n "$template" ] || fail "seaweedfs.hcl no longer has an iam.json template with an sts block"
+template=${template#'{{ with secret "${sts_secret}" }}'}
+template=${template%'{{ end }}'}
+template=${template//'{{ .Data.data.signing_key }}'/c2VhdHdlZWRmcy1lMmUtc2lnbmluZy1rZXktMzJieXRlcyE=}
+template=${template//'${iam_members}'/$members}
+jq --arg issuer "$issuer" '.providers |= map(if .name == "nomad" then .config.issuer = $issuer else . end)' \
+    <<<"$template" > "$work/secrets/iam.json" || fail "the rendered iam.json is not JSON: $template"
+jq -e --arg issuer "$issuer" --arg role "$role_arn" '
+    any(.providers[]; .name == "nomad" and .config.issuer == $issuer) and any(.roles[]; .roleArn == $role)' \
+    "$work/secrets/iam.json" >/dev/null ||
+    fail "the rendered iam.json has no nomad provider or no role $role_arn"
 cp "$here/s3.json" "$work/secrets/s3.json"
 echo hook-token > "$work/secrets/webhook_token"
 echo ov-token > "$work/secrets/ov_token"
@@ -128,7 +132,7 @@ docker network create "$run_id" >/dev/null
 docker run -d --name "$run_id-fakes" --network "$run_id" -p "$ov_port:8080" \
     -v "$work/bin:/bin-e2e:ro" -v "$work/tokens:/tokens" \
     -e FAKE_OV_ADDR=0.0.0.0:8080 -e ISSUER_ADDR=0.0.0.0:8090 -e ISSUER="$issuer" \
-    -e TOKEN_FILE=/tokens/nomad_seaweedfs.jwt \
+    -e TOKEN_FILE=/tokens/nomad_seaweedfs.jwt -e JOB="$job" -e AUD="$aud" \
     alpine:3 /bin-e2e/fakes >/dev/null
 docker run -d --name "$run_id-nats" --network "$run_id" -p "$mon_port:8222" \
     "$nats_image" -js -m 8222 >/dev/null
@@ -147,7 +151,7 @@ docker run -d --name "$run_id-consumer" --network "$run_id" \
     -e OV_SYNC_MAP_FILE=/local/prefixes.json \
     -e S3_ENDPOINT="$run_id-receiver:8333" -e S3_BUCKET=ov-sync \
     -e AWS_WEB_IDENTITY_TOKEN_FILE=/secrets/tokens/nomad_seaweedfs.jwt \
-    -e AWS_ROLE_ARN=arn:aws:iam::role/ov-sync-consumer \
+    -e AWS_ROLE_ARN="$role_arn" \
     -e RATE_PER_SECOND=50 -e MAX_TRIES=3 -e CATCHUP_INTERVAL=24h \
     alpine:3 /bin-e2e/ov-sync-consumer consumer >/dev/null
 
@@ -224,24 +228,39 @@ rm img/pic.png
 wait_for "$(jq -n --arg r "$r" '{($r+"/docs/a.md"): "changed\n"}')"
 
 step "checking what went through"
-sleep 3 # let any stragglers land before reading the logs and the stream
+# Wait until the consumer has acked everything, so a retried or
+# dead-lettered event has run its course before the logs are read.
+drained() {
+    curl -sf "http://127.0.0.1:$mon_port/jsz?consumers=true" | jq -e '
+        [.account_details[0].stream_detail[] | select(.name == "OV_SYNC") | .consumer_detail[]]
+        | length > 0 and all(.[]; .num_pending == 0 and .num_ack_pending == 0)' >/dev/null 2>&1
+}
+for _ in $(seq 120); do drained && break; sleep 1; done
+drained || fail "the consumer never acked every event"
 all=$(calls)
 d=$(dirs)
 jq -e 'map(select(test("_state"))) | length == 0' <<<"$all" >/dev/null ||
     fail "OpenViking got a call for ovsq's manifest: $all"
 jq -e 'map(select(startswith("UNEXPECTED"))) | length == 0' <<<"$all" >/dev/null ||
     fail "OpenViking got a call the fake does not know: $all"
-for gone in docs/deep img/pic.png img; do
-    jq -e --arg u "$r/$gone" 'has($u) | not' <<<"$d" >/dev/null ||
-        fail "the emptied folder $gone was left in OpenViking: $all"
-done
-jq -e --arg u "$r/docs" 'has($u)' <<<"$d" >/dev/null ||
+jq -e --arg u "$r/docs/deep" 'has($u) | not' <<<"$d" >/dev/null ||
+    fail "the emptied folder docs/deep was left in OpenViking: $all"
+jq -e --arg u "$r/docs" '.[$u] == "dir"' <<<"$d" >/dev/null ||
     fail "the folder docs, which still holds a.md, was removed: $all"
+# OpenViking keeps a deleted image's folder as an empty ghost, so the consumer
+# deletes img/pic.png, treats the ghost as gone, and leaves img alone.
+jq -e --arg u "$r/img/pic.png" 'index("DELETE " + $u) != null' <<<"$all" >/dev/null ||
+    fail "the consumer never deleted the image's folder img/pic.png: $all"
+jq -e --arg u "$r/img/pic.png" '.[$u] == "ghost"' <<<"$d" >/dev/null ||
+    fail "img/pic.png should be left as OpenViking's empty ghost folder: $d"
+jq -e --arg u "$r/img" 'index("DELETE " + $u) == null' <<<"$all" >/dev/null ||
+    fail "the consumer deleted img, which still lists the ghost: $all"
 # Capture first: under pipefail, grep -q exiting early can kill docker logs
 # with SIGPIPE and hide the match.
 consumer_log=$(docker logs "$run_id-consumer" 2>&1)
-if grep -q 'dead-lettering' <<<"$consumer_log"; then
-    fail "the consumer dead-lettered an event"
+if grep -qE 'event failed|dead-lettering' <<<"$consumer_log"; then
+    grep -E 'event failed|dead-lettering' <<<"$consumer_log" | head -5 >&2
+    fail "the consumer failed or dead-lettered an event"
 fi
 msgs=$(curl -sf "http://127.0.0.1:$mon_port/jsz?streams=true" |
     jq '.account_details[0].stream_detail[] | select(.name == "OV_SYNC") | .state.messages')

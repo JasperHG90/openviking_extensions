@@ -131,9 +131,13 @@ only: CI has no clone, and it is not a gate.
 - The receiver and the consumer are the real `ov-sync-consumer` binary,
   built from the clone and run with the jobspec's environment.
 - The consumer gets S3 credentials the production way: SeaweedFS's STS trades
-  a Nomad-style workload token for the `ov-sync-consumer` role, under the
-  IAM policy `services.tf` renders, with `defaultEffect` Deny. The script
-  stops if those lines in `services.tf` change, so its copy cannot drift.
+  a Nomad-style workload token for the role `ov-sync-consumer.hcl` names,
+  with `defaultEffect` Deny. SeaweedFS's `iam.json` is built as production
+  builds it: `terraform console` evaluates `services.tf`'s own `iam_members`
+  expression, and the result fills `seaweedfs.hcl`'s template. Only the
+  OIDC issuer URL is swapped for the fake one. So the test needs terraform
+  on PATH, and a change to the role, policy or trust in localstack shows up
+  in the next run.
 - Only OpenViking and the Nomad token issuer are faked (`e2e/pipeline/`).
   The catch-up pass is pushed out to 24h, so every change must arrive
   through an event.
@@ -141,8 +145,9 @@ only: CI has no clone, and it is not a gate.
 It checks that text files and a PNG under a `subdir` reach OpenViking:
 upload, edit, replace, and delete, with the image compared byte for byte.
 It also checks that the consumer never touches ovsq's manifest, that
-emptied folders (an image's included) are removed, and that nothing is
-dead-lettered. `OVSQ_E2E_KEEP=1` leaves the containers up after a run.
+emptied folders are removed, and that no event fails or is dead-lettered.
+The fake OpenViking keeps a deleted image's folder as an empty ghost, as
+real OpenViking does, so the consumer's handling of that is tested too. `OVSQ_E2E_KEEP=1` leaves the containers up after a run.
 
 The repo's `prek run --all-files` runs `check.sh` through the
 `go-ov-sync-queue` hook, so the repo's gates now need Go on PATH.
