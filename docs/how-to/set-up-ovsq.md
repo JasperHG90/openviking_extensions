@@ -1,5 +1,5 @@
 ---
-description: "Sync a local folder into OpenViking through the ov-sync queue with ovsq and an S3 key scoped to your prefix, then check the whole pipeline on your laptop."
+description: "Sync a local folder into OpenViking through the ov-sync queue with ovsq and 15-minute S3 credentials from your Vault session, then check the whole pipeline on your laptop."
 stale_after: 2027-02-27
 sources:
   - resource: packages/ov-sync-queue/README.md
@@ -16,21 +16,18 @@ This guide gets one local folder into OpenViking through the ov-sync queue.
 JasperHG90/localstack takes them from there.
 
 `ovsq` runs on your laptop, never in CI. In CI, use the `openviking-sync`
-action, which logs in without a key.
+action.
 
-It authenticates with a static S3 key. No local route skips the key: the
-keyless logins in localstack are for Nomad jobs (a workload token) and
-GitHub Actions (a Vault token), and a laptop has neither. So you give it a
-key scoped to one prefix, which can read, write and delete under that
-prefix and nothing else.
-
-The examples use the prefix `JasperHG90/notes`. Use `<owner>/<name>` for your
-own.
+No S3 key is stored for it. Before each run, `localstack ov-sync-env` trades
+your Vault session for S3 credentials that last 15 minutes and can read,
+write and delete under `ov-sync/JasperHG90/local/` only. Localstack maps that
+prefix once to `viking://user/jasper/resources/local/`, and each folder picks
+its own place under it with `subdir`. So adding a folder needs no change in
+localstack.
 
 ## Before you start
 
-- A clone of JasperHG90/localstack you can apply Terraform from, and Vault
-  access to read the key back.
+- The `localstack` CLI, logged in as the operator (`localstack login`).
 - For the local check at the end: Docker, Go 1.26 or later, `jq` and
   `terraform` on PATH, and
   the localstack clone beside this repo (or `LOCALSTACK_DIR` pointing at it).
@@ -62,128 +59,45 @@ cd packages/ov-sync-queue
 go build -o ~/.local/bin/ovsq .
 ```
 
-### 2. Map your prefix to an OpenViking folder
-
-The consumer drops files whose prefix it has no mapping for, and they reach
-the bucket and go no further. In localstack, add the prefix to `prefixes` in
-`nomad_job.ov_sync_consumer` (`deployments/applications/services.tf`):
-
-```hcl
-prefixes = jsonencode({
-  # ...the entries already there
-  "JasperHG90/notes/" = "viking://user/jasper/resources/projects/notes/"
-})
-```
-
-Keep the trailing `/` on both sides.
-
-### 3. Create a key scoped to your prefix
-
-SeaweedFS reads its static keys from the `s3.json` template in
-`deployments/infrastructure/services/seaweedfs.hcl`. Today that file holds
-only the admin key. Do not hand the admin key to `ovsq`: it can do anything
-to every bucket.
-
-In `deployments/infrastructure/secrets.tf`, add a secret beside the admin
-key's. Put it under `default/seaweedfs/` so the SeaweedFS job can read it,
-because a Nomad job reads only `secret/data/default/<its job id>/*`:
-
-```hcl
-resource "random_password" "ovsq_notes_secret_key" {
-  length  = 40
-  special = false
-}
-
-resource "vault_kv_secret_v2" "ovsq_notes" {
-  mount = vault_mount.kvv2.path
-  name  = "default/seaweedfs/ovsq-notes"
-  data_json = jsonencode({
-    access_key = "ovsq-notes"
-    secret_key = random_password.ovsq_notes_secret_key.result
-  })
-}
-```
-
-Pass its path to the SeaweedFS template. In
-`deployments/infrastructure/services.tf`, add the variable next to
-`seaweedfs_secret`:
-
-```hcl
-      ovsq_notes_secret = vault_kv_secret_v2.ovsq_notes.path
-```
-
-Then add an identity to `seaweedfs.hcl`'s `s3.json` template. The whole
-file sits on one line, and invalid JSON there breaks S3 for every user once
-SeaweedFS restarts, so edit it with care. Insert a comma and the new entry
-just before the closing `]}`, so the line ends like this:
-
-```json
-...,"actions":["Admin","Read","Write","List","Tagging"]},{"name":"ovsq-notes","credentials":[{"accessKey":"{{ with secret "${ovsq_notes_secret}" }}{{ .Data.data.access_key }}{{ end }}","secretKey":"{{ with secret "${ovsq_notes_secret}" }}{{ .Data.data.secret_key }}{{ end }}"}],"actions":["Read:ov-sync/JasperHG90/notes/*","Write:ov-sync/JasperHG90/notes/*"]}]}
-```
-
-`Write` covers deletes. `ovsq` never lists the bucket, so the key needs no
-`List`. Apply both Terraform roots. The SeaweedFS job restarts with the new
-`s3.json`, and the consumer job picks up the new prefix map.
-
-### 4. Configure the folder
+### 2. Configure the folder
 
 ```console
 $ ovsq init ~/notes
 ```
 
-Edit `~/notes/ov-sync-queue.toml` and set the prefix:
-
-```toml
-[target]
-prefix = "JasperHG90/notes"
-```
-
-`subdir`, `source` and the `[sync]` filters are optional. Every key is in
-[the reference](../reference/ovsq-commands-and-config.md).
-
-#### Several folders without a new prefix each
-
-Each new prefix means another localstack change: a map entry and a key.
-To skip that, map one broad prefix once, scope one key to it, and let each
-folder pick its place with `subdir`:
-
-```hcl
-"JasperHG90/local/" = "viking://user/jasper/resources/"
-```
+Edit `~/notes/ov-sync-queue.toml`:
 
 ```toml
 [target]
 prefix = "JasperHG90/local"
-subdir = "projects/notes"   # lands in viking://user/jasper/resources/projects/notes/
-source = "notes"
+subdir = "notes"     # lands in viking://user/jasper/resources/local/notes/
+source = "notes"     # names this folder's manifest
 ```
 
 Give every folder its own `subdir` and `source`, or they overwrite and
-delete each other's files. Scope the step 3 key to the broad prefix
-(`ov-sync/JasperHG90/local/*`). The trade-off: that one key can write
-anywhere under `resources/`.
+delete each other's files. Every key is in
+[the reference](../reference/ovsq-commands-and-config.md).
 
-### 5. Give ovsq the key
+The prefix must stay `JasperHG90/local`: the credentials reach nothing else.
+A place outside `resources/local/` is not possible from here. The consumer
+deletes every file under a mapped folder that has no object behind it, so
+localstack never maps a prefix over a folder that holds other content.
 
-Read the key back from Vault:
+### 3. Load the credentials
+
+In the shell that runs `ovsq`:
 
 ```console
-$ vault kv get -mount=secret default/seaweedfs/ovsq-notes
+$ eval "$(localstack ov-sync-env)"
+ov-sync credentials expire at 2026-11-27T18:15:00Z
 ```
 
-Then export it in the shell that runs `ovsq`:
+It exports `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and
+`AWS_SESSION_TOKEN`, which `ovsq` reads first. A run that outlasts the 15
+minutes fails with `ExpiredToken`: run the `eval` again and rerun `ovsq`,
+which continues from its last manifest checkpoint.
 
-```bash
-export AWS_ACCESS_KEY_ID=ovsq-notes
-export AWS_SECRET_ACCESS_KEY=<secret_key from Vault>
-```
-
-Or put it in a profile in `~/.aws/credentials` and set `AWS_PROFILE`.
-Exported variables win over the profile, so unset `AWS_ACCESS_KEY_ID` and
-`MINIO_ROOT_USER` in that shell if you use one. Never
-put the key in `ov-sync-queue.toml`: it has no field for one.
-
-### 6. Sync
+### 4. Sync
 
 ```console
 $ ovsq status ~/notes          # what would change; writes nothing
@@ -194,11 +108,12 @@ $ ovsq run ~/notes --delete    # also remove files you deleted locally
 ## Check it worked
 
 - `ovsq status ~/notes` after a run shows `0 to upload, 0 to delete`.
-- The files appear under the folder you mapped in step 2, for example
-  `viking://user/jasper/resources/projects/notes/`. The consumer
+- The files appear under `viking://user/jasper/resources/local/<subdir>/`,
+  for example `viking://user/jasper/resources/local/notes/`. The consumer
   rate-limits its writes, so a large folder takes a while.
-- An `Access Denied` from `ovsq` means the key's actions do not cover the
-  prefix in `ov-sync-queue.toml`. Check the two match exactly.
+- An `Access Denied` from `ovsq` means the prefix in `ov-sync-queue.toml` is
+  not `JasperHG90/local`. `ExpiredToken` means the credentials are past
+  their 15 minutes: repeat step 3.
 
 ### Run the whole pipeline on your laptop
 
@@ -216,9 +131,10 @@ It reads the set-up from your localstack clone:
   Terraform.
 - The receiver and the consumer run the `ov-sync-consumer` image that
   `services.tf` deploys.
-- `ovsq` writes with a key scoped to its prefix, shaped like the one in
-  step 3. The test checks that the key can read, write and delete inside
-  the prefix, and is refused outside it.
+- `ovsq` writes with a static key scoped to its prefix. That is a
+  stand-in: the test has no Vault to mint the STS credentials step 3 uses.
+  The test checks that the key can read, write and delete inside the
+  prefix, and is refused outside it.
 
 The deployed image is built for linux/arm64. On an amd64 machine Docker
 needs emulation (Docker Desktop has it), or set `OVSQ_E2E_CONSUMER=source`.

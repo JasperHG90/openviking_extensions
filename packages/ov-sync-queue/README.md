@@ -53,12 +53,14 @@ whether they go further, both in JasperHG90/localstack:
    `nomad_job.ov_sync_consumer` (`deployments/applications/services.tf`),
    mapped to a `viking://` folder. A prefix missing there reaches the bucket
    and goes no further.
-2. **A write credential.** The bucket has no writers by default. You need a
-   static S3 key allowed to read and write `ov-sync/<prefix>/*`. `ovsq` never
-   lists the bucket, so it needs no List.
+2. **A write credential.** No S3 key is stored for ovsq.
+   `eval "$(localstack ov-sync-env)"` trades your Vault session for STS
+   credentials that last 15 minutes and reach only
+   `ov-sync/JasperHG90/local/*`. Localstack maps that prefix to
+   `viking://user/jasper/resources/local/`, so each folder picks its place
+   with `subdir` and needs no localstack change.
 
-[Set up ovsq](../../docs/how-to/set-up-ovsq.md) walks through both, the key
-included.
+[Set up ovsq](../../docs/how-to/set-up-ovsq.md) walks through it.
 
 ## How it works
 
@@ -156,8 +158,9 @@ only: CI has no clone, and it is not a gate.
   That image is linux/arm64, so an amd64 host needs Docker's emulation.
   `OVSQ_E2E_CONSUMER=source` builds them from the clone instead, to test a
   change before it is released.
-- ovsq writes with a static key scoped to its prefix, shaped like the one
-  the how-to sets up, and the test checks the key is refused outside it.
+- ovsq writes with a static key scoped to its prefix, a stand-in for the
+  STS credentials the how-to uses, since the test has no Vault. The test
+  checks the key is refused outside the prefix.
 - The consumer gets S3 credentials the production way: SeaweedFS's STS trades
   a Nomad-style workload token for the role `ov-sync-consumer.hcl` names,
   with `defaultEffect` Deny. SeaweedFS's `iam.json` is built as production
