@@ -556,3 +556,104 @@ def test_requests_arriving_together_share_one_retry(
         assert len(attempts) == 1
     finally:
         adapter.close()
+
+
+def stale_and_current(dsn: str, schema: str) -> tuple[Any, Any]:
+    """Return a writer that loaded the old schema, and a reader that reconciled.
+
+    The stale one stands for a server that started before another reconciled
+    the table, including an older ov-postgres: it writes the new fields into
+    ``extra`` because its view of the table has no columns for them.
+    """
+    first = make_adapter(dsn, schema)
+    create(first, OLD)
+    first.close()
+    stale = make_adapter(dsn, schema)
+    assert stale.collection_exists()
+    current = reopen(dsn, schema, NEW)
+    return stale, current
+
+
+def extra_of(dsn: str, schema: str, key: str) -> dict[str, Any]:
+    """Return a row's ``extra`` as stored."""
+    with psycopg.connect(dsn) as conn:
+        row = conn.execute(
+            f'SELECT extra FROM "{schema}".ov_context WHERE id = %s', (key,)
+        ).fetchone()
+    assert row is not None
+    return dict(row[0])
+
+
+def test_an_old_style_write_after_the_reconcile_lands_in_its_columns(
+    dsn: str, test_schema: str
+) -> None:
+    """A field written to ``extra`` by a stale writer is read, filtered and ACL'd right.
+
+    Restricted by a writer that has no column for ``acl_mode``, the resource
+    must still be hidden from a user without a grant.
+    """
+    stale, current = stale_and_current(dsn, test_schema)
+    try:
+        grants = acl_grant_tokens(["user:alice"], AclAction.READ)
+        stale.upsert(
+            resource(
+                "secret", acl_mode="restricted", acl_direct_grants=grants[:1], md5="m1"
+            )
+        )
+        stale.upsert(resource("plain"))
+
+        assert visible_to_bob(current) == {"plain"}
+        row = current.query(
+            filter={"op": "must", "field": "id", "conds": ["secret"]},
+            output_fields=["id", "acl_mode", "acl_direct_grants", "md5"],
+            limit=1,
+        )[0]
+        assert row["acl_mode"] == "restricted"
+        assert row["acl_direct_grants"] == grants[:1]
+        assert row["md5"] == "m1"
+        assert {
+            r["id"]
+            for r in current.query(
+                filter={"op": "must", "field": "md5", "conds": ["m1"]}, limit=10
+            )
+        } == {"secret"}
+        assert not NEW_FIELDS & set(extra_of(dsn, test_schema, "secret"))
+        plain = current.get(["plain"])[0]
+        assert plain["acl_mode"] == "none"
+        assert plain["acl_direct_grants"] == [EMPTY_ACL_GRANT]
+    finally:
+        stale.close()
+        current.close()
+
+
+def test_a_raw_update_into_extra_is_moved_too(dsn: str, test_schema: str) -> None:
+    """Whatever writes ``extra``, the value ends up in the column."""
+    stale, current = stale_and_current(dsn, test_schema)
+    try:
+        current.upsert(resource("doc"))
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            conn.execute(
+                f'UPDATE "{test_schema}".ov_context '
+                "SET extra = extra || '{\"acl_mode\": \"restricted\"}' WHERE id = 'doc'"
+            )
+        assert current.get(["doc"])[0]["acl_mode"] == "restricted"
+        assert visible_to_bob(current) == set()
+    finally:
+        stale.close()
+        current.close()
+
+
+def test_an_acl_value_a_stale_writer_cannot_store_is_refused(
+    dsn: str, test_schema: str
+) -> None:
+    """An ACL value that fits no column fails the write rather than reading as open."""
+    stale, current = stale_and_current(dsn, test_schema)
+    try:
+        with pytest.raises(psycopg.Error, match="acl_mode"):
+            stale.upsert(resource("odd", acl_mode={"not": "a string"}))
+        stale.upsert(resource("odd2", md5={"not": "a string"}))
+        assert extra_of(dsn, test_schema, "odd2")["md5"] == {"not": "a string"}
+        assert current.get(["odd2"])[0]["md5"] == ""
+    finally:
+        stale.close()
+        current.close()

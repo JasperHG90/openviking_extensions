@@ -33,6 +33,7 @@ from . import ddl
 from .collection import PgVectorCollection
 from .compat import check_openviking_version
 from .config import DSN_ENV_VARS, PgVectorParams, VectorDBConfigLike, resolve_dsn
+from .md5_backfill import FileReader, run_md5_backfill
 from .observability import DB_SYSTEM, annotate, traced
 from .schema import CollectionSchema
 
@@ -436,7 +437,41 @@ class PgVectorCollectionAdapter(CollectionAdapter):  # type: ignore[misc]  # bas
             )
             return created
         self._reconcile(dict(schema))
+        inner = self._pg_collection
+        if inner is not None and inner.md5_backfill_pending():
+            logger.warning(
+                "ov_postgres: %s has rows with no md5, so OpenViking's next reindex "
+                "would re-embed every one. The backfill runs by itself under "
+                "ov-ext-server; without ov-ext, await run_md5_backfill(viking_fs) "
+                "on this adapter once the server has started",
+                self._collection_name,
+            )
         return False
+
+    async def run_md5_backfill(self, viking_fs: FileReader) -> int:
+        """Fill in ``md5`` on rows a reconcile left without one.
+
+        Needs the running server's ``VikingFS``, because the md5 is of the
+        stored file's bytes and only the server's filesystem holds them, and
+        decrypts them when encryption at rest is on. ov-ext starts this by
+        itself once the server has started. Safe to run more than once, and to
+        run beside normal traffic. See :mod:`ov_postgres.md5_backfill`.
+
+        Parameters
+        ----------
+        viking_fs :
+            The server's ``VikingFS``.
+
+        Returns
+        -------
+        int
+            How many rows were given an md5; 0 when nothing was pending.
+        """
+        self.get_collection()
+        inner = self._pg_collection
+        if inner is None:
+            return 0
+        return await run_md5_backfill(inner, viking_fs, self._decode_uri_field_value)
 
     @traced("ov_postgres.reconcile")
     def _reconcile(self, schema: dict[str, Any]) -> None:

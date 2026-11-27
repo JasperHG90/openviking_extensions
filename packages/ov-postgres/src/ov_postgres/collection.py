@@ -42,6 +42,38 @@ from .schema import (
     fulltext_candidates,
 )
 
+# Registry key holding this backend's own maintenance state, beside the schema
+# OpenViking reads. OpenViking ignores keys it does not know.
+MAINTENANCE_KEY = "OvPostgresMaintenance"
+MD5_BACKFILL = "md5_backfill"
+# The fields a reconcile added, which the extra-guard trigger watches.
+EXTRA_GUARD = "extra_guard"
+
+# How the extra-guard trigger tests a JSON value from `extra` for each column
+# type, and converts it. `v` is the value. A type absent here is left in
+# `extra`, as before; none of the fields OpenViking has added is one.
+_GUARD_CONVERSIONS: dict[str, tuple[str, str]] = {
+    "string": ("jsonb_typeof(v) = 'string'", "v #>> '{}'"),
+    "text": ("jsonb_typeof(v) = 'string'", "v #>> '{}'"),
+    "bool": ("jsonb_typeof(v) = 'boolean'", "(v #>> '{}')::boolean"),
+    "int64": (
+        "jsonb_typeof(v) = 'number' AND (v #>> '{}') ~ '^-?[0-9]{1,18}$'",
+        "(v #>> '{}')::bigint",
+    ),
+    "float32": ("jsonb_typeof(v) = 'number'", "(v #>> '{}')::real"),
+    "list<string>": (
+        "jsonb_typeof(v) = 'array' AND NOT EXISTS ("
+        "SELECT 1 FROM jsonb_array_elements(v) e WHERE jsonb_typeof(e) <> 'string')",
+        "ARRAY(SELECT jsonb_array_elements_text(v))",
+    ),
+    "list<int64>": (
+        "jsonb_typeof(v) = 'array' AND NOT EXISTS ("
+        "SELECT 1 FROM jsonb_array_elements(v) e WHERE jsonb_typeof(e) <> 'number' "
+        "OR (e #>> '{}') !~ '^-?[0-9]{1,18}$')",
+        "ARRAY(SELECT x::bigint FROM jsonb_array_elements_text(v) x)",
+    ),
+}
+
 # Rows read per page while moving values out of `extra` during a reconcile.
 _EXTRA_MOVE_PAGE = 1000
 
@@ -2550,6 +2582,11 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 for spec in added:
                     self._add_column(cur, spec)
                 moved = self._move_extra_into_columns(cur, added)
+                guarded = sorted(
+                    {*(stored.get(MAINTENANCE_KEY) or {}).get(EXTRA_GUARD, [])}
+                    | {spec.name for spec in added}
+                )
+                self._install_extra_guard(cur, [incoming.by_name(n) for n in guarded])
 
             raw_by_name = {
                 str(field.get("FieldName")): field for field in meta.get("Fields", [])
@@ -2559,6 +2596,18 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
                 *(raw_by_name[spec.name] for spec in added),
             ]
             stored["ScalarIndex"] = [*stored.get("ScalarIndex", []), *indexed]
+            stored[MAINTENANCE_KEY] = {
+                **stored.get(MAINTENANCE_KEY, {}),
+                EXTRA_GUARD: guarded,
+            }
+            if any(spec.name == "md5" for spec in added):
+                # Every existing row now has an empty md5, and OpenViking's
+                # maintenance reindex treats an empty md5 as stale. Mark the
+                # table so the backfill runs; see `ov_postgres.md5_backfill`.
+                stored[MAINTENANCE_KEY] = {
+                    **stored.get(MAINTENANCE_KEY, {}),
+                    MD5_BACKFILL: "pending",
+                }
             with conn.cursor() as plain:
                 built = self._create_new_indexes(
                     plain, before=current, after=CollectionSchema.from_meta(stored)
@@ -2603,6 +2652,97 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             moved,
         )
         return stored
+
+    def md5_backfill_pending(self) -> bool:
+        """Return whether a reconcile added ``md5`` and its backfill has not finished."""
+        maintenance = self.get_meta_data().get(MAINTENANCE_KEY) or {}
+        return bool(maintenance.get(MD5_BACKFILL) == "pending")
+
+    @traced("ov_postgres.md5_backfill_batch")
+    def md5_backfill_batch(
+        self, after: object, limit: int
+    ) -> list[tuple[object, str, int, str]]:
+        """Return the next rows with an empty ``md5`` that OpenViking fingerprints.
+
+        Levels 0 and 1 (a directory's sidecars) and 2 (a file), walked by
+        primary key so each row is visited once.
+
+        Parameters
+        ----------
+        after :
+            The last primary key of the previous batch, or ``None`` to start.
+        limit :
+            Rows to return.
+
+        Returns
+        -------
+        list[tuple[object, str, int, str]]
+            ``(primary key, stored uri, level, account id)`` per row.
+        """
+        annotate({"db.operation.name": "SELECT"})
+        self._check_open()
+        pk = sql.Identifier(self._schema.primary_key.name)
+        rows = self._execute(
+            sql.SQL(
+                "SELECT {pk} AS pk, uri, level, account_id FROM {table} "
+                "WHERE coalesce(md5, '') = '' AND level IN (0, 1, 2) "
+                "AND ({pk} > %s OR %s) ORDER BY {pk} LIMIT %s"
+            ).format(pk=pk, table=self._qualified),
+            (after, after is None, limit),
+            fetch="all",
+        )
+        return [
+            (
+                row["pk"],
+                str(row["uri"] or ""),
+                int(row["level"]),
+                str(row["account_id"] or ""),
+            )
+            for row in rows or []
+        ]
+
+    @traced("ov_postgres.record_md5")
+    def record_md5(self, key: object, md5: str) -> bool:
+        """Set a row's ``md5`` unless something wrote one in the meantime.
+
+        Returns
+        -------
+        bool
+            Whether the row was updated.
+        """
+        annotate({"db.operation.name": "UPDATE"})
+        self._check_open()
+        pk = sql.Identifier(self._schema.primary_key.name)
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                sql.SQL(
+                    "UPDATE {table} SET md5 = %s "
+                    "WHERE {pk} = %s AND coalesce(md5, '') = ''"
+                ).format(table=self._qualified, pk=pk),
+                (md5, key),
+            )
+            return bool(cur.rowcount)
+
+    @traced("ov_postgres.finish_md5_backfill")
+    def finish_md5_backfill(self) -> None:
+        """Clear the pending-backfill mark in the registry."""
+        annotate({"db.operation.name": "UPDATE"})
+        self._check_open()
+        with self._lock:
+            self._execute(
+                sql.SQL(
+                    "UPDATE {} SET meta = jsonb_set(meta, %s, "
+                    "coalesce(meta->%s, '{{}}'::jsonb) - %s) WHERE name = %s"
+                ).format(self._registry(ddl.REGISTRY_COLLECTIONS)),
+                ([MAINTENANCE_KEY], MAINTENANCE_KEY, MD5_BACKFILL, self._name),
+            )
+            raw = dict(self._schema.raw)
+            raw[MAINTENANCE_KEY] = {
+                key: value
+                for key, value in (raw.get(MAINTENANCE_KEY) or {}).items()
+                if key != MD5_BACKFILL
+            }
+            self._schema.raw = raw
 
     def _add_column(self, cur: Cursor[Any], spec: FieldSpec) -> None:
         """Add the column(s) for one field, holding its default on every row.
@@ -2671,6 +2811,82 @@ class PgVectorCollection(ICollection):  # type: ignore[misc]  # ICollection is u
             present.add(entry.name)
             built.append(entry.name)
         return built
+
+    def _install_extra_guard(
+        self, cur: Cursor[Any], fields: list[FieldSpec | None]
+    ) -> None:
+        """Install the trigger that keeps reconciled fields out of ``extra``.
+
+        A server whose view predates the reconcile -- one still running from
+        before it, or an older ov-postgres -- has no column for these fields
+        and writes them into ``extra``. Read from there, every filter and
+        projection would see the column instead, and an ACL filter would let
+        a restricted row through. So before every insert and update, the
+        trigger moves such a value into its column, and gives a column left
+        NULL its default. An ACL value that does not fit its column fails the
+        write, rather than leave the row unrestricted; any other misfit stays
+        in ``extra``, as it did before.
+
+        Parameters
+        ----------
+        cur :
+            A cursor inside the reconcile's transaction.
+        fields :
+            The fields to guard.
+        """
+        branches: list[str] = []
+        for spec in fields:
+            if spec is None or spec.ov_type not in _GUARD_CONVERSIONS:
+                continue
+            check, convert = _GUARD_CONVERSIONS[spec.ov_type]
+            key = sql.Literal(spec.name).as_string(cur)
+            column = sql.Identifier(spec.name).as_string(cur)
+            refuse = (
+                "RAISE EXCEPTION 'ov_postgres: % in extra does not fit its column, "
+                "and an ACL value is never dropped', "
+                f"{key} USING ERRCODE = '22023';"
+                if spec.name in _FAIL_CLOSED_FIELDS
+                else "NULL;"
+            )
+            branches.append(
+                f"IF NEW.extra ? {key} THEN\n"
+                f"  v := NEW.extra -> {key};\n"
+                f"  IF {check} THEN\n"
+                f"    NEW.{column} := {convert};\n"
+                f"    NEW.extra := NEW.extra - {key};\n"
+                f"  ELSE\n    {refuse}\n  END IF;\n"
+                "END IF;"
+            )
+            default = default_for(spec)
+            if default is not None:
+                literal = sql.SQL("{}::{}").format(
+                    sql.Literal(self._adapt_value(spec, default)), ddl.column_type(spec)
+                )
+                branches.append(
+                    f"IF NEW.{column} IS NULL THEN "
+                    f"NEW.{column} := {literal.as_string(cur)}; END IF;"
+                )
+        if not branches:
+            return
+        function = sql.Identifier(
+            self._db_schema, ddl.index_name(self._table, "extra_guard")
+        )
+        trigger = sql.Identifier(ddl.index_name(self._table, "extra_guard"))
+        body = "DECLARE v jsonb;\nBEGIN\n" + "\n".join(branches) + "\nRETURN NEW;\nEND;"
+        cur.execute(
+            sql.SQL(
+                "CREATE OR REPLACE FUNCTION {}() RETURNS trigger LANGUAGE plpgsql AS {}"
+            ).format(function, sql.Literal(body))
+        )
+        cur.execute(
+            sql.SQL("DROP TRIGGER IF EXISTS {} ON {}").format(trigger, self._qualified)
+        )
+        cur.execute(
+            sql.SQL(
+                "CREATE TRIGGER {} BEFORE INSERT OR UPDATE ON {} "
+                "FOR EACH ROW EXECUTE FUNCTION {}()"
+            ).format(trigger, self._qualified, function)
+        )
 
     def _move_extra_into_columns(self, cur: Cursor[Any], added: list[FieldSpec]) -> int:
         """Move values written under the new fields' names out of ``extra``.

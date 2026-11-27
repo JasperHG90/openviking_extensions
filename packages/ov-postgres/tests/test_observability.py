@@ -368,10 +368,15 @@ class TestSpansFromRealQueries:
                     "Fields": [
                         *META["Fields"],
                         {"FieldName": "probe_field", "FieldType": "string"},
+                        {"FieldName": "md5", "FieldType": "string"},
+                        {"FieldName": "account_id", "FieldType": "string"},
                     ],
                     "ScalarIndex": [*META["ScalarIndex"], "probe_field"],
                 }
             )
+            collection.md5_backfill_batch(None, 10)
+            collection.record_md5("b", "probe")
+            collection.finish_md5_backfill()
             collection.create_index("probe_index", {})
             collection.update_index("probe_index", description="probe")
             collection.drop_index("probe_index")
@@ -427,6 +432,9 @@ class TestSpansFromRealQueries:
             "ov_postgres.get_meta_data": "SELECT",
             "ov_postgres.update": "UPDATE",
             "ov_postgres.reconcile_schema": "ALTER TABLE",
+            "ov_postgres.md5_backfill_batch": "SELECT",
+            "ov_postgres.record_md5": "UPDATE",
+            "ov_postgres.finish_md5_backfill": "UPDATE",
             "ov_postgres.list_indexes": "SELECT",
             "ov_postgres.has_index": "SELECT",
             "ov_postgres.get_index_meta_data": "SELECT",
