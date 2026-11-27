@@ -1,0 +1,47 @@
+{
+  "schema_version": "1.0",
+  "fingerprint": "40492b93e6a98895de0694807938176c99255312867ca0dea22ac6a7af96c972",
+  "slug": null,
+  "results": [
+    {
+      "name": "lint",
+      "kind": "gate",
+      "command": "prek run ruff-check --all-files",
+      "exit": 0,
+      "passed": true,
+      "tests_passed": null,
+      "note": null,
+      "input_fingerprint": null,
+      "cached": false,
+      "cached_from": null
+    },
+    {
+      "name": "format",
+      "kind": "gate",
+      "command": "prek run ruff-format --all-files",
+      "exit": 0,
+      "passed": true,
+      "tests_passed": null,
+      "note": null,
+      "input_fingerprint": null,
+      "cached": false,
+      "cached_from": null
+    },
+    {
+      "name": "go-ov-sync-queue",
+      "kind": "gate",
+      "command": "bash packages/ov-sync-queue/check.sh",
+      "exit": 0,
+      "passed": true,
+      "tests_passed": null,
+      "note": null,
+      "input_fingerprint": "455af76d76af9046991ca492260c9e3fe2dc96dd6b6e7b950dd66c58f33d2291",
+      "cached": false,
+      "cached_from": null
+    }
+  ],
+  "green": true,
+  "at": "2026-11-27T10:39:49+00:00",
+  "commit": null,
+  "by": "process:loopctl/2.3.1.dev65+g93b143856"
+}
