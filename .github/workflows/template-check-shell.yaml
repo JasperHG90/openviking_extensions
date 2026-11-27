@@ -49,3 +49,15 @@ jobs:
         run: >
           uv run --locked --directory packages/${{ inputs.package }}
           pytest -v -m "not integration" --color=yes --tb=short
+
+      # The skills' instructions carried out against a real OpenViking, which
+      # the suite starts in docker. Linux only: macOS runners have no docker,
+      # and what this checks is the server, not the bash. Only this file: the
+      # package's other integration tests download releases from GitHub.
+      - name: Run the skills against a live OpenViking
+        if: >-
+          ${{ runner.os == 'Linux'
+              && hashFiles(format('packages/{0}/tests/test_live_openviking.py', inputs.package)) != '' }}
+        run: >
+          uv run --locked --directory packages/${{ inputs.package }}
+          pytest -v -m integration tests/test_live_openviking.py --color=yes --tb=short

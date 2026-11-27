@@ -330,3 +330,51 @@ def test_unknown_command_fails(tmp_path: Path) -> None:
     )
     assert result.returncode == 1
     assert "Usage:" in result.stderr
+
+
+# --- what OpenViking changed under the skills since 0.4.17.1 -----------------
+#
+# Each of these was found by carrying a skill's instructions out against a
+# real server (tests/test_live_openviking.py). They pin the text, so the fix
+# cannot quietly come undone in an edit that never runs the live suite.
+
+# Gone from OpenViking between 0.4.17.1 and 0.5.6: `--tag`, renamed `--tags`
+# in 0.4.18 (#4599); session `used`, removed in 0.4.22 (#5252); the
+# wait-specific `--timeout` and `timeout=` (#6048) and session `extract`
+# (#6131), both removed in 0.5.1. An agent told to use one gets an error.
+REMOVED_SINCE_0_4_17 = re.compile(r"--timeout\b|--tag\b|/extract\b|/used\b|\btimeout=")
+
+
+def shipped_text() -> list[tuple[str, str]]:
+    """Every file the installer ships or runs, with its name."""
+    files = [*SKILLS_DIR.rglob("*.md"), *SKILLS_DIR.rglob("*.sh"), INSTALLER]
+    return [(str(f.relative_to(PACKAGE)), f.read_text(encoding="utf-8")) for f in files]
+
+
+def test_nothing_shipped_uses_what_openviking_removed() -> None:
+    """No skill, script or installer names a flag or endpoint 0.5.6 lacks."""
+    hits = [
+        f"{name}: {match.group(0)}"
+        for name, text in shipped_text()
+        for match in REMOVED_SINCE_0_4_17.finditer(text)
+    ]
+    assert hits == []
+
+
+def test_handoff_says_what_to_do_when_the_save_is_busy() -> None:
+    """OpenViking 0.5 refuses a write to a file whose last write is still indexing.
+
+    A second /handoff to the same URI inside that window is told the resource
+    is busy, and an agent with no instruction reports a failed save.
+    """
+    text = (SKILLS_DIR / "handoff" / "SKILL.md").read_text(encoding="utf-8")
+    assert "busy" in text
+    assert "same call again" in text
+
+
+def test_ingest_uploads_a_local_file_as_a_form_field() -> None:
+    """The upload URL takes multipart field ``file``; a raw body is refused."""
+    text = (SKILLS_DIR / "ingest" / "SKILL.md").read_text(encoding="utf-8")
+    commands = re.findall(r"`(curl [^`]+)`", text)
+    assert commands
+    assert all('-F "file=@' in command for command in commands)

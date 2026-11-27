@@ -82,9 +82,13 @@ directories are created for you, so the first handoff in a new project needs no
 setup.
 
 Use `replace` even for a brand-new handoff. The stamp only resolves to the
-minute, so a second `/handoff` on the same work inside one minute would collide
-— under `create` that is an error, under `replace` it is simply the newer
-version winning, which is what you want.
+minute, so a second `/handoff` on the same work inside one minute lands on the
+same URI, and under `replace` the newer version simply wins, which is what you
+want. Servers before OpenViking 0.5.1 refuse that second write under `create`.
+
+If `write` answers that the resource is busy, your previous save to this URI is
+still being indexed and nothing was written. Wait a few seconds and make the
+same call again.
 
 Indexing runs in the background, so the file is also reachable through ordinary
 recall later. That is a feature here — do not pass `wait=true` for it, since
