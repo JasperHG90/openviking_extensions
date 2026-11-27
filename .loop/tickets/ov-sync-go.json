@@ -3,7 +3,7 @@
   "slug": "ov-sync-go",
   "stage": "planning",
   "attempts": 0,
-  "plan_rounds": 0,
+  "plan_rounds": 1,
   "review_rounds": 0,
   "extra_plan_rounds": 0,
   "extra_review_rounds": 0,
@@ -103,8 +103,27 @@
   "accepted_risks": [],
   "waivers": [],
   "overrides": [],
-  "round": null,
-  "plan_hash": "25c52b4504755fa02347371b03efbda2d62664d49dcdb6c47382fe73a8708f5c",
+  "round": {
+    "kind": "plan",
+    "n": 1,
+    "binds": "9f24e7b0e4ec4b6ad2d91423a754436b4bb73e42f3e0f134aaf8c4e87b39a3bb",
+    "started_at": "2026-11-27T08:47:10+00:00",
+    "passes": [
+      "plan-reviewer"
+    ],
+    "tree": null,
+    "plan_hash": null,
+    "eval_hash": null,
+    "scope": "full",
+    "sent_back": [],
+    "since": null,
+    "returned": {},
+    "chosen": {},
+    "skipped": [],
+    "closed": false,
+    "outcome": null
+  },
+  "plan_hash": "9f24e7b0e4ec4b6ad2d91423a754436b4bb73e42f3e0f134aaf8c4e87b39a3bb",
   "intent": {
     "epic": null,
     "depends_on": [],
@@ -119,5 +138,5 @@
     }
   ],
   "by": "process:loopctl/2.3.1.dev65+g93b143856",
-  "at": "2026-11-27T08:47:05+00:00"
+  "at": "2026-11-27T08:47:10+00:00"
 }
